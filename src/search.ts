@@ -127,14 +127,50 @@ export function apply(ctx: Context, config: Config = {}): void {
         signal: exec.signal,
         scope,
       }
-      const allowedIds = new Set<string>()
-      for (const schema of ctx.tools.schemas(scope)) allowedIds.add(schema.name)
-      for (const skill of await ctx.skills.list({ scope, cwd: context.cwd })) allowedIds.add(skill.name)
+      // Which capabilities this agent may search.
+      //
+      // WHY THE SCOPED VIEW ALONE IS WRONG: this plugin hides On-demand tools
+      // with an agent-scoped `tools.restrict({ deny })` (see `src/policy.ts`),
+      // so `ctx.tools.schemas(scope)` cannot see them. Building the allow set
+      // from that view made `meta_search` filter out every On-demand tool —
+      // the search returned `total: 0` for the exact capabilities it exists to
+      // find, and the whole On-demand loop was unreachable.
+      //
+      // The scoped view also cannot say WHO hid a tool: `restrict()` filters
+      // intersect, and the public API exposes only "visible / not visible".
+      // So membership is decided in two steps:
+      //   1. visible in this scope            -> searchable;
+      //   2. not visible, but this policy calls it On-demand
+      //      -> searchable, because the only thing hiding it may be us.
+      // A name hidden by ANOTHER plugin falls through both steps and stays
+      // out of the results. `meta_invoke` applies the same two-step rule
+      // before forwarding, so a third-party restriction still denies the call.
+      const visibleToolIds = new Set<string>()
+      for (const schema of ctx.tools.schemas(scope)) visibleToolIds.add(schema.name)
+      const visibleSkillIds = new Set<string>()
+      for (const skill of await ctx.skills.list({ scope, cwd: context.cwd })) visibleSkillIds.add(skill.name)
       // The registry keeps every tier for management. Model search exposes
       // only On-demand capabilities in the current session.
       const policy = ctx.get('capabilityPolicy')
       const isOnDemand = (capId: string, capKind: 'tool' | 'skill'): boolean =>
         policy?.classifyCapability(capId, capKind) === 'on-demand'
+      // A tool may be missing from the scoped view for two reasons: this policy
+      // hid it (On-demand), or somebody else restricted it. Both look identical
+      // through the public API — `restrict()` filters intersect and neither
+      // `ToolDefinition` nor the scoped view carries an owner. So step 2 can
+      // only prove "registered globally", NOT "hidden only by us".
+      //
+      // KNOWN API GAP (recorded, not papered over): a name restricted by a third
+      // party is still listed here. `meta_invoke` re-checks before forwarding
+      // (`resolveForwardDefinition`), so such a call fails as UNKNOWN_TOOL at
+      // execution time — the listing over-reports, the execution stays
+      // fail-closed. Do not "fix" this by dropping the check in invoke.ts.
+      const registeredTool = (capId: string): boolean => ctx.tools.get(capId) !== undefined
+      const isSearchable = (capId: string, capKind: 'tool' | 'skill'): boolean => {
+        if (!isOnDemand(capId, capKind)) return false
+        if (capKind === 'skill') return visibleSkillIds.has(capId)
+        return visibleToolIds.has(capId) || registeredTool(capId)
+      }
       // The kind filter doubles as a disambiguator for exact-id lookups.
       const kindArg = kind === 'all' || kind === undefined ? undefined : kind
 
@@ -143,7 +179,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         if (resolved === undefined) {
           throw new Error(`meta_search: capability "${id}" is unknown, unavailable, or ambiguous — pass kind: "tool" | "skill" when both exist`)
         }
-        if (!allowedIds.has(id)) throw new Error(`meta_search: capability "${id}" is not available in the current session scope`)
+        if (!isSearchable(id, resolved.kind)) throw new Error(`meta_search: capability "${id}" is not available in the current session scope`)
         if (!isOnDemand(id, resolved.kind)) {
           throw new Error(`meta_search: capability "${id}" is not On-demand and cannot be inspected`)
         }
@@ -165,7 +201,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         maxResults: Number.MAX_SAFE_INTEGER,
         scope,
       })
-        .filter(result => allowedIds.has(result.id) && isOnDemand(result.id, result.kind))
+        .filter(result => isSearchable(result.id, result.kind))
       const results = matches.slice(0, limit)
       const truncated = results.length < matches.length
       return {

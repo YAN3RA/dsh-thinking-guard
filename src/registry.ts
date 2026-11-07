@@ -1089,7 +1089,13 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       if (record === undefined) return undefined
 
       if (record.kind === 'tool') {
+        // A tool hidden from the caller's view may still be a registered global
+        // definition — that is exactly the On-demand case this method exists to
+        // serve. Falling back to the unscoped lookup keeps detail reachable;
+        // authorization is not granted here, `meta_invoke` re-checks before it
+        // forwards (see `resolveForwardDefinition`).
         const definition = ctx.tools.get(record.name, context.scope)
+          ?? (context.scope === undefined ? undefined : ctx.tools.get(record.name))
         if (definition === undefined) return undefined
         return {
           id: record.id,

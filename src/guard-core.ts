@@ -1,5 +1,4 @@
-import { createHash } from 'node:crypto'
-import { createGuardLoopState, type GuardLoopState, type GuardToolOutcome } from './guard-loop-core.ts'
+import { createGuardLoopState, type GuardLoopBlockSource, type GuardLoopState, type GuardToolOutcome } from './guard-loop-core.ts'
 
 export type GuardProfileName = 'quick' | 'normal' | 'deep'
 
@@ -66,7 +65,13 @@ export interface PendingLoopObservation {
   readonly epoch: number
   readonly signature: string
   readonly outcome: GuardToolOutcome
-  readonly resultFingerprint: string
+  /**
+   * Omitted when the dispatch was known not to need a fingerprint, or when the
+   * result exceeded the fingerprint budget. Absence means "no progress cannot be
+   * proven", never "the result is identical" — see `fingerprintsMatch` in
+   * guard-loop-core.
+   */
+  readonly resultFingerprint?: string
 }
 
 export interface DispatchRecord {
@@ -74,6 +79,13 @@ export interface DispatchRecord {
   readonly epoch: number
   readonly name: string
   readonly signature: string
+  /**
+   * Decided at dispatch time from the tool name alone: excluded / polling /
+   * warn-only / control-plane calls can never become a block candidate, so their
+   * result is never canonicalized or hashed. This skips the work instead of
+   * computing a fingerprint the detector then discards.
+   */
+  readonly fingerprintNeeded: boolean
 }
 
 export interface TurnState {
@@ -87,7 +99,13 @@ export interface TurnState {
   readonly dispatchRecords: Map<string, DispatchRecord>
   readonly pendingLoopObservations: Map<number, PendingLoopObservation | null>
   loopState: GuardLoopState
-  readonly pendingBlockSignatures: Set<string>
+  /**
+   * Pending local-denial candidates keyed by tool signature, each holding the
+   * detector(s) that produced it. Keeping both sources per signature is what makes
+   * `duplicateDetection` and `alternatingCycleDetection` independent: a repeat
+   * candidate and a cycle candidate for the same call never overwrite each other.
+   */
+  readonly pendingBlockCandidates: Map<string, Set<GuardLoopBlockSource>>
   readonly blockedLoopSignatures: Set<string>
   readonly deniedCallIds: Set<string>
   localLoopDenials: number
@@ -200,17 +218,6 @@ export function validateGuardConfig(input: Partial<GuardConfig> = {}): GuardConf
   }
 }
 
-export function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'undefined'
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
-  const object = value as Record<string, unknown>
-  return `{${Object.keys(object).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(',')}}`
-}
-
-export function toolSignature(name: string, argumentsValue: unknown): string {
-  return createHash('sha256').update(name).update('\0').update(canonicalJson(argumentsValue)).digest('hex')
-}
-
 export class GuardStateStore {
   private readonly states = new WeakMap<object, TurnState>()
 
@@ -226,7 +233,7 @@ export class GuardStateStore {
       dispatchRecords: new Map(),
       pendingLoopObservations: new Map(),
       loopState: createGuardLoopState(turn),
-      pendingBlockSignatures: new Set(),
+      pendingBlockCandidates: new Map(),
       blockedLoopSignatures: new Set(),
       deniedCallIds: new Set(),
       localLoopDenials: 0,
@@ -272,7 +279,7 @@ export class EfficiencyGuard {
     state.dispatchRecords.clear()
     state.pendingLoopObservations.clear()
     state.loopState = createGuardLoopState(state.turn)
-    state.pendingBlockSignatures.clear()
+    state.pendingBlockCandidates.clear()
     state.blockedLoopSignatures.clear()
     state.deniedCallIds.clear()
     state.localLoopDenials = 0

@@ -1,12 +1,22 @@
 import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_REPEAT_THRESHOLDS,
+  FINGERPRINT_MAX_BYTES,
+  FINGERPRINT_MAX_DEPTH,
+  FINGERPRINT_MAX_NODES,
   LOOP_HISTORY_LIMIT,
   createGuardLoopState,
   guardResultFingerprint,
   guardToolSignature,
   observeGuardLoop,
 } from '../src/guard-loop-core.ts'
+
+/** Nest `levels` objects around a scalar, so the leaf scalar sits at depth levels + 1. */
+function nest(levels: number): unknown {
+  let value: unknown = 'leaf'
+  for (let index = 0; index < levels; index += 1) value = { child: value }
+  return value
+}
 
 describe('guard loop core', () => {
   it('canonicalizes argument object key order into an exact repeat signature', () => {
@@ -255,5 +265,218 @@ describe('Guard switch independence', () => {
     }
     expect(last.decision.repeatCount).toBe(8)
     expect(last.decision.blockCandidate).toBe(true)
+  })
+
+  /** Drive `times` identical calls that all share one unchanged fingerprint. */
+  function repeating(options: Parameters<typeof observeGuardLoop>[3], times = 8): ReturnType<typeof observeGuardLoop> {
+    let state = createGuardLoopState(1)
+    let last = observeGuardLoop(state, 1, { name: 'r', arguments: {}, outcome: 'success', resultFingerprint: 'same' }, options)
+    state = last.state
+    for (let index = 1; index < times; index += 1) {
+      last = observeGuardLoop(state, 1, { name: 'r', arguments: {}, outcome: 'success', resultFingerprint: 'same' }, options)
+      state = last.state
+    }
+    return last
+  }
+
+  it('suppresses only the repeat reminder when repeat detection is off, and keeps counting', () => {
+    const off = repeating({ repeatDetection: false })
+    expect(off.decision.repeatCount).toBe(8)
+    expect(off.decision.warning).toBe('none')
+    // Only the reminder and the candidate are suppressed; the counts stay for diagnostics.
+    expect(off.decision.repeatThreshold).toBe(8)
+    expect(off.decision.blockCandidate).toBe(false)
+    expect(off.decision.blockSource).toBeUndefined()
+    // The alternating-cycle path still sees the same history.
+    const cycle = alternating({ repeatDetection: false, alternatingCycleEnabled: true })
+    expect(cycle.decision).toMatchObject({ alternatingCycle: true, warning: 'alternating-cycle', blockCandidate: true, blockSource: 'cycle' })
+  })
+
+  it('keeps the cycle path independent of the repeat path when repeat detection is on', () => {
+    const cycle = alternating({ repeatDetection: true, alternatingCycleEnabled: true })
+    expect(cycle.decision).toMatchObject({ warning: 'alternating-cycle', blockSource: 'cycle' })
+    const repeated = repeating({ repeatDetection: true, alternatingCycleEnabled: false })
+    expect(repeated.decision).toMatchObject({ warning: 'repeat', repeatThreshold: 8, blockSource: 'repeat' })
+  })
+
+  /**
+   * §4.3 full matrix. `duplicateDetection` is `repeatDetection` in the detector;
+   * the master `enabled` switch is enforced at the src/guard.ts entry and covered
+   * end-to-end by tests/guard.spec.ts, so its row is expressed here as "every
+   * detector idle", which is exactly what the core sees when it is off.
+   */
+  const matrix = [
+    {
+      label: 'duplicate on × cycle on × no-progress on',
+      duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: true,
+      repeatReminder: true, cycleReminder: true, repeatBlock: true, cycleBlock: true,
+    },
+    {
+      label: 'duplicate off × cycle on × no-progress on',
+      duplicateDetection: false, alternatingCycleDetection: true, noProgressProtection: true,
+      repeatReminder: false, cycleReminder: true, repeatBlock: false, cycleBlock: true,
+    },
+    {
+      label: 'duplicate on × cycle off × no-progress on',
+      duplicateDetection: true, alternatingCycleDetection: false, noProgressProtection: true,
+      repeatReminder: true, cycleReminder: false, repeatBlock: true, cycleBlock: false,
+    },
+    {
+      label: 'duplicate on × cycle on × no-progress off',
+      duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: false,
+      repeatReminder: true, cycleReminder: true, repeatBlock: false, cycleBlock: false,
+    },
+    {
+      label: 'duplicate off × cycle off × no-progress on',
+      duplicateDetection: false, alternatingCycleDetection: false, noProgressProtection: true,
+      repeatReminder: false, cycleReminder: false, repeatBlock: false, cycleBlock: false,
+    },
+    {
+      label: 'master switch off (all detectors idle) × no-progress off',
+      duplicateDetection: false, alternatingCycleDetection: false, noProgressProtection: false,
+      repeatReminder: false, cycleReminder: false, repeatBlock: false, cycleBlock: false,
+    },
+  ] as const
+
+  for (const row of matrix) {
+    it(`matrix: ${row.label}`, () => {
+      const options = {
+        repeatDetection: row.duplicateDetection,
+        alternatingCycleEnabled: row.alternatingCycleDetection,
+        noProgressProtection: row.noProgressProtection,
+      }
+
+      const repeated = repeating(options)
+      // Counting and cycle evidence stay live even when a detector is switched off.
+      expect(repeated.decision.repeatCount).toBe(8)
+      expect(repeated.decision.warning).toBe(row.repeatReminder ? 'repeat' : 'none')
+      expect(repeated.decision.blockCandidate).toBe(row.repeatBlock)
+      expect(repeated.decision.blockSource).toBe(row.repeatBlock ? 'repeat' : undefined)
+
+      const cycled = alternating(options)
+      expect(cycled.decision.alternatingCycle).toBe(row.cycleReminder)
+      expect(cycled.decision.warning).toBe(row.cycleReminder ? 'alternating-cycle' : 'none')
+      expect(cycled.decision.blockCandidate).toBe(row.cycleBlock)
+      expect(cycled.decision.blockSource).toBe(row.cycleBlock ? 'cycle' : undefined)
+    })
+  }
+})
+
+describe('fingerprint budgets', () => {
+  it('keeps the budgets large enough for ordinary tool payloads', () => {
+    // Guards against tuning the limits down until normal results stop being
+    // fingerprintable, which would silently weaken detection.
+    expect(FINGERPRINT_MAX_NODES).toBeGreaterThanOrEqual(10_000)
+    expect(FINGERPRINT_MAX_DEPTH).toBeGreaterThanOrEqual(32)
+    expect(FINGERPRINT_MAX_BYTES).toBeGreaterThanOrEqual(64 * 1024)
+  })
+
+  it('still fingerprints and detects a repeated small result', () => {
+    const result = { content: [{ type: 'text', text: 'small but real payload' }], rows: [{ id: 1 }] }
+    const first = observeGuardLoop(createGuardLoopState(1), 1, { name: 'read', arguments: { path: 'a' }, outcome: 'success', result })
+    expect(first.decision.ignored).toBe(false)
+    expect(first.state.history[0].resultFingerprint).toMatch(/^[a-f0-9]{64}$/)
+    // Same result again is proven unchanged evidence, not merely "same call".
+    const second = observeGuardLoop(first.state, 1, { name: 'read', arguments: { path: 'a' }, outcome: 'success', result })
+    expect(second.decision.noProgressEvidence).toBe('unchanged-result')
+  })
+
+  it('produces no fingerprint and no block candidate when the result exceeds the byte budget', () => {
+    const oversized = { content: [{ type: 'text', text: 'x'.repeat(FINGERPRINT_MAX_BYTES + 1024) }] }
+    expect(guardResultFingerprint('success', oversized)).toBeUndefined()
+
+    // Eight identical oversized results: with no fingerprint there is no evidence,
+    // so the reminder may fire but the call must never become blockable.
+    let state = createGuardLoopState(1)
+    let last = observeGuardLoop(state, 1, { name: 'read', arguments: { path: 'big' }, outcome: 'success', result: oversized })
+    state = last.state
+    for (let index = 0; index < 7; index += 1) {
+      last = observeGuardLoop(state, 1, { name: 'read', arguments: { path: 'big' }, outcome: 'success', result: oversized })
+      state = last.state
+    }
+    expect(last.decision.repeatCount).toBe(8)
+    expect(last.decision.blockCandidate).toBe(false)
+    expect(last.decision.noProgressEvidence).toBe('none')
+    expect(state.history.every(entry => entry.resultFingerprint === undefined)).toBe(true)
+  })
+
+  it('drops an observation whose argument signature exceeds the budget instead of comparing it', () => {
+    const oversizedArgs = { path: 'a', blob: 'y'.repeat(FINGERPRINT_MAX_BYTES + 1024) }
+    expect(guardToolSignature('read', oversizedArgs)).toBeUndefined()
+
+    const first = observeGuardLoop(createGuardLoopState(1), 1, {
+      name: 'read', arguments: oversizedArgs, outcome: 'success', resultFingerprint: 'same',
+    })
+    expect(first.decision.ignored).toBe(true)
+    expect(first.decision.blockCandidate).toBe(false)
+    expect(first.state.history).toHaveLength(0)
+  })
+
+  it('does not overflow the stack on nesting deeper than the depth budget', () => {
+    const tooDeep = nest(FINGERPRINT_MAX_DEPTH + 1)
+    expect(() => guardResultFingerprint('success', tooDeep)).not.toThrow()
+    expect(guardResultFingerprint('success', tooDeep)).toBeUndefined()
+    // Far past any recursive walk's limit: still a clean `undefined`, never a throw.
+    expect(guardResultFingerprint('success', nest(20_000))).toBeUndefined()
+    expect(guardToolSignature('read', nest(20_000))).toBeUndefined()
+
+    const observed = observeGuardLoop(createGuardLoopState(1), 1, {
+      name: 'read', arguments: { path: 'a' }, outcome: 'success', result: nest(20_000),
+    })
+    expect(observed.decision.blockCandidate).toBe(false)
+    expect(observed.state.history[0].resultFingerprint).toBeUndefined()
+  })
+
+  it('accepts nesting inside the depth budget', () => {
+    expect(guardResultFingerprint('success', nest(FINGERPRINT_MAX_DEPTH - 1))).toMatch(/^[a-f0-9]{64}$/)
+  })
+
+  it('stops at the node budget without returning a partial fingerprint', () => {
+    const tooManyNodes = Array.from({ length: FINGERPRINT_MAX_NODES + 1 }, (_, index) => index)
+    expect(guardResultFingerprint('success', tooManyNodes)).toBeUndefined()
+    // A wide-but-shallow object under budget still fingerprints normally.
+    expect(guardResultFingerprint('success', { items: Array.from({ length: 500 }, (_, index) => index) }))
+      .toMatch(/^[a-f0-9]{64}$/)
+  })
+
+  it('keeps the loop lifecycle intact across cyclic and throwing inputs', () => {
+    const cyclic: Record<string, unknown> = { name: 'cycle' }
+    cyclic.self = cyclic
+    expect(guardResultFingerprint('success', cyclic)).toBeUndefined()
+    expect(guardToolSignature('read', cyclic)).toBeUndefined()
+
+    const throwing = { get boom(): string { throw new Error('getter exploded') } }
+    expect(guardResultFingerprint('success', throwing)).toBeUndefined()
+
+    // A result that cannot be fingerprinted must not break the run: the call is
+    // still recorded (signature is fine) and the next normal call keeps working.
+    let state = createGuardLoopState(1)
+    const withCyclic = observeGuardLoop(state, 1, { name: 'read', arguments: { path: 'c' }, outcome: 'success', result: cyclic })
+    expect(withCyclic.decision.ignored).toBe(false)
+    state = withCyclic.state
+    const withThrowing = observeGuardLoop(state, 1, { name: 'read', arguments: { path: 'c' }, outcome: 'success', result: throwing })
+    state = withThrowing.state
+    expect(state.history).toHaveLength(2)
+    expect(state.history.every(entry => entry.resultFingerprint === undefined)).toBe(true)
+    expect(withThrowing.decision.blockCandidate).toBe(false)
+
+    const normal = observeGuardLoop(state, 1, { name: 'read', arguments: { path: 'c' }, outcome: 'success', result: { ok: true } })
+    expect(normal.state.history).toHaveLength(3)
+    expect(normal.state.history.at(-1)?.resultFingerprint).toMatch(/^[a-f0-9]{64}$/)
+    expect(normal.state.turn).toBe(1)
+  })
+
+  it('never treats a missing fingerprint as an unchanged result', () => {
+    // Same call, one fingerprinted result and one over budget: no evidence.
+    const first = observeGuardLoop(createGuardLoopState(1), 1, {
+      name: 'read', arguments: { path: 'a' }, outcome: 'success', result: { ok: true },
+    })
+    const second = observeGuardLoop(first.state, 1, {
+      name: 'read', arguments: { path: 'a' }, outcome: 'success',
+      result: { content: [{ type: 'text', text: 'x'.repeat(FINGERPRINT_MAX_BYTES + 1) }] },
+    })
+    expect(second.decision.repeatCount).toBe(2)
+    expect(second.decision.noProgressEvidence).toBe('none')
+    expect(second.decision.blockCandidate).toBe(false)
   })
 })

@@ -1,6 +1,6 @@
 # dsh-thinking-guard
 
-一个 DSH 插件：把**能力目录与按需调用**（Capability Menu 思路）和 **Agent 效率守卫**（重复/循环调用提醒）整合在一起。当前版本 **0.1.15**。
+一个 DSH 插件：把**能力目录与按需调用**（Capability Menu 思路）和 **Agent 效率守卫**（重复/循环调用提醒）整合在一起。当前版本 **0.1.18**。
 
 ## 它做什么
 
@@ -13,6 +13,12 @@
 - 不做工具结果压缩与原文恢复——那是 [dsh-plugin-save-token](https://github.com/YAN3RA/dsh-plugin-save-token) 的职责。
 - 不做模型 / Provider / 完整会话管理——那是 DSH 宿主的职责。
 - 不读取、保存或输出隐藏思维链。
+
+## 宿主兼容性
+
+- **实测版本：DSH 0.2.2-rc.1**。本插件的开发、类型检查与测试都以该版本为基线（`devDependencies` 中 `@deepseek-ai/dsh-*` 均为 `0.2.2-rc.1`，`node_modules/@deepseek-ai/dsh-tools` 实测也是 `0.2.2-rc.1`）。
+- `peerDependencies` 声明的范围是 `^0.2.0 || ^0.2.1-rc.3 || ^0.2.2-rc.1`。范围内**除 0.2.2-rc.1 以外的版本均未实测**，属于理论兼容，不代表已验证可用。
+- 只有 `0.2.2-rc.1` 上跑过完整检查；其他 0.2.x 版本请按「提示 DSH 版本不兼容」一节的流程自行评估风险。
 
 ## 安装
 
@@ -33,7 +39,7 @@ dsh plugin --profile desktop add dsh-thinking-guard
 ### 指定版本 / 升级
 
 ```bash
-dsh plugin --profile desktop add dsh-thinking-guard@0.1.17   # 锁定版本
+dsh plugin --profile desktop add dsh-thinking-guard@0.1.18   # 锁定版本
 dsh plugin --profile desktop add dsh-thinking-guard           # 升到最新
 ```
 
@@ -146,7 +152,13 @@ ls -t ~/.dsh/profiles/desktop/.plugin-manager/logs | head
 
 ## 配置
 
-默认 Guard 模式为 `normal`。当前 Step、Tool 次数、Duration 阈值只保留配置校验和计数，不触发软提醒或硬停止。`stepLimitMode: hard-stop` 会归一为 `warn-only`，`duplicateHardBlock: true` 会归一为 `false`，启动时分别记录弃用提示。开启 `duplicateDetection` 时，连续重复的第 3/5/8 次与有证据的 A-B 循环会提醒；只有相同操作及结果/错误指纹满足策略门槛后，才会通过 `tools.guard` 对匹配调用局部拒绝一次，不停止整个 Turn。配置位于插件 root entry 的 `config.guard`，状态按 Agent / Turn 隔离。
+默认 Guard 模式为 `normal`。Guard 的行为由三个开关各自独立控制：
+
+- `duplicateDetection`：精确重复提醒。开启后，同一操作及相同结果/错误指纹构成的连续重复达到第 3/5/8 次时给出提醒。
+- `alternatingCycleDetection`：交替循环识别。开启后，识别有证据的 A-B 交替循环并给出提醒；它与 `duplicateDetection` 互相独立，关掉其一不影响另一个。
+- `noProgressProtection`：局部拒绝的总闸。关闭时 Guard 仍然提醒，但**绝不拒绝任何调用**；只有开启、且相同操作及结果/错误指纹满足门槛时，才通过 `tools.guard` 对匹配调用局部拒绝一次，不停止整个 Turn。
+
+Quick / Normal / Deep 里的 `soft*` / `hard*` 阈值（Step、Tool 次数、Duration）只是兼容字段与计数口径，**不产生提醒，也不停止任务**。`stepLimitMode: hard-stop` 会归一为 `warn-only`，`duplicateHardBlock: true` 会归一为 `false`，启动时分别记录弃用提示。配置位于插件 root entry 的 `config.guard`，状态按 Agent / Turn 隔离。
 
 ## 文档入口
 

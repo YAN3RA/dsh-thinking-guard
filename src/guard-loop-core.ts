@@ -3,6 +3,42 @@ import { createHash } from 'node:crypto'
 export const LOOP_HISTORY_LIMIT = 16
 export const DEFAULT_REPEAT_THRESHOLDS = Object.freeze([3, 5, 8] as const)
 
+/**
+ * Fingerprint budgets, checked *while* canonicalizing.
+ *
+ * Exceeding any budget abandons the fingerprint entirely. A truncated canonical
+ * form would still look complete and could make two different results compare
+ * equal — the false "no progress" evidence this guard must never invent.
+ *
+ * - `FINGERPRINT_MAX_NODES`: values visited (object keys charge bytes only).
+ *   A 1000-row x 5-field tool result is ~6k nodes; 20k still fingerprints a
+ *   ~3300-row table in a few milliseconds.
+ * - `FINGERPRINT_MAX_DEPTH`: nesting levels, root = 1. The recursive walk
+ *   overflows the stack at ~2000 object levels on the bundled Node 22 runtime
+ *   with the default stack (measured), so 64 keeps ~30x headroom and is still
+ *   far deeper than any real payload (`content[] -> block -> value` is depth 4).
+ * - `FINGERPRINT_MAX_BYTES`: UTF-8 bytes of the canonical JSON. 256 KiB covers
+ *   ordinary file reads, search hits and multi-hundred-KB JSON in under 1 ms,
+ *   while a multi-megabyte result is rejected before it is fully materialized.
+ */
+export const FINGERPRINT_MAX_NODES = 20_000
+export const FINGERPRINT_MAX_DEPTH = 64
+export const FINGERPRINT_MAX_BYTES = 256 * 1024
+
+/** Which budget rejected a value. */
+export type GuardFingerprintBudget = 'nodes' | 'depth' | 'bytes'
+
+/** Internal signal: this value cannot be fingerprinted within budget. */
+export class GuardFingerprintBudgetError extends Error {
+  readonly limit: GuardFingerprintBudget
+
+  constructor(limit: GuardFingerprintBudget) {
+    super(`guard fingerprint budget exceeded: ${limit}`)
+    this.name = 'GuardFingerprintBudgetError'
+    this.limit = limit
+  }
+}
+
 export type GuardToolOutcome = 'success' | 'error' | 'denied' | 'cancelled'
 
 type LoopHistoryEntry = {
@@ -36,6 +72,12 @@ export interface GuardLoopOptions {
   /** Disable sequence-cycle detection after overlapping dispatches were observed. */
   readonly disableSequenceDetection?: boolean
   /**
+   * Exact-repeat detection switch. False suppresses the 'repeat' reminder and the
+   * repeat block candidate; `repeatCount` is still counted for diagnostics and the
+   * alternating-cycle path keeps running on the same history.
+   */
+  readonly repeatDetection?: boolean
+  /**
    * Alternating-cycle detection switch. False reports no cycle at all, leaving
    * the repeat-detection path (and its reminders) untouched.
    */
@@ -55,6 +97,9 @@ export interface GuardLoopOptions {
 
 export type NoProgressEvidence = 'none' | 'unchanged-result' | 'unchanged-error' | 'unchanged-cycle'
 
+/** Which detector turned a call into a local-block candidate. */
+export type GuardLoopBlockSource = 'repeat' | 'cycle'
+
 export interface GuardLoopDecision {
   readonly ignored: boolean
   readonly signature?: string
@@ -64,6 +109,8 @@ export interface GuardLoopDecision {
   readonly repeatThreshold?: number
   /** Advisory only. The caller must not block without applying its own policy. */
   readonly blockCandidate: boolean
+  /** Set only when `blockCandidate` is true, so the caller can gate per source. */
+  readonly blockSource?: GuardLoopBlockSource
   readonly noProgressEvidence: NoProgressEvidence
 }
 
@@ -76,39 +123,98 @@ export function createGuardLoopState(turn: number): GuardLoopState {
   return { turn, history: [] }
 }
 
-function canonicalJson(value: unknown, seen = new Set<object>()): string {
-  if (value === null) return 'null'
-  if (typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value)
-  if (typeof value === 'number') return Number.isFinite(value) ? JSON.stringify(value) : 'null'
-  if (typeof value === 'undefined') return '"[undefined]"'
-  if (typeof value === 'bigint') return JSON.stringify(value.toString())
-  if (typeof value !== 'object') return JSON.stringify(String(value))
+interface FingerprintBudget {
+  nodes: number
+  bytes: number
+}
+
+function chargeBytes(budget: FingerprintBudget, text: string): string {
+  budget.bytes += Buffer.byteLength(text, 'utf8')
+  if (budget.bytes > FINGERPRINT_MAX_BYTES) throw new GuardFingerprintBudgetError('bytes')
+  return text
+}
+
+/**
+ * Canonical JSON with hard node/depth/byte budgets.
+ *
+ * Throws `GuardFingerprintBudgetError` the moment a budget is crossed instead of
+ * returning a partial string, because a partial string is indistinguishable from
+ * a complete one. The cycle check stays a `TypeError` so cyclic input keeps its
+ * own error class.
+ */
+function canonicalJson(value: unknown, depth: number, budget: FingerprintBudget, seen: Set<object>): string {
+  budget.nodes += 1
+  if (budget.nodes > FINGERPRINT_MAX_NODES) throw new GuardFingerprintBudgetError('nodes')
+  if (depth > FINGERPRINT_MAX_DEPTH) throw new GuardFingerprintBudgetError('depth')
+  if (value === null) return chargeBytes(budget, 'null')
+  if (typeof value === 'string' || typeof value === 'boolean') return chargeBytes(budget, JSON.stringify(value))
+  if (typeof value === 'number') return chargeBytes(budget, Number.isFinite(value) ? JSON.stringify(value) : 'null')
+  if (typeof value === 'undefined') return chargeBytes(budget, '"[undefined]"')
+  if (typeof value !== 'object') return chargeBytes(budget, JSON.stringify(String(value)))
   if (seen.has(value)) throw new TypeError('Cannot fingerprint a cyclic value')
   seen.add(value)
-  let result: string
-  if (Array.isArray(value)) {
-    result = `[${value.map(item => canonicalJson(item, seen)).join(',')}]`
+  const isArray = Array.isArray(value)
+  const open = chargeBytes(budget, isArray ? '[' : '{')
+  let body = ''
+  if (isArray) {
+    const items = value as readonly unknown[]
+    for (let index = 0; index < items.length; index += 1) {
+      if (index > 0) body += chargeBytes(budget, ',')
+      body += canonicalJson(items[index], depth + 1, budget, seen)
+    }
   } else {
     const record = value as Record<string, unknown>
-    result = `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(record[key], seen)}`).join(',')}}`
+    for (const key of Object.keys(record).sort()) {
+      if (body.length > 0) body += chargeBytes(budget, ',')
+      body += chargeBytes(budget, `${JSON.stringify(key)}:`)
+      body += canonicalJson(record[key], depth + 1, budget, seen)
+    }
   }
+  const close = chargeBytes(budget, isArray ? ']' : '}')
   seen.delete(value)
-  return result
+  return `${open}${body}${close}`
 }
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
-export function guardToolSignature(name: string, argumentsValue: unknown): string {
-  return sha256(`${name}\0${canonicalJson(argumentsValue)}`)
+/**
+ * Fingerprint one canonical form, or `undefined` when it cannot be proven.
+ *
+ * Fail-open by construction: budget overflow, cycles, and a throwing getter on
+ * an otherwise plain object all resolve to "no fingerprint", never an exception
+ * for the caller. `undefined` is *not* evidence that two values are equal — see
+ * `fingerprintsMatch`.
+ */
+function boundedHash(prefix: string, value: unknown): string | undefined {
+  try {
+    const canonical = canonicalJson(value, 1, { nodes: 0, bytes: 0 }, new Set<object>())
+    return sha256(`${prefix}\0${canonical}`)
+  } catch {
+    return undefined
+  }
 }
 
-/** Fingerprint a result/error transiently; raw content is never returned or retained. */
-export function guardResultFingerprint(outcome: GuardToolOutcome, value: unknown): string {
-  return sha256(`${outcome}\0${canonicalJson(value)}`)
+/** Bounded argument signature; `undefined` means this call is not comparable. */
+export function guardToolSignature(name: string, argumentsValue: unknown): string | undefined {
+  return boundedHash(name, argumentsValue)
 }
 
+/**
+ * Fingerprint a result/error transiently; raw content is never returned or
+ * retained. `undefined` means "cannot prove the result did not change".
+ */
+export function guardResultFingerprint(outcome: GuardToolOutcome, value: unknown): string | undefined {
+  return boundedHash(outcome, value)
+}
+
+/**
+ * Two entries match only when *both* carry a fingerprint. A missing fingerprint
+ * means "cannot prove no progress happened" and must never be read as "results
+ * are identical" — otherwise every oversized result would become no-progress
+ * evidence and could be denied.
+ */
 function fingerprintsMatch(a: LoopHistoryEntry, b: LoopHistoryEntry): boolean {
   return a.outcome === b.outcome
     && a.resultFingerprint !== undefined
@@ -147,6 +253,10 @@ function noopDecision(): GuardLoopDecision {
  * Pure bounded detector. It never enforces a step, call-count, or duration budget.
  * Alternating cycles warn; a local-block candidate requires matching result/error
  * fingerprints for every leg of the repeated cycle.
+ *
+ * An observation whose argument signature exceeds the fingerprint budget is
+ * dropped exactly like an excluded tool: without a stable signature there is no
+ * comparable history entry, so no reminder and no block candidate is produced.
  */
 export function observeGuardLoop(
   previousState: GuardLoopState,
@@ -160,6 +270,7 @@ export function observeGuardLoop(
   }
 
   const signature = observation.signature ?? guardToolSignature(observation.name, observation.arguments)
+  if (signature === undefined) return { state: base, decision: noopDecision() }
   const fingerprint = observation.resultFingerprint
     ?? (Object.hasOwn(observation, 'result') ? guardResultFingerprint(observation.outcome, observation.result) : undefined)
   const current: LoopHistoryEntry = {
@@ -197,12 +308,21 @@ export function observeGuardLoop(
     throw new Error('repeatThresholds must contain unique integers >= 2')
   }
   const repeatThreshold = thresholds.includes(repeatCount) ? repeatCount : undefined
-  const warning = alternatingCycle ? 'alternating-cycle' : repeatThreshold !== undefined ? 'repeat' : 'none'
+  // Repeat detection and cycle detection are independent switches: neither may
+  // suppress the other. `repeatCount` keeps counting even when reminders are off.
+  const repeatEnabled = options.repeatDetection !== false
+  const warning = alternatingCycle ? 'alternating-cycle' : repeatEnabled && repeatThreshold !== undefined ? 'repeat' : 'none'
   const noProgressEvidence = cycleEvidence !== 'none' ? cycleEvidence : exactEvidence
+  const repeatCandidate = repeatEnabled && exactEvidence !== 'none' && repeatCount >= thresholds[thresholds.length - 1]
+  const cycleCandidate = cycleEvidence !== 'none'
+  const blockSource: GuardLoopBlockSource | undefined = cycleCandidate
+    ? 'cycle'
+    : repeatCandidate
+      ? 'repeat'
+      : undefined
   const blockCandidate = options.noProgressProtection !== false
     && !options.warnOnlyTools?.has(observation.name)
-    && (cycleEvidence !== 'none'
-      || (exactEvidence !== 'none' && repeatCount >= thresholds[thresholds.length - 1]))
+    && blockSource !== undefined
 
   return {
     state: { turn, history: nextHistory },
@@ -214,6 +334,7 @@ export function observeGuardLoop(
       warning,
       ...(repeatThreshold !== undefined ? { repeatThreshold } : {}),
       blockCandidate,
+      ...(blockCandidate && blockSource !== undefined ? { blockSource } : {}),
       noProgressEvidence,
     },
   }

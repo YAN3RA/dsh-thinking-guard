@@ -701,6 +701,70 @@ describe('capability-policy persistence (tier writes)', () => {
   })
 })
 
+describe('On-demand attribution predicate (isHiddenOnlyByPolicy)', () => {
+  /**
+   * The predicate the On-demand `meta_invoke` forward leans on. It must answer
+   * `true` only when this policy's own `tools.restrict({ deny })` is the sole
+   * reason a name is invisible; every other answer is a refusal to lift.
+   */
+  it('attributes a mask to this policy only when nobody else hides the name', async () => {
+    const ctx = await setup({ tools: { 'on-demand': ['mcp__km__search', 'mcp__km__shared'] } })
+    registerTool(ctx, 'mcp__km__search')
+    registerTool(ctx, 'mcp__km__shared')
+    registerTool(ctx, 'mcp__km__resident')
+    await ctx.capability.refresh()
+    const agent = await announceAgent(ctx)
+    const policyService = ctx.capabilityPolicy
+
+    // Masked by this policy alone → attributable, so the forward may lift it.
+    expect(agent.ctx.get('tools')?.get('mcp__km__search', agent as never)).toBeUndefined()
+    expect(policyService.isHiddenOnlyByPolicy(agent, 'mcp__km__search')).toBe(true)
+
+    // A Resident name is not hidden at all: there is nothing to attribute.
+    expect(policyService.isHiddenOnlyByPolicy(agent, 'mcp__km__resident')).toBe(false)
+    // A name this policy never denied, and an agent it never restricted.
+    expect(policyService.isHiddenOnlyByPolicy(agent, 'mcp__km__absent')).toBe(false)
+    expect(policyService.isHiddenOnlyByPolicy(undefined, 'mcp__km__search')).toBe(false)
+    expect(policyService.isHiddenOnlyByPolicy({}, 'mcp__km__search')).toBe(false)
+
+    // A third-party deny of a Resident name is not this policy's doing.
+    await agent.ctx.plugin({
+      name: 'third-party-deny-resident',
+      inject: ['tools'],
+      apply(restrictedCtx) { restrictedCtx.tools.restrict({ deny: ['mcp__km__resident'] }) },
+    })
+    expect(agent.ctx.get('tools')?.get('mcp__km__resident', agent as never)).toBeUndefined()
+    expect(policyService.isHiddenOnlyByPolicy(agent, 'mcp__km__resident')).toBe(false)
+
+    // Both masks on the same On-demand name: conservative, so not attributable.
+    await agent.ctx.plugin({
+      name: 'third-party-deny-shared',
+      inject: ['tools'],
+      apply(restrictedCtx) { restrictedCtx.tools.restrict({ deny: ['mcp__km__shared'] }) },
+    })
+    expect(agent.ctx.get('tools')?.get('mcp__km__shared', agent as never)).toBeUndefined()
+    expect(policyService.isHiddenOnlyByPolicy(agent, 'mcp__km__shared')).toBe(false)
+
+    // …and the unaffected On-demand name keeps its attribution, so the reapply
+    // path rebuilt the set instead of dropping it.
+    expect(policyService.isHiddenOnlyByPolicy(agent, 'mcp__km__search')).toBe(true)
+  })
+
+  it('drops the attribution when a tier move lifts the mask', async () => {
+    const ctx = await setup({ tools: { 'on-demand': ['mcp__km__search'] } })
+    registerTool(ctx, 'mcp__km__search')
+    await ctx.capability.refresh()
+    const agent = await announceAgent(ctx)
+    expect(ctx.capabilityPolicy.isHiddenOnlyByPolicy(agent, 'mcp__km__search')).toBe(true)
+
+    // Resident again: the name is visible, so nothing may be forwarded on the
+    // strength of a stale proof.
+    await ctx.capabilityPolicy.updateConfig({ tools: { resident: ['mcp__km__search'] } })
+    expect(agent.ctx.get('tools')?.get('mcp__km__search', agent as never)).toBeDefined()
+    expect(ctx.capabilityPolicy.isHiddenOnlyByPolicy(agent, 'mcp__km__search')).toBe(false)
+  })
+})
+
 describe('capability-policy startup', () => {
   it('settles despite a pending initial registry refresh', async () => {
     const ctx = new Context()

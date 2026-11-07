@@ -96,17 +96,23 @@ export function apply(ctx: Context, config: Config = {}): void {
   // The source override keeps On-demand targets reachable. The policy hides them
   // with an agent-scoped `tools.restrict({ deny })` (see `src/policy.ts`), which
   // removes them from `view(agent)` — and the default lookup,
-  // `tools.executable(name, scope, toolSet)`, reads exactly that view. Without
-  // the fallback every On-demand forward would fail as UNKNOWN_TOOL. The
-  // fallback is limited to names THIS policy classifies as On-demand, so a
-  // restriction placed by someone else still denies the call. Execution still
-  // carries `agent`, `signal`, and `parent`, so scope, pre-execute policy,
-  // guards, and event attribution are unchanged.
+  // `tools.executable(name, scope, toolSet)`, reads exactly that view. Without a
+  // fallback every On-demand forward would fail as UNKNOWN_TOOL.
+  //
+  // The fallback is therefore narrow on purpose: it applies only to a name the
+  // policy can PROVE is invisible *solely* because of its own On-demand mask
+  // (`capabilityPolicy.isHiddenOnlyByPolicy`). Classification alone is not
+  // evidence — it says how this plugin treats a name, not whether a third party
+  // also denies it — so a `tools.restrict({ deny })`, an `allow` filter, or any
+  // other restriction installed by someone else still denies the call, exactly
+  // like it denies a direct one. Execution still carries `agent`, `signal`, and
+  // `parent`, so scope, pre-execute policy, guards, and event attribution are
+  // unchanged.
   const resolveForwardDefinition = (name: string, scope: unknown, toolSet: unknown) => {
     const visible = ctx.tools.executable(name, scope as never, toolSet as never)
     if (visible !== undefined) return visible
     const policy = ctx.get('capabilityPolicy')
-    if (policy?.classifyTool(name) !== 'on-demand') return undefined
+    if (policy?.isHiddenOnlyByPolicy(scope as object | undefined, name) !== true) return undefined
     // Registered definitions only: the step's admission set belongs to the
     // caller's view, which this policy just masked.
     return ctx.tools.get(name)
@@ -228,9 +234,9 @@ export function apply(ctx: Context, config: Config = {}): void {
       // schema.
       if (capability.kind === 'tool') {
         // Resolve the target the same way the forward does: the caller's view
-        // first, then — only for a name this policy classified On-demand — the
-        // registered definition, because the policy itself masked that name out
-        // of the caller's view. Every other restriction still reads as absent.
+        // first, then — only for a name the policy proved it alone masked — the
+        // registered definition. Any other restriction still reads as absent,
+        // so this never lifts a third party's decision.
         const definition = resolveForwardDefinition(capability.name, exec.agent, exec.toolSet)
         if (definition === undefined) {
           throw new Error(`meta_invoke: tool "${capability.name}" is not available`)

@@ -509,6 +509,47 @@ describe('capability-menu-invoke', () => {
     expect(isError).toBe(true)
   })
 
+  it('denies an On-demand forward once a third party also restricts the name', async () => {
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(join(tmpdir(), 'dsh-meta-invoke-')))
+    const ctx = await setup(home)
+    await ctx.plugin(policy, { tools: { 'on-demand': ['mcp__km__search'] }, stateFile: '' })
+    let calls = 0
+    const name = registerMcpTool(ctx, 'km', 'search', 'Search the knowledge base', () => {
+      calls += 1
+      return { ok: true }
+    })
+    await ctx.capability.refresh()
+    expect(ctx.capabilityPolicy.classifyTool(name)).toBe('on-demand')
+
+    const agent = agentStub('on-demand-restricted') as { id: string; ctx: Context }
+    agent.ctx = createScope(ctx, agent as never).ctx
+    await ctx.emit('agent/created', { agent: agent as never })
+
+    // Control: this policy's own mask alone must not block the forward —
+    // otherwise the denial below could not be attributed to the third party.
+    expect(agent.ctx.get('tools')?.get(name, agent as never)).toBeUndefined()
+    const allowed = await runTool(ctx, 'meta_invoke', { id: name, kind: 'tool', args: { title: 'x' } }, agent)
+    expect(allowed.isError).toBe(false)
+    expect(calls).toBe(1)
+
+    // The third party denies the same name for the same agent scope.
+    await agent.ctx.plugin({
+      name: 'third-party-deny',
+      inject: ['tools'],
+      apply(restrictedCtx) { restrictedCtx.tools.restrict({ deny: [name] }) },
+    })
+    expect(ctx.capabilityPolicy.isHiddenOnlyByPolicy(agent, name)).toBe(false)
+
+    const denied = await runTool(ctx, 'meta_invoke', { id: name, kind: 'tool', args: { title: 'x' } }, agent)
+    expect(denied.isError).toBe(true)
+    expect(calls).toBe(1)
+
+    // The third party's own decision is what denies it: a direct call fails too.
+    const direct = await runTool(ctx, name, { title: 'x' }, agent)
+    expect(direct.isError).toBe(true)
+    expect(calls).toBe(1)
+  })
+
   it('dedups already-loaded skills within one session and returns a short reminder on repeat', async () => {
     const home = await import('node:fs/promises').then(fs => fs.mkdtemp(join(tmpdir(), 'dsh-meta-invoke-')))
     await writeSkill(`${home}/.agents/skills`, 'frontend-design', 'Design guidance', 'Full design instructions body here.')

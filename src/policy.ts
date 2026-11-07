@@ -345,6 +345,18 @@ export interface CapabilityPolicyService {
    * a bare name shared by a tool and a skill.
    */
   isDisabledCapability(id: string, kind?: CapabilityKind): boolean
+  /**
+   * True only when `name` is invisible in `agent`'s tool view *solely* because
+   * this policy's own On-demand restriction hides it.
+   *
+   * This is the attribution predicate the On-demand `meta_invoke` forward is
+   * allowed to lean on (`src/invoke.ts`), so every answer is conservative:
+   * a name a third party also hides (`tools.restrict`, an `allow` filter, …),
+   * a name this policy never denied, and an unknown/absent agent all return
+   * `false`. Lifting a third party's decision is exactly what must not happen,
+   * so "cannot prove it is only ours" reads as "not ours".
+   */
+  isHiddenOnlyByPolicy(agent: object | undefined, name: string): boolean
   /** Tool names that are always kept Resident. */
   metaTools(): readonly string[]
   /** Resolve a capability's id to a class; pass `kind` to disambiguate a bare name. */
@@ -719,6 +731,16 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     isDisabledCapability(id: string, kind?: CapabilityKind): boolean {
       return service.classifyCapability(id, kind) === 'disabled'
     },
+    isHiddenOnlyByPolicy(agent: object | undefined, name: string): boolean {
+      // Fail closed on every axis: no agent, no recorded proof, a name this
+      // policy never denied, or a name that is currently visible (so there is
+      // nothing to lift) all answer `false`.
+      if (agent === undefined || agent === null) return false
+      const owned = policyOwnedHiddenNames.get(agent)
+      if (owned === undefined || !owned.has(name)) return false
+      if (service.classifyTool(name) !== 'on-demand') return false
+      return !visibleTo(agent, name)
+    },
     metaTools(): readonly string[] {
       return metaTools
     },
@@ -871,6 +893,82 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   const onDemandRestrictions = new WeakMap<object, { dispose: () => void; deny: readonly string[] }>()
 
   /**
+   * Per-agent names this policy can PROVE it hides on its own.
+   *
+   * `meta_invoke` has to execute an On-demand tool that this policy masked out
+   * of the caller's view, i.e. read a definition the caller cannot see. Doing
+   * that for every name classified On-demand is the bypass this set replaces:
+   * classification states how THIS plugin treats a name, never whether somebody
+   * else also denies it.
+   *
+   * The proof is taken in the one moment the caller's view is free of this
+   * policy's own mask — after the previous restriction is disposed and before
+   * the next one is installed (see `applyOnDemandRestriction`). A name still
+   * absent in that window is hidden by a third party as well and is therefore
+   * never recorded.
+   *
+   * Both halves fail closed: a missing entry (unknown agent, nothing applied,
+   * the apply threw) reads as "not ours", and the post-install re-check drops
+   * any name this deny list demonstrably does not hide.
+   *
+   * Staleness is not possible at read time, because the set is recomputed
+   * synchronously from every `tools/change` — including the one a third-party
+   * `tools.restrict()` emits after its filter is already live — while a forward
+   * always runs in a later task than the change that could affect it.
+   */
+  const policyOwnedHiddenNames = new WeakMap<object, ReadonlySet<string>>()
+
+  /**
+   * Install one agent's deny list, recording the disposer it produced.
+   *
+   * `restrict()` rejects the whole call when any name is no longer a known
+   * global tool, so a late or racing registration can make an otherwise valid
+   * list fail. That must not fail the caller: the agent then simply keeps the
+   * tool declared, which is what the previous code did and what the warning
+   * records. Returns the installed entry, or `undefined` when nothing landed —
+   * in which case no name may be attributed to this policy.
+   */
+  const installOnDemandRestriction = (
+    agent: { ctx: Context; id?: unknown },
+    deny: readonly string[],
+  ): { dispose: () => void; deny: readonly string[] } | undefined => {
+    const scopedTools = agent.ctx.get('tools')
+    if (scopedTools === undefined) return undefined
+    try {
+      const entry = { dispose: scopedTools.restrict({ deny }), deny }
+      onDemandRestrictions.set(agent, entry)
+      return entry
+    } catch (error) {
+      ctx.logger.warn(`capability-policy: cannot apply On-demand restriction for agent ${String(agent.id)}: ${String(error)}`)
+      return undefined
+    }
+  }
+
+  /**
+   * Whether `name` is currently visible to `agent` as a registered definition.
+   *
+   * Reads the same view the forward reads (`tools.get(name, scope)`), through
+   * the public service only — no Cordis internals. Used both for the attribution
+   * window (this policy's mask lifted) and for the post-install re-check.
+   */
+  const visibleTo = (agent: object, name: string): boolean =>
+    ctx.tools.get(name, agent as never) !== undefined
+
+  /**
+   * The names among `deny` whose invisibility is caused by this policy alone.
+   *
+   * Caller contract: this policy's own restriction is currently NOT installed
+   * for `agent`, so whatever is still hidden is hidden by somebody else.
+   */
+  const namesHiddenOnlyByPolicy = (agent: object, deny: readonly string[]): Set<string> => {
+    const owned = new Set<string>()
+    for (const name of deny) {
+      if (visibleTo(agent, name)) owned.add(name)
+    }
+    return owned
+  }
+
+  /**
    * Agents this policy has seen created and not yet disposed.
    *
    * Kept as an explicit live set instead of reading `ctx.agents.list()` so a
@@ -913,6 +1011,16 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
    * without it the nested pass would dispose the restriction the outer pass just
    * installed and leave two intersecting masks live, permanently hiding tools
    * the current policy considers Resident.
+   *
+   * This is also the only place attribution is decided. Between
+   * `previous.dispose()` and `installOnDemandRestriction()` the caller's view
+   * carries every restriction except this policy's own, and the whole window
+   * runs synchronously inside one listener invocation — Cordis dispatches
+   * `tools/change` synchronously and the disposer runs inline — so no other
+   * plugin can slip a restriction in or out while the sample is taken. A name
+   * visible there is hidden by this policy alone; a name still hidden there is
+   * hidden by somebody else too, so it is never attributed and never becomes
+   * forwardable.
    */
   let applying = false
   const applyOnDemandRestriction = (agent: { ctx: Context; id?: unknown }, force = false): void => {
@@ -930,15 +1038,23 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         onDemandRestrictions.delete(agent)
         previous.dispose()
       }
+      // Attribution window: this policy's mask is off, so this sample proves
+      // which of `deny` are invisible only because of a third party.
+      const owned = deny.length === 0 ? new Set<string>() : namesHiddenOnlyByPolicy(agent, deny)
+      policyOwnedHiddenNames.set(agent, owned)
       if (deny.length === 0) return
-      const scopedTools = agent.ctx.get('tools')
-      if (scopedTools === undefined) return
-      try {
-        onDemandRestrictions.set(agent, { dispose: scopedTools.restrict({ deny }), deny })
-      } catch (error) {
-        // A late restriction on a disposing agent must not fail the caller; the
-        // next assembly then simply keeps the tool declared.
-        ctx.logger.warn(`capability-policy: cannot apply On-demand restriction for agent ${String(agent.id)}: ${String(error)}`)
+      if (installOnDemandRestriction(agent, deny) === undefined) {
+        // Nothing was installed, so nothing is hidden by this policy: an entry
+        // here would let the forward lift a mask that does not exist.
+        policyOwnedHiddenNames.set(agent, new Set())
+        return
+      }
+      // Post-install re-check: a name this list claims to hide but which is
+      // still visible cannot be attributed to it. `restrict()` only masks the
+      // names it was given, so this can only fire on a view that disagrees —
+      // fail closed rather than forward an unproven name.
+      for (const name of owned) {
+        if (visibleTo(agent, name)) owned.delete(name)
       }
     } finally {
       applying = false
@@ -961,6 +1077,10 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
 
   ctx.on('agent/disposed', ({ agent }) => {
     restrictedAgents.delete(agent)
+    // Drop the attribution before anything else: once this policy's mask is
+    // gone, a name still hidden here is hidden by a third party, and a stale
+    // entry must never authorise a forward on its behalf.
+    policyOwnedHiddenNames.delete(agent)
     const entry = onDemandRestrictions.get(agent)
     if (entry === undefined) return
     entry.dispose()

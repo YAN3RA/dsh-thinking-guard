@@ -10,6 +10,7 @@ import {
   guardResultFingerprint,
   guardToolSignature,
   observeGuardLoop,
+  type GuardLoopBlockSource,
   type GuardLoopOptions,
   type GuardToolOutcome,
 } from './guard-loop-core.ts'
@@ -107,6 +108,22 @@ function isControlPlaneTool(policy: CapabilityPolicyService, name: string): bool
   return RESERVED_TRANSPORT_TOOLS.has(name) || policy.metaTools().includes(name)
 }
 
+/**
+ * True when this tool can never become a local-block candidate, judged from its
+ * name alone. Such a call needs no result fingerprint at all, which is what lets
+ * the result stage skip canonicalizing and hashing a payload it would discard.
+ */
+function isNonBlockableTool(
+  policy: CapabilityPolicyService,
+  name: string,
+  excludedTools: ReadonlySet<string>,
+  pollingTools: ReadonlySet<string>,
+  warnOnlyTools: ReadonlySet<string>,
+): boolean {
+  return isControlPlaneTool(policy, name)
+    || excludedTools.has(name) || pollingTools.has(name) || warnOnlyTools.has(name)
+}
+
 function rememberDeniedCall(state: { deniedCallIds: Set<string> }, callId: string): void {
   if (state.deniedCallIds.has(callId)) return
   if (state.deniedCallIds.size >= MAX_LOCAL_LOOP_DENIALS) {
@@ -130,7 +147,7 @@ function failOpenLoopDetection(state: TurnState): void {
   state.loopDetectionDisabled = true
   state.dispatchRecords.clear()
   state.pendingLoopObservations.clear()
-  state.pendingBlockSignatures.clear()
+  state.pendingBlockCandidates.clear()
   state.loopState = createGuardLoopState(state.turn)
   state.nextLoopSequence = state.nextDispatchSequence
 }
@@ -145,13 +162,34 @@ function rememberLoopWarning(state: { loopWarnings: Set<string> }, key: string):
   return true
 }
 
-function rememberBlockCandidate(state: { pendingBlockSignatures: Set<string> }, signature: string): void {
-  if (state.pendingBlockSignatures.has(signature)) return
-  if (state.pendingBlockSignatures.size >= LOOP_HISTORY_LIMIT) {
-    const oldest = state.pendingBlockSignatures.values().next().value
-    if (oldest !== undefined) state.pendingBlockSignatures.delete(oldest)
+function rememberBlockCandidate(state: TurnState, signature: string, source: GuardLoopBlockSource): void {
+  const sources = state.pendingBlockCandidates.get(signature)
+  if (sources !== undefined) {
+    sources.add(source)
+    return
   }
-  state.pendingBlockSignatures.add(signature)
+  if (state.pendingBlockCandidates.size >= LOOP_HISTORY_LIMIT) {
+    const oldest = state.pendingBlockCandidates.keys().next().value
+    if (oldest !== undefined) state.pendingBlockCandidates.delete(oldest)
+  }
+  state.pendingBlockCandidates.set(signature, new Set([source]))
+}
+
+/**
+ * Consume a pending candidate, but only if the detector that produced it is still
+ * enabled. A candidate whose source switch was flipped off stops counting instead
+ * of being silently ignored, and the other source's candidate survives untouched.
+ */
+function takeBlockCandidate(state: TurnState, signature: string, allowed: ReadonlySet<GuardLoopBlockSource>): boolean {
+  const sources = state.pendingBlockCandidates.get(signature)
+  if (sources === undefined) return false
+  for (const source of allowed) {
+    if (sources.delete(source)) {
+      if (sources.size === 0) state.pendingBlockCandidates.delete(signature)
+      return true
+    }
+  }
+  return false
 }
 
 function rememberBlockedSignature(state: { blockedLoopSignatures: Set<string> }, signature: string): void {
@@ -197,8 +235,10 @@ function handleLoopObservation(
   // No-progress protection is the evidence gate for the LOCAL denial. With it off
   // the call is still reminded about (below), but never becomes blockable, so the
   // switch in the settings page changes behaviour instead of being cosmetic.
-  if (signature !== undefined && decision.blockCandidate && options.noProgressProtection !== false) {
-    rememberBlockCandidate(state, signature)
+  const blockSource = decision.blockSource
+  if (signature !== undefined && decision.blockCandidate && blockSource !== undefined
+    && options.noProgressProtection !== false) {
+    rememberBlockCandidate(state, signature, blockSource)
   }
   if (signature === undefined || decision.warning === 'none') return
 
@@ -216,6 +256,7 @@ function createLoopOptions(
   excludedTools: ReadonlySet<string>,
   pollingTools: ReadonlySet<string>,
   warnOnlyTools: ReadonlySet<string>,
+  repeatDetectionEnabled: boolean,
   alternatingCycleEnabled: boolean,
 ): GuardLoopOptions {
   return {
@@ -223,6 +264,7 @@ function createLoopOptions(
     excludedTools: new Set([...excludedTools, ...ctx.capabilityPolicy.metaTools(), ...RESERVED_TRANSPORT_TOOLS]),
     pollingTools,
     warnOnlyTools,
+    repeatDetection: repeatDetectionEnabled,
     alternatingCycleEnabled,
   }
 }
@@ -279,27 +321,59 @@ export function apply(ctx: Context, config: Config = {}): void {
   const pollingTools = new Set([...DEFAULT_POLLING_TOOLS, ...(config.pollingTools ?? [])])
   const warnOnlyTools = new Set([...DEFAULT_WARN_ONLY_TOOLS, ...(config.warnOnlyTools ?? [])])
   const switches = (): ReturnType<typeof readSwitches> => readSwitches(ctx, config)
-  const loopOptions = (): GuardLoopOptions => ({
-    ...createLoopOptions(ctx, excludedTools, pollingTools, warnOnlyTools, switches().alternatingCycleDetection),
-    noProgressProtection: switches().noProgressProtection,
-  })
+  /**
+   * True while at least one of the two detectors is on. The observation entries
+   * key off this instead of `duplicateDetection` alone, so turning exact-repeat
+   * detection off no longer starves the alternating-cycle detector of history.
+   */
+  const loopDetectionActive = (): boolean => {
+    const sw = switches()
+    return sw.duplicateDetection || sw.alternatingCycleDetection
+  }
+  /** Candidate sources still permitted by the live switches. */
+  const allowedBlockSources = (): ReadonlySet<GuardLoopBlockSource> => {
+    const sw = switches()
+    const sources = new Set<GuardLoopBlockSource>()
+    if (sw.duplicateDetection) sources.add('repeat')
+    if (sw.alternatingCycleDetection) sources.add('cycle')
+    return sources
+  }
+  const loopOptions = (): GuardLoopOptions => {
+    const sw = switches()
+    return {
+      ...createLoopOptions(ctx, excludedTools, pollingTools, warnOnlyTools,
+        sw.duplicateDetection, sw.alternatingCycleDetection),
+      noProgressProtection: sw.noProgressProtection,
+    }
+  }
 
   const toolGuard = ctx.tools.guard((execution) => {
-    const agent = execution.agent
-    const sw = switches()
-    if (!sw.enabled || !sw.duplicateDetection || agent === undefined
-      || isControlPlaneTool(ctx.capabilityPolicy, execution.name)
-      || excludedTools.has(execution.name) || pollingTools.has(execution.name) || warnOnlyTools.has(execution.name)) return undefined
-    const state = guard.states.get(agent)
-    if (state === undefined || state.loopDetectionDisabled) return undefined
-    const signature = guardToolSignature(execution.name, execution.arguments)
-    if (state.localLoopDenials >= MAX_LOCAL_LOOP_DENIALS
-      || !state.pendingBlockSignatures.delete(signature)
-      || state.blockedLoopSignatures.has(signature)) return undefined
-    rememberBlockedSignature(state, signature)
-    rememberDeniedCall(state, String(execution.callId))
-    state.localLoopDenials += 1
-    return '检测到相同工具调用及相同结果/错误证据；已局部拒绝本次重复调用，当前 Turn 继续运行。'
+    try {
+      const agent = execution.agent
+      const sw = switches()
+      // Candidates are gated per source instead of by `duplicateDetection`, which
+      // used to make every alternating-cycle candidate unblockable.
+      const allowed = allowedBlockSources()
+      if (!sw.enabled || allowed.size === 0 || agent === undefined
+        || isControlPlaneTool(ctx.capabilityPolicy, execution.name)
+        || excludedTools.has(execution.name) || pollingTools.has(execution.name) || warnOnlyTools.has(execution.name)) return undefined
+      const state = guard.states.get(agent)
+      if (state === undefined || state.loopDetectionDisabled) return undefined
+      // A signature beyond the fingerprint budget is not a stable identity, so it
+      // can never justify a denial: fail open instead of comparing it.
+      const signature = guardToolSignature(execution.name, execution.arguments)
+      if (signature === undefined) return undefined
+      if (state.localLoopDenials >= MAX_LOCAL_LOOP_DENIALS
+        || !takeBlockCandidate(state, signature, allowed)
+        || state.blockedLoopSignatures.has(signature)) return undefined
+      rememberBlockedSignature(state, signature)
+      rememberDeniedCall(state, String(execution.callId))
+      state.localLoopDenials += 1
+      return '检测到相同工具调用及相同结果/错误证据；已局部拒绝本次重复调用，当前 Turn 继续运行。'
+    } catch {
+      // Fail open: a Guard fault must never block a real tool call.
+      return undefined
+    }
   })
   disposers.push(toolGuard)
 
@@ -316,62 +390,111 @@ export function apply(ctx: Context, config: Config = {}): void {
   }))
 
   disposers.push(ctx.on('tools/execute', async (execution, next) => {
-    const agent = execution.agent
-    if (!switches().enabled || !switches().duplicateDetection || agent === undefined) return next()
-    const state = guard.states.get(agent)
-    if (state === undefined || state.loopDetectionDisabled) return next()
+    try {
+      const agent = execution.agent
+      // Both detectors share one history, so the dispatch record must be built while
+      // either switch is on; gating on `duplicateDetection` alone starved the cycle
+      // detector whenever exact-repeat detection was turned off.
+      if (!switches().enabled || !loopDetectionActive() || agent === undefined) return next()
+      const state = guard.states.get(agent)
+      if (state === undefined || state.loopDetectionDisabled) return next()
 
-    const callId = String(execution.callId)
-    if (state.dispatchRecords.has(callId)
-      || state.dispatchRecords.size + state.pendingLoopObservations.size >= MAX_PENDING_DISPATCHES) {
-      failOpenLoopDetection(state)
+      const callId = String(execution.callId)
+      if (state.dispatchRecords.has(callId)
+        || state.dispatchRecords.size + state.pendingLoopObservations.size >= MAX_PENDING_DISPATCHES) {
+        failOpenLoopDetection(state)
+        return next()
+      }
+      const dispatchSequence = state.nextDispatchSequence
+      // A call that can never become a block candidate gets no result fingerprint:
+      // the decision is name-based, so it is made here and the result stage skips
+      // canonicalizing and hashing a payload it would only throw away.
+      const fingerprintNeeded = !isNonBlockableTool(ctx.capabilityPolicy, execution.name,
+        excludedTools, pollingTools, warnOnlyTools)
+      // A signature beyond the fingerprint budget is not a stable identity, so the
+      // call is not observed at all. The sequence number is consumed only when a
+      // record is actually stored: a gap would stall the ordered drain below and
+      // silently disable detection for the rest of the turn.
+      const signature = guardToolSignature(execution.name, execution.arguments)
+      if (signature === undefined) return next()
+      state.nextDispatchSequence += 1
+      const epoch = state.loopEpoch
+      state.dispatchRecords.set(callId, {
+        sequence: dispatchSequence, epoch, name: execution.name, signature, fingerprintNeeded,
+      })
+      guard.observeTool(agent, state.turn, { controlPlane: isControlPlaneTool(ctx.capabilityPolicy, execution.name) })
+      return next()
+    } catch {
+      // Fail open: loop detection is advisory, the tool call is not.
       return next()
     }
-    const dispatchSequence = state.nextDispatchSequence++
-    const epoch = state.loopEpoch
-    const signature = guardToolSignature(execution.name, execution.arguments)
-    state.dispatchRecords.set(callId, { sequence: dispatchSequence, epoch, name: execution.name, signature })
-    guard.observeTool(agent, state.turn, { controlPlane: isControlPlaneTool(ctx.capabilityPolicy, execution.name) })
-    return next()
   }))
 
   disposers.push(ctx.on('tools/result', (execution: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>) => {
-    const agent = execution.agent
-    const state = agent === undefined ? undefined : guard.states.get(agent)
-    if (!switches().enabled || agent === undefined || state === undefined) return
-    const callId = String(execution.callId)
-    if (state.deniedCallIds.delete(callId)) return
+    let activeState: TurnState | undefined
+    try {
+      const agent = execution.agent
+      const state = agent === undefined ? undefined : guard.states.get(agent)
+      if (!switches().enabled || agent === undefined || state === undefined) return
+      activeState = state
+      const callId = String(execution.callId)
+      if (state.deniedCallIds.delete(callId)) return
 
-    const dispatch = state.dispatchRecords.get(callId)
-    if (dispatch === undefined) return
-    state.dispatchRecords.delete(callId)
-    if (dispatch.epoch !== state.loopEpoch || !switches().duplicateDetection || state.loopDetectionDisabled) return
+      const dispatch = state.dispatchRecords.get(callId)
+      if (dispatch === undefined) return
+      state.dispatchRecords.delete(callId)
+      if (dispatch.epoch !== state.loopEpoch || !loopDetectionActive() || state.loopDetectionDisabled) return
 
-    const outcome = outcomeFor(result)
-    const evidence = result.isError
-      ? { code: result.error.info?.code ?? null, message: result.error.message, content: result.content }
-      : { value: result.value, content: result.content }
-    const pending: PendingLoopObservation = {
-      name: dispatch.name,
-      callId,
-      dispatchSequence: dispatch.sequence,
-      epoch: dispatch.epoch,
-      signature: dispatch.signature,
-      outcome,
-      resultFingerprint: guardResultFingerprint(outcome, evidence),
-    }
-    if (state.pendingLoopObservations.size >= MAX_PENDING_DISPATCHES) {
-      failOpenLoopDetection(state)
-      return
-    }
-    state.pendingLoopObservations.set(dispatch.sequence, pending)
+      // No fingerprint for excluded / polling / warn-only / control-plane calls, and
+      // none when the payload exceeds the fingerprint budget. The result itself is
+      // returned to the caller untouched either way; a missing fingerprint only
+      // means "no progress cannot be proven", so it never becomes evidence.
+      let resultFingerprint: string | undefined
+      let outcome: GuardToolOutcome = 'error'
+      if (dispatch.fingerprintNeeded) {
+        try {
+          outcome = outcomeFor(result)
+          resultFingerprint = guardResultFingerprint(outcome, result.isError
+            ? { code: result.error.info?.code ?? null, message: result.error.message, content: result.content }
+            : { value: result.value, content: result.content })
+        } catch {
+          // A malformed host result yields no fingerprint, but the observation is
+          // still recorded below: dropping it would leave a hole in the ordered
+          // sequence and stall every later observation for the rest of the turn.
+          resultFingerprint = undefined
+        }
+      } else {
+        outcome = outcomeFor(result)
+      }
+      const pending: PendingLoopObservation = {
+        name: dispatch.name,
+        callId,
+        dispatchSequence: dispatch.sequence,
+        epoch: dispatch.epoch,
+        signature: dispatch.signature,
+        outcome,
+        ...(resultFingerprint !== undefined ? { resultFingerprint } : {}),
+      }
+      if (state.pendingLoopObservations.size >= MAX_PENDING_DISPATCHES) {
+        failOpenLoopDetection(state)
+        return
+      }
+      state.pendingLoopObservations.set(dispatch.sequence, pending)
 
-    while (state.pendingLoopObservations.has(state.nextLoopSequence)) {
-      const observation = state.pendingLoopObservations.get(state.nextLoopSequence)
-      state.pendingLoopObservations.delete(state.nextLoopSequence)
-      state.nextLoopSequence += 1
-      if (observation === null || observation === undefined || observation.epoch !== state.loopEpoch) continue
-      handleLoopObservation(state, agent, observation, loopOptions())
+      while (state.pendingLoopObservations.has(state.nextLoopSequence)) {
+        const observation = state.pendingLoopObservations.get(state.nextLoopSequence)
+        state.pendingLoopObservations.delete(state.nextLoopSequence)
+        state.nextLoopSequence += 1
+        if (observation === null || observation === undefined || observation.epoch !== state.loopEpoch) continue
+        handleLoopObservation(state, agent, observation, loopOptions())
+      }
+    } catch {
+      // Fail open: a Guard fault must never disturb the real tool result. The
+      // ordered drain advances its cursor before handling each observation, so a
+      // throw cannot leave a permanent gap; resetting detection for the rest of the
+      // turn is a conservative extra: after an unknown fault the Guard stops
+      // producing evidence instead of continuing from possibly stale history.
+      if (activeState !== undefined) failOpenLoopDetection(activeState)
     }
   }))
 

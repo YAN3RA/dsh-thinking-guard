@@ -932,8 +932,18 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   // Index the global tool view eagerly. The first explicit refresh enumerates
   // preset standing scopes; the optional-service injection above also triggers
   // a full pass if agentPresets is mounted after this plugin.
-  void rebuildTools()
-  void refreshSkills()
+  //
+  // This MUST go through `runRebuild`, not a bare `rebuildTools()` +
+  // `refreshSkills()` pair. Those two calls bypass the `rebuilding` single-flight
+  // flag, so the eager mount-time pass could run CONCURRENTLY with a `runRebuild`
+  // started by the `agentPresets` injection or an explicit `refresh()`. The epoch
+  // guards only protect which snapshot gets PUBLISHED; they do not stop the
+  // losing run from already having enumerated every preset scope. The observable
+  // damage was an extra `agentPresets.acquireScope()` per overlapping run, which
+  // made `requested.get('coding-plus')` read 3 instead of 2 whenever the eager
+  // pass overlapped the test's explicit refresh — the intermittent
+  // `tests/registry.spec.ts` failure.
+  void runRebuild()
   ctx.effect(() => () => {
     stopped = true
     if (timer !== undefined) clearTimeout(timer)

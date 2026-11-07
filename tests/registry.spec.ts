@@ -432,6 +432,63 @@ describe('meta-registry', () => {
     expect(builtIn.map(summary => summary.id)).toContain('bash')
   })
 
+  /**
+   * The eager mount-time pass must be single-flight with every later rebuild.
+   *
+   * `rebuildTools()` and `refreshSkills()` are the two halves of one pass. The
+   * mount-time eager index used to call them DIRECTLY, which bypasses the
+   * `rebuilding` flag, so an eager pass could run concurrently with a rebuild
+   * started by the `agentPresets` injection or an explicit `refresh()`. The
+   * epoch guards still chose a winner for PUBLISHING, but the losing run had
+   * already enumerated every preset scope. A late half of the eager pass could
+   * land after a test cleared its counter and push the count to an odd number —
+   * the intermittent `requested.get('coding-plus')` === 3 failure.
+   *
+   * Asserting the invariant (never two passes at once) is both stronger and
+   * non-flaky: an exact enumeration count depends on how many coalesced
+   * follow-ups the scheduler legitimately chains, which is timing-dependent by
+   * design.
+   */
+  it('never runs two catalog passes at once, including the eager mount-time pass', async () => {
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(pathJoin(tmpdir(), 'dsh-registry-')))
+    const ctx = await setup(home, { refreshDebounceMs: 0 })
+    registerNativeTool(ctx, 'bash', 'Run commands in a bash shell')
+
+    let inFlight = 0
+    let maxInFlight = 0
+    let passes = 0
+    const agentPresets = {
+      async list(): Promise<Array<{ id: string; broken?: string }>> {
+        passes += 1
+        inFlight += 1
+        maxInFlight = Math.max(maxInFlight, inFlight)
+        try {
+          // Yield so a concurrent, non-single-flight pass has every chance to
+          // overlap with this one.
+          await new Promise(resolve => setTimeout(resolve, 2))
+          return [{ id: 'coding-plus' }]
+        } finally {
+          inFlight -= 1
+        }
+      },
+      async acquireScope(id?: string) {
+        return { key: { agentPreset: id } }
+      },
+    }
+    ctx.provide('agentPresets', agentPresets)
+
+    // Drive the mount-time pass, the injection pass and several explicit
+    // refreshes through the same window.
+    await Promise.all([ctx.capability.refresh(), ctx.capability.refresh(), ctx.capability.refresh()])
+    await wait(60)
+    await ctx.capability.refresh()
+
+    expect(passes).toBeGreaterThan(0)
+    // One pass at a time. The eager-pass code produced 2 here, because its
+    // `rebuildTools()` and `refreshSkills()` calls ran side by side.
+    expect(maxInFlight).toBe(1)
+  })
+
   it('indexes live session tools and cwd-dependent project skills', async () => {
     const { mkdir, mkdtemp } = await import('node:fs/promises')
     const { join } = await import('node:path')

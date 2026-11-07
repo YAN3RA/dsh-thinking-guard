@@ -763,6 +763,67 @@ describe('On-demand attribution predicate (isHiddenOnlyByPolicy)', () => {
     expect(agent.ctx.get('tools')?.get('mcp__km__search', agent as never)).toBeDefined()
     expect(ctx.capabilityPolicy.isHiddenOnlyByPolicy(agent, 'mcp__km__search')).toBe(false)
   })
+
+  /**
+   * The install window is not immune to a third party.
+   *
+   * `installOnDemandRestriction()` calls `restrict()`, which emits `tools/change`
+   * synchronously. A third-party listener mounted after this policy runs inside
+   * that same emit and can append its own `deny` while the attribution sample is
+   * still held. Without a guard the sample keeps crediting that name to this
+   * policy, `isHiddenOnlyByPolicy` returns true, and `meta_invoke` lifts a
+   * restriction somebody else installed.
+   *
+   * The guard is the `tools/change` counter bracketing the window: our own
+   * install contributes exactly one emit, so anything beyond that proves the
+   * view moved under us and the attribution must be dropped.
+   *
+   * The trigger must be `agent/created` (or a forced reapply) — the window only
+   * opens while the policy actually disposes and reinstalls its restriction.
+   */
+  it('refuses attribution when a third party installs a mask inside the install emit', async () => {
+    const ctx = await setup({ tools: { 'on-demand': ['mcp__km__search'] } })
+    registerTool(ctx, 'mcp__km__search')
+    await ctx.capability.refresh()
+
+    // Build the agent scope by hand so the third party can be mounted on it
+    // BEFORE the policy's restriction is installed by `agent/created`.
+    const agent = {
+      id: 'in-emit-agent',
+      options: {},
+      session: { header: { cwd: process.cwd() } },
+      ctx: new Context(),
+      status: 'idle',
+    } as unknown as { id: string; ctx: Context }
+    agent.ctx = (await import('@deepseek-ai/dsh-scope')).createScope(ctx, agent as never).ctx
+
+    let armed = false
+    let installed = 0
+    await agent.ctx.plugin({
+      name: 'third-party-in-emit',
+      inject: ['tools'],
+      apply(scoped: {
+        on: (n: string, h: () => void) => unknown
+        tools: { restrict: (f: unknown) => () => void }
+      }) {
+        scoped.on('tools/change', () => {
+          if (!armed || installed > 0) return
+          installed += 1
+          // Append our own restriction inside the policy's install emit.
+          scoped.tools.restrict({ deny: ['mcp__km__search'] })
+        })
+      },
+    } as never)
+
+    armed = true
+    await ctx.emit('agent/created', { agent: agent as never, source: 'startup' } as never)
+    armed = false
+
+    expect(installed).toBeGreaterThan(0)
+    // Invisible, but NOT only because of this policy — the forward must not lift it.
+    expect(agent.ctx.get('tools')?.get('mcp__km__search', agent as never)).toBeUndefined()
+    expect(ctx.capabilityPolicy.isHiddenOnlyByPolicy(agent as never, 'mcp__km__search')).toBe(false)
+  })
 })
 
 describe('capability-policy startup', () => {

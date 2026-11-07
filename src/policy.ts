@@ -969,6 +969,23 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   }
 
   /**
+   * Count of `tools/change` broadcasts observed so far.
+   *
+   * The attribution window is only trustworthy while nothing else changes the
+   * tool view inside it. `installOnDemandRestriction()` calls `restrict()`, which
+   * emits `tools/change` SYNCHRONOUSLY, and a third-party listener registered
+   * after this policy runs inside that same emit — it can append its own
+   * restriction while our sample is still being evaluated. The sample would then
+   * wrongly credit that name to us. Comparing this counter across the window
+   * detects exactly that.
+   *
+   * Incremented by the existing `tools/change` listener below (which also
+   * re-applies the restriction) rather than by a listener of its own, so the
+   * plugin keeps one subscription per event.
+   */
+  let toolsChangeCount = 0
+
+  /**
    * Agents this policy has seen created and not yet disposed.
    *
    * Kept as an explicit live set instead of reading `ctx.agents.list()` so a
@@ -1014,13 +1031,17 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
    *
    * This is also the only place attribution is decided. Between
    * `previous.dispose()` and `installOnDemandRestriction()` the caller's view
-   * carries every restriction except this policy's own, and the whole window
-   * runs synchronously inside one listener invocation — Cordis dispatches
-   * `tools/change` synchronously and the disposer runs inline — so no other
-   * plugin can slip a restriction in or out while the sample is taken. A name
-   * visible there is hidden by this policy alone; a name still hidden there is
-   * hidden by somebody else too, so it is never attributed and never becomes
-   * forwardable.
+   * carries every restriction except this policy's own, so a name visible there
+   * is hidden by this policy alone, and a name still hidden there is hidden by
+   * somebody else too.
+   *
+   * The window is NOT immune to concurrent changes, despite running inside one
+   * synchronous listener invocation: `installOnDemandRestriction()` calls
+   * `restrict()`, which emits `tools/change` synchronously, and a third-party
+   * listener mounted after this policy runs inside that emit and can append its
+   * own restriction right then. So the sample is bracketed by a `tools/change`
+   * counter; if the count moved, somebody else touched the view mid-window and
+   * the attribution is discarded wholesale (fail closed) instead of trusted.
    */
   let applying = false
   const applyOnDemandRestriction = (agent: { ctx: Context; id?: unknown }, force = false): void => {
@@ -1040,12 +1061,30 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       }
       // Attribution window: this policy's mask is off, so this sample proves
       // which of `deny` are invisible only because of a third party.
+      //
+      // Bracket the sample with the `tools/change` counter. Installing the new
+      // restriction emits `tools/change` synchronously, and a third-party
+      // listener mounted after this policy runs inside that emit — it can append
+      // its own deny while we are still holding the sample, which would make us
+      // credit a name we do not actually hide. The count must therefore move by
+      // EXACTLY the one emit our own install produces; anything more means
+      // somebody else touched the view, so the attribution is dropped wholesale
+      // rather than partially trusted.
+      const changeBaseline = toolsChangeCount
       const owned = deny.length === 0 ? new Set<string>() : namesHiddenOnlyByPolicy(agent, deny)
       policyOwnedHiddenNames.set(agent, owned)
       if (deny.length === 0) return
       if (installOnDemandRestriction(agent, deny) === undefined) {
         // Nothing was installed, so nothing is hidden by this policy: an entry
         // here would let the forward lift a mask that does not exist.
+        policyOwnedHiddenNames.set(agent, new Set())
+        return
+      }
+      // Our own `restrict()` contributes exactly one emit. More than that means a
+      // third party appended a restriction inside our install emit, so the
+      // sample no longer proves anything: clear it and let the forward fail
+      // closed. The next `tools/change` recomputes it from a clean window.
+      if (toolsChangeCount - changeBaseline > 1) {
         policyOwnedHiddenNames.set(agent, new Set())
         return
       }
@@ -1092,6 +1131,9 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   // the global tool set changes. The unchanged-list guard keeps this from
   // looping on the `tools/change` that `restrict()` itself emits.
   ctx.on('tools/change', () => {
+    // Count first: the attribution window compares this across its own install,
+    // and a third-party listener may run after this one inside the same emit.
+    toolsChangeCount += 1
     reapplyOnDemandRestrictions()
   })
 

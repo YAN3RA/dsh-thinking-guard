@@ -265,7 +265,7 @@ describe('meta_invoke permission matrix', () => {
     expect(seenParent).toBeDefined()
   })
 
-  it('row 3: On-demand plus a third-party tools.restrict({deny}) — the restriction is real, and it is enforced everywhere except the On-demand forward', async () => {
+  it('row 3: On-demand plus a third-party tools.restrict({deny}) — the restriction is real, and it is enforced on both the direct call and the On-demand forward', async () => {
     // Attribution control: the identical composition WITHOUT the third-party
     // restriction must succeed, otherwise a denial could not be attributed to
     // the third party at all.
@@ -311,23 +311,18 @@ describe('meta_invoke permission matrix', () => {
   })
 
   /**
-   * KNOWN DEFECT (plan §3.2 row 3), pinned rather than hidden.
+   * Former defect (plan §3.2 row 3), kept as the regression guard.
    *
-   * `resolveForwardDefinition` (`src/invoke.ts:105-113`) falls back to
-   * `ctx.tools.get(name)` — the *global* view — whenever
-   * `tools.executable(name, scope, toolSet)` returns nothing and the name is
-   * classified On-demand. That fallback cannot tell this plugin's own On-demand
-   * mask from a restriction installed by a third party, so any third-party
-   * `tools.restrict({ deny })` of an On-demand name is lifted for `meta_invoke`
-   * while still applying to a direct call. The comment at `src/invoke.ts:101-102`
-   * claims the opposite ("a restriction placed by someone else still denies the
-   * call"); it holds for Resident and Disabled names, not for On-demand ones.
+   * `resolveForwardDefinition` used to fall back to `ctx.tools.get(name)` — the
+   * *global* view — whenever `tools.executable(name, scope, toolSet)` returned
+   * nothing and the name was classified On-demand. That fallback could not tell
+   * this plugin's own On-demand mask from a restriction installed by a third
+   * party, so a third-party `tools.restrict({ deny })` of an On-demand name was
+   * lifted for `meta_invoke` while still applying to a direct call.
    *
-   * The expectation below is the CORRECT one, and it is deliberately not softened
-   * into an `it.fails` / `skip` / `expect.soft` pass: this case is RED until the
-   * bypass is fixed, because a green suite must not imply the property holds.
-   * When `resolveForwardDefinition` stops lifting third-party restrictions this
-   * test turns green on its own.
+   * The fallback now requires `capabilityPolicy.isHiddenOnlyByPolicy(agent,
+   * name)`, which can PROVE the invisibility is this policy's own. This test
+   * went green when that landed; it stays here so the bypass cannot come back.
    */
   it('row 3 defect: a third-party tools.restrict({deny}) must deny an On-demand forward', async () => {
     const { ctx, agent, target, executed } = await restrictedOnDemandComposition('dsh-perm-row3-defect-')
@@ -337,12 +332,12 @@ describe('meta_invoke permission matrix', () => {
     expect(direct.isError, direct.text).toBe(true)
     expect(executed).toEqual([])
 
-    // …so it must deny the forward as well. It currently does not (bypass).
+    // …so it must deny the forward as well.
     const forwarded = await invoke(ctx, target, agent)
     expect(forwarded.isError, forwarded.text).toBe(true)
     expect(executed).toEqual([])
 
-    // Same requirement through a real step admission set, so the bypass is not
+    // Same requirement through a real step admission set, so the result is not
     // an artifact of `runOneToolCall` omitting `toolSet`.
     const withToolSet = await invokeWithToolSet(ctx, target, agent)
     expect(withToolSet.isError, withToolSet.text).toBe(true)

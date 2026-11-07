@@ -354,7 +354,12 @@ export function apply(ctx: Context, config: Config = {}): void {
       // Candidates are gated per source instead of by `duplicateDetection`, which
       // used to make every alternating-cycle candidate unblockable.
       const allowed = allowedBlockSources()
-      if (!sw.enabled || allowed.size === 0 || agent === undefined
+      // `noProgressProtection` is the gate for the LOCAL DENIAL itself, so it must
+      // be re-read here and not only where a candidate is recorded. A turn can
+      // record candidates while the switch is on and then have it turned off;
+      // without this check those already-recorded candidates would still fire and
+      // the switch would not mean what the settings page promises.
+      if (!sw.enabled || sw.noProgressProtection === false || allowed.size === 0 || agent === undefined
         || isControlPlaneTool(ctx.capabilityPolicy, execution.name)
         || excludedTools.has(execution.name) || pollingTools.has(execution.name) || warnOnlyTools.has(execution.name)) return undefined
       const state = guard.states.get(agent)

@@ -434,6 +434,64 @@ describe('Guard live switches from the settings page', () => {
     expect(agent.inject).not.toHaveBeenCalled()
   })
 
+  /**
+   * `noProgressProtection` is the gate for the denial itself, not just for
+   * recording a candidate.
+   *
+   * A candidate is recorded during `tools/result` while the switch is on. If the
+   * switch is then turned off, the *next* matching call must not be denied — the
+   * settings page promises "关闭时仍然提醒，但绝不拒绝任何调用". Checking the
+   * switch only where candidates are recorded (and not at the enforcement point
+   * in `ctx.tools.guard`) lets an already-recorded candidate fire afterwards.
+   *
+   * The call that consumes the candidate must be a NEW call id: the Guard dedups
+   * by callId, so reusing one would make this test pass for the wrong reason.
+   */
+  it('stops denying after no-progress protection is flipped off mid-turn (repeat path)', async () => {
+    const host = setupWithSwitches({
+      enabled: true, duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: true,
+    })
+    const agent = { inject: vi.fn() }
+    const next = vi.fn(async () => ({ kind: 'continue' }))
+    await host.hooks.get('agent/pre-step')!({ agent, turn: 1 }, next)
+
+    // Drive to the 8th identical call so a repeat candidate is recorded. Every
+    // call here is admitted (the guard is only asked at the 9th), so the
+    // candidate stays pending.
+    for (let i = 0; i < 8; i += 1) {
+      const call = execution(agent, 'write', { same: true }, `before-${i}`)
+      expect(host.guard()(call)).toBeUndefined()
+      await host.hooks.get('tools/execute')!(call, vi.fn(async () => success({ ok: true })))
+      host.hooks.get('tools/result')!(call, success({ ok: true }))
+    }
+
+    // Flip the gate off, then ask the guard about the next identical call. The
+    // pending repeat candidate must not turn into a denial.
+    host.toggle({ noProgressProtection: false })
+    const denialAfter = host.guard()(execution(agent, 'write', { same: true }, 'after-0'))
+    expect(denialAfter).toBeUndefined()
+  })
+
+  it('stops denying after no-progress protection is flipped off mid-turn (cycle path)', async () => {
+    const host = setupWithSwitches({
+      enabled: true, duplicateDetection: false, alternatingCycleDetection: true, noProgressProtection: true,
+    })
+    const agent = { inject: vi.fn() }
+    const next = vi.fn(async () => ({ kind: 'continue' }))
+    await host.hooks.get('agent/pre-step')!({ agent, turn: 1 }, next)
+
+    // Build a complete A-B-A-B cycle with unchanged results.
+    expect(await runLive(host, agent, 'tool-a', { step: 1 }, 'flip-1')).toBeUndefined()
+    expect(await runLive(host, agent, 'tool-b', { step: 2 }, 'flip-2')).toBeUndefined()
+    expect(await runLive(host, agent, 'tool-a', { step: 1 }, 'flip-3')).toBeUndefined()
+    expect(await runLive(host, agent, 'tool-b', { step: 2 }, 'flip-4')).toBeUndefined()
+
+    // Flip the gate off. The recorded cycle candidate must no longer deny.
+    host.toggle({ noProgressProtection: false })
+    const denialAfter = host.guard()(execution(agent, 'tool-b', { step: 2 }, 'flip-5'))
+    expect(denialAfter).toBeUndefined()
+  })
+
   it('reminds but never denies once no-progress protection is turned off', async () => {
     const host = setupWithSwitches({
       enabled: true, duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: false,

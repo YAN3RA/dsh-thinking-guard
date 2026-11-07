@@ -8,12 +8,6 @@
 - Guard 按 Agent / Turn 隔离，用工具签名与 Step 的结果/错误指纹做重复与 A-B 循环检测；只在证据满足门槛时对匹配调用局部拒绝一次，**不停止整个 Turn**。
 - 设置页提供四个页面：总览、防循环、调用统计、能力目录。
 
-## 它不做什么
-
-- 不做工具结果压缩与原文恢复——那是 [dsh-plugin-save-token](https://github.com/YAN3RA/dsh-plugin-save-token) 的职责。
-- 不做模型 / Provider / 完整会话管理——那是 DSH 宿主的职责。
-- 不读取、保存或输出隐藏思维链。
-
 ## 宿主兼容性
 
 - **实测版本：DSH 0.2.2-rc.1**。本插件的开发、类型检查与测试都以该版本为基线（`devDependencies` 中 `@deepseek-ai/dsh-*` 均为 `0.2.2-rc.1`，`node_modules/@deepseek-ai/dsh-tools` 实测也是 `0.2.2-rc.1`）。

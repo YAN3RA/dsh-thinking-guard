@@ -33,7 +33,7 @@ dsh plugin --profile desktop add dsh-thinking-guard
 ### 指定版本 / 升级
 
 ```bash
-dsh plugin --profile desktop add dsh-thinking-guard@0.1.16   # 锁定版本
+dsh plugin --profile desktop add dsh-thinking-guard@0.1.17   # 锁定版本
 dsh plugin --profile desktop add dsh-thinking-guard           # 升到最新
 ```
 

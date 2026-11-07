@@ -59,7 +59,7 @@ export function Pill(props: BasicProps) {
  * panels stay caller-owned. Mirrored here so tests can walk `role="tab"`.
  */
 export function SegmentedTabs(props: BasicProps) {
-  const { items, value, onChange, label } = props as unknown as {
+  const { items, value, label } = props as unknown as {
     items: readonly { value: string; label: ReactNode; id: string; panelId: string }[]
     value: string
     onChange: (value: string) => void

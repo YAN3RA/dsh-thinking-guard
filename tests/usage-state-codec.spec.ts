@@ -26,14 +26,31 @@ const unknownWorkspace = { attribution: 'unknown' as const }
 
 type MutableRecord = Record<string, unknown>
 
+/**
+ * A coverage row: the tests mutate `reasons` in place to probe the decoder.
+ *
+ * `unknown[]` on purpose — one case injects a non-string reason to prove the
+ * decoder rejects it, so the element type must not be narrowed here.
+ */
+interface MutableCoverage {
+  reasons: unknown[]
+  [key: string]: unknown
+}
+
+/** An aggregate row: the tests mutate the nested error `code`. */
+interface MutableAggregate {
+  errors: Array<{ code: string; [key: string]: unknown }>
+  [key: string]: unknown
+}
+
 interface MutableDocument {
   schema: unknown
   version: unknown
   limits: Record<string, unknown>
   seenEvents: MutableRecord[]
   calls: MutableRecord[]
-  aggregates: MutableRecord[]
-  coverage: MutableRecord[]
+  aggregates: MutableAggregate[]
+  coverage: MutableCoverage[]
   totals: Record<string, unknown>
   [key: string]: unknown
 }

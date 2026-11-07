@@ -482,7 +482,7 @@ describe('usage gateway · client/server schema parity', () => {
     expect(first).toEqual(second)
     // The projection must not alias the source rows (a later Host mutation
     // would otherwise change a value already handed to the browser).
-    expect(first.report.aggregates[0]).not.toBe((input.report as UnknownRecord).aggregates[0])
+    expect(first.report.aggregates[0]).not.toBe(((input.report as UnknownRecord).aggregates as unknown[])[0])
   })
 })
 

@@ -1,6 +1,6 @@
 import { tmpdir } from 'node:os'
 import { describe, expect, it } from 'vitest'
-import { lstat, mkdtemp, mkdir, readFile, readlink, realpath, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdtemp, mkdir, readFile, readlink, realpath, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { LocationRegistry } from '../src/locations.ts'

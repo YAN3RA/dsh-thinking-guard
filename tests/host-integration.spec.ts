@@ -35,6 +35,7 @@ import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
 import * as SkillFileSystem from '@deepseek-ai/dsh-skill-filesystem'
 import { createScope } from '@deepseek-ai/dsh-scope'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import * as registry from '../src/registry.ts'
 import * as policy from '../src/policy.ts'
 import * as toolMetaInvoke from '../src/invoke.ts'
@@ -119,7 +120,7 @@ async function announceAgent(
   // `tools.restrict()` reads the CALL SITE's scope, so the Agent needs a real
   // child scope rather than a detached Context.
   agent.ctx = createScope(ctx, agent as never).ctx
-  await ctx.serial('agent/created', { agent: agent as never })
+  await ctx.serial('agent/created', { agent: agent as never, source: 'startup' as const })
   return agent
 }
 
@@ -308,6 +309,7 @@ describe('skill catalog: only Resident skills reach the model', () => {
     const decision = await ctx.waterfall('agent/pre-step', {
       agent: { id: 'catalog-agent' } as never,
       messages: [catalog],
+      modelSelection: { provider: 'test', model: 'test' } as never,
       turn: 1,
       step: 1,
       signal: testSignal,
@@ -348,6 +350,7 @@ describe('skill catalog: only Resident skills reach the model', () => {
       const decision = await ctx.waterfall('agent/pre-step', {
         agent: { id: 'catalog-agent' } as never,
         messages: [opaque],
+        modelSelection: { provider: 'test', model: 'test' } as never,
         turn: 1,
         step: 1,
         signal: testSignal,
@@ -778,8 +781,9 @@ describe('unload: dispose releases hooks, listeners and per-Agent state', () => 
 
     // The pre-execute hook is gone, so nothing denies any more.
     const decision = await ctx.waterfall('tools/pre-execute', {
-      callId: 'after-dispose', name: 'hidden_tool', arguments: {}, signal: testSignal,
-    }, () => Promise.resolve({ kind: 'allow' }))
+      callId: 'after-dispose', rootCallId: 'after-dispose', token: 'after-dispose:token',
+      name: 'hidden_tool', arguments: {}, signal: testSignal,
+    } as never, () => Promise.resolve({ kind: 'allow' }))
     expect(decision).toEqual({ kind: 'allow' })
 
     // The agent/created listener is gone: a new Agent is never masked, and the
@@ -799,6 +803,7 @@ describe('unload: dispose releases hooks, listeners and per-Agent state', () => 
       } as never
       const preStep = await ctx.waterfall('agent/pre-step', {
         agent: agent as never, messages: [opaque], turn: 1, step: 1, signal: testSignal,
+        modelSelection: { provider: 'test', model: 'test' } as never,
       }, () => Promise.resolve({ kind: 'enter', messages: [opaque] }))
       expect(preStep.kind).toBe('enter')
       expect(warn).not.toHaveBeenCalled()
@@ -878,8 +883,8 @@ describe('usage: unknown/partial stay honest without sessionPersistence', () => 
       if (!mapped.ok) return
       // Zero rows + zero coverage is `unknown`, never `complete`: "nothing
       // reported" is not "nothing missing".
-      expect(mapped.value.coverage.status).toBe('unknown')
-      expect(mapped.value.coverage.status).not.toBe('complete')
+      expect(mapped.value.coverage?.status).toBe('unknown')
+      expect(mapped.value.coverage?.status).not.toBe('complete')
       expect(mapped.value.totals?.calls).toBe(0)
 
       const text = panelText(mapped.value)
@@ -911,7 +916,7 @@ describe('usage: unknown/partial stay honest without sessionPersistence', () => 
       // A) A live-observed Session with no `sessionPersistence` to verify it.
       //    The runtime's own listener produces `partial` coverage for it — the
       //    real host path, not a hand-built fixture.
-      ctx.emit('session/event', { id: 'session-live' }, {
+      ctx.emit('session/event', { id: SessionId('session-live') } as never, {
         type: 'tool/call',
         seq: 1,
         time: now - 60_000,
@@ -929,7 +934,7 @@ describe('usage: unknown/partial stay honest without sessionPersistence', () => 
       const livePanel = toUsagePanelResult(live, { days: 7 }, now)
       expect(livePanel.ok).toBe(true)
       if (!livePanel.ok) return
-      expect(livePanel.value.coverage.status).toBe('partial')
+      expect(livePanel.value.coverage?.status).toBe('partial')
       const liveText = panelText(livePanel.value)
       // The panel labels the page "部分" and states that the numbers are a lower
       // bound, never a complete count.
@@ -959,7 +964,7 @@ describe('usage: unknown/partial stay honest without sessionPersistence', () => 
       }, { days: 7 }, now)
       expect(complete.ok).toBe(true)
       if (!complete.ok) return
-      expect(complete.value.coverage.status).toBe('complete')
+      expect(complete.value.coverage?.status).toBe('complete')
       const completeText = panelText(complete.value)
       expect(completeText).toContain('所选范围内没有调用记录')
       expect(completeText).not.toContain('不能据此判断能力未使用')
@@ -980,8 +985,8 @@ describe('usage: unknown/partial stay honest without sessionPersistence', () => 
       }, { days: 7 }, now)
       expect(capped.ok).toBe(true)
       if (!capped.ok) return
-      expect(capped.value.coverage.status).toBe('partial')
-      expect(capped.value.coverage.status).not.toBe('complete')
+      expect(capped.value.coverage?.status).toBe('partial')
+      expect(capped.value.coverage?.status).not.toBe('complete')
 
       // D) no runtime at all is an error result, not a zero-filled page.
       await disposeRuntime()

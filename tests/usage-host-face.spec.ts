@@ -185,6 +185,8 @@ describe('usage wire bounds', () => {
       expect(descriptor.result.mode).toBe('strict')
       // getSnapshot and refresh answer the same contract; a different symbol
       // would mean the browser face and the Host disagree about the shape.
+      // `mode` narrows the union: only the strict variant carries `typeSymbol`.
+      if (descriptor.result.mode !== 'strict') throw new Error('expected a strict result codec')
       expect(descriptor.result.typeSymbol).toBe('dsh-thinking-guard#UsageSnapshot')
     }
   })

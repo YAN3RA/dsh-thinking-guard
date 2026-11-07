@@ -179,7 +179,6 @@ function profileHash(context: unknown): string {
 
 function options(
   context: unknown,
-  service: { open: unknown },
   overrides: Partial<UsageBackfillOptions> = {},
 ): UsageBackfillOptions {
   return {
@@ -213,7 +212,7 @@ describe('runUsageBackfill', () => {
       return { source: { kind: 'native' }, capabilityId: toolName }
     }
 
-    const result = await runUsageBackfill(options(context, harness.service, {
+    const result = await runUsageBackfill(options(context, {
       classify: trackingClassifier,
       limits: { pageSize: 2 },
     }))
@@ -267,7 +266,7 @@ describe('runUsageBackfill', () => {
     const context = contextFor(harness.service)
     const controller = new AbortController()
 
-    await runUsageBackfill(options(context, harness.service, { signal: controller.signal }))
+    await runUsageBackfill(options(context, { signal: controller.signal }))
 
     expect(harness.opens[0]?.signal).toBe(controller.signal)
   })
@@ -282,7 +281,7 @@ describe('runUsageBackfill', () => {
     })
     const context = contextFor(harness.service)
 
-    const result = await runUsageBackfill(options(context, harness.service))
+    const result = await runUsageBackfill(options(context))
 
     expect(harness.reads.map(call => [call.offset, call.length])).toEqual([[2, 2]])
     expect(result.report.calls).toBe(1)
@@ -301,7 +300,7 @@ describe('runUsageBackfill', () => {
       { shortReadLength: 1 },
     )
     const context = contextFor(harness.service)
-    const result = await runUsageBackfill(options(context, harness.service, { limits: { pageSize: 2 } }))
+    const result = await runUsageBackfill(options(context, { limits: { pageSize: 2 } }))
 
     expect(result.coverageStatus).toBe('partial')
     expect(result.stats.eventsRead).toBe(1)
@@ -316,7 +315,7 @@ describe('runUsageBackfill', () => {
     })
     const context = contextFor(harness.service)
 
-    const result = await runUsageBackfill(options(context, harness.service))
+    const result = await runUsageBackfill(options(context))
 
     expect(result.coverageStatus).toBe('partial')
     expect(result.stats.unverifiableSessions).toBe(1)
@@ -330,7 +329,7 @@ describe('runUsageBackfill', () => {
     const harness = createHarness({ s1: { revision: 'r1', events: [] } })
     const context = contextFor(harness.service)
 
-    const result = await runUsageBackfill(options(context, harness.service))
+    const result = await runUsageBackfill(options(context))
 
     expect(result.coverageStatus).toBe('complete')
     expect(result.stats.completedSessions).toBe(1)
@@ -346,7 +345,7 @@ describe('runUsageBackfill', () => {
     })
     const context = contextFor(harness.service)
 
-    const result = await runUsageBackfill(options(context, harness.service, { limits: { maxSessions: 2 } }))
+    const result = await runUsageBackfill(options(context, { limits: { maxSessions: 2 } }))
 
     expect(harness.opens.map(call => call.sessionId)).toEqual(['s-a', 's-b'])
     expect(result.stats.truncated).toBe(true)
@@ -380,7 +379,7 @@ describe('runUsageBackfill', () => {
       maxTotalEvents: 10,
     }
 
-    const first = await runUsageBackfill(options(context, harness.service, { limits }))
+    const first = await runUsageBackfill(options(context, { limits }))
 
     expect(first.coverageStatus).toBe('partial')
     expect(first.stats.truncated).toBe(true)
@@ -391,7 +390,7 @@ describe('runUsageBackfill', () => {
     expect(first.cursor?.entries).toEqual([{ sessionId: 's1', nextOffset: 3, revision: 'r1' }])
     expect(first.report.coverage.s1?.status).toBe('partial')
 
-    const second = await runUsageBackfill(options(context, harness.service, {
+    const second = await runUsageBackfill(options(context, {
       limits,
       state: first.state,
       cursor: first.cursor,
@@ -415,7 +414,7 @@ describe('runUsageBackfill', () => {
     const context = contextFor(harness.service)
     const cursor = cursorFor(context, [{ sessionId: 's1', nextOffset: 3, revision: 'old' }])
 
-    const result = await runUsageBackfill(options(context, harness.service, {
+    const result = await runUsageBackfill(options(context, {
       cursor,
       limits: { pageSize: 10 },
     }))
@@ -433,7 +432,7 @@ describe('runUsageBackfill', () => {
       entries: [{ sessionId: 's1', nextOffset: 2, revision: 'r1' }],
     }
 
-    const result = await runUsageBackfill(options(context, harness.service, { cursor }))
+    const result = await runUsageBackfill(options(context, { cursor }))
 
     expect(harness.opens.map(call => call.sessionId)).toEqual(['s1'])
     expect(harness.reads.map(call => [call.offset, call.length])).toEqual([[0, 2]])
@@ -445,7 +444,7 @@ describe('runUsageBackfill', () => {
     const context = contextFor(harness.service)
     const cursor = cursorFor(context, [{ sessionId: 's1', nextOffset: 2, revision: 'r1' }])
 
-    const result = await runUsageBackfill(options(context, harness.service, { cursor }))
+    const result = await runUsageBackfill(options(context, { cursor }))
 
     expect(harness.opens).toEqual([])
     expect(harness.reads).toEqual([])
@@ -466,7 +465,7 @@ describe('runUsageBackfill', () => {
     )
     const context = contextFor(harness.service)
 
-    const result = await runUsageBackfill(options(context, harness.service, {
+    const result = await runUsageBackfill(options(context, {
       signal: controller.signal,
       limits: { pageSize: 2 },
     }))
@@ -491,7 +490,7 @@ describe('runUsageBackfill', () => {
     )
     const context = contextFor(harness.service)
 
-    const result = await runUsageBackfill(options(context, harness.service, {
+    const result = await runUsageBackfill(options(context, {
       limits: { pageSize: 2 },
     }))
 
@@ -514,7 +513,7 @@ describe('runUsageBackfill', () => {
     )
     const context = contextFor(harness.service)
 
-    const result = await runUsageBackfill(options(context, harness.service))
+    const result = await runUsageBackfill(options(context))
 
     expect(harness.closes).toEqual(['s2'])
     expect(result.stats.openFailures).toBe(1)
@@ -534,7 +533,7 @@ describe('runUsageBackfill', () => {
     )
     const context = contextFor(harness.service)
 
-    const result = await runUsageBackfill(options(context, harness.service))
+    const result = await runUsageBackfill(options(context))
 
     expect(harness.closes).toEqual(['s1'])
     expect(result.stats.closeFailures).toBe(1)
@@ -555,7 +554,7 @@ describe('runUsageBackfill', () => {
     const harness = createHarness({ s1: { revision: 'r1', events: [badTime] } })
     const context = contextFor(harness.service)
 
-    const result = await runUsageBackfill(options(context, harness.service))
+    const result = await runUsageBackfill(options(context))
 
     expect(result.stats.rejectedEvents).toBe(1)
     expect(result.stats.failedSessions).toBe(1)
@@ -575,7 +574,7 @@ describe('runUsageBackfill', () => {
     const harness = createHarness({ s1: { revision: 'r1', events: [malformedResult] } })
     const context = contextFor(harness.service)
 
-    const result = await runUsageBackfill(options(context, harness.service))
+    const result = await runUsageBackfill(options(context))
 
     expect(result.coverageStatus).toBe('complete')
     expect(result.stats.completedSessions).toBe(1)
@@ -590,7 +589,7 @@ describe('runUsageBackfill', () => {
     })
     const context = contextFor(harness.service)
 
-    const result = await runUsageBackfill(options(context, harness.service, {
+    const result = await runUsageBackfill(options(context, {
       limits: { pageSize: 2, maxTotalEvents: 4 },
     }))
 
@@ -614,7 +613,7 @@ describe('runUsageBackfill', () => {
     const times = [0, 0, 2_000]
     let index = 0
 
-    const result = await runUsageBackfill(options(context, harness.service, {
+    const result = await runUsageBackfill(options(context, {
       limits: { maxRuntimeMs: 1_000 },
       now: () => times[Math.min(index++, times.length - 1)]!,
     }))
@@ -633,7 +632,7 @@ describe('runUsageBackfill', () => {
     const context = contextFor(harness.service)
     const state = createUsageCollectorState()
 
-    const result = await runUsageBackfill(options(context, harness.service, { state }))
+    const result = await runUsageBackfill(options(context, { state }))
 
     expect(harness.opens).toEqual([])
     expect(harness.listCalls).toHaveLength(1)
@@ -650,7 +649,7 @@ describe('runUsageBackfill', () => {
     )
     const context = contextFor(harness.service, null)
 
-    const result = await runUsageBackfill(options(context, harness.service))
+    const result = await runUsageBackfill(options(context))
 
     expect(harness.listCalls).toEqual([])
     expect(harness.opens).toEqual([])

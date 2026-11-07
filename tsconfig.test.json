@@ -1,0 +1,14 @@
+{
+  "// why": "Tests are not covered by tsconfig.json (which includes only src) or tsconfig.client.json (only src/client), so a type error inside tests/ could never fail `pnpm typecheck`. This config closes that gap without emitting.",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "lib": ["es2022", "dom"],
+    "jsx": "react-jsx",
+    "types": ["node", "vitest/globals"],
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": ["tests", "src"]
+}

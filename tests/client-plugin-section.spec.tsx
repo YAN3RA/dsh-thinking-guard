@@ -26,7 +26,6 @@ import {
 } from '../src/client/PluginSection.tsx'
 import { UsagePanel, type UsagePanelApi } from '../src/client/usage.tsx'
 import { OverviewContainer } from '../src/client/OverviewContainer.tsx'
-import { OverviewPanel } from '../src/client/OverviewPanel.tsx'
 import { GuardPanel } from '../src/client/GuardPanel.tsx'
 import { GuardContainer } from '../src/client/GuardContainer.tsx'
 import type { CapabilitySectionInjected } from '../src/client/CapabilitySection.tsx'

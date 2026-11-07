@@ -5,7 +5,7 @@ describe('agent efficiency guard core', () => {
   it('does not allocate state or warn when disabled', () => {
     const guard = new EfficiencyGuard({ enabled: false })
     const agent = {}
-    const call = { name: 'read', arguments: {} }
+    const call = {}
     expect(guard.admitStep(agent, 1)).toEqual({ kind: 'allow' })
     for (let i = 0; i < 3; i++) guard.observeTool(agent, 1, call)
     expect(guard.states.get(agent)).toBeUndefined()
@@ -14,7 +14,7 @@ describe('agent efficiency guard core', () => {
   it('validates legacy threshold ordering and rejects invalid modes', () => {
     expect(() => validateGuardConfig({ profiles: { normal: {
       softSteps: 8, hardSteps: 8, softToolCalls: 1, hardToolCalls: 2, softDurationMs: 1, hardDurationMs: 2,
-    } } })).toThrow(/softSteps must be less than hardSteps/)
+    } } as never })).toThrow(/softSteps must be less than hardSteps/)
     expect(() => validateGuardConfig({ stepLimitMode: 'invalid' as never })).toThrow(/stepLimitMode/)
   })
 
@@ -38,7 +38,7 @@ describe('agent efficiency guard core', () => {
     const agent = {}
     expect(guard.admitStep(agent, 1, 0)).toEqual({ kind: 'allow' })
     expect(guard.admitStep(agent, 1, 1_000_000)).toEqual({ kind: 'allow' })
-    const call = { name: 'read', arguments: { path: 'same' } }
+    const call = {}
     guard.observeTool(agent, 1, call)
     guard.observeTool(agent, 1, call)
     expect(guard.states.get(agent)?.businessToolCalls).toBe(2)
@@ -47,12 +47,12 @@ describe('agent efficiency guard core', () => {
   it('retains counters and timing past all legacy thresholds without convergence signals', () => {
     const guard = new EfficiencyGuard({ profile: 'quick', profiles: { quick: {
       softSteps: 1, hardSteps: 2, softToolCalls: 1, hardToolCalls: 2, softDurationMs: 10, hardDurationMs: 20,
-    } } })
+    } } as never })
     const agent = {}
     guard.admitStep(agent, 1, 0)
     for (let index = 0; index < 100; index++) {
       expect(guard.admitStep(agent, 1, index + 30)).toEqual({ kind: 'allow' })
-      guard.observeTool(agent, 1, { name: 'read', arguments: { path: `file-${index}` } }, index + 30)
+      guard.observeTool(agent, 1, {}, index + 30)
     }
     expect(guard.states.get(agent)).toMatchObject({ modelSteps: 101, businessToolCalls: 100, startedAt: 0, lastActivityAt: 129 })
   })

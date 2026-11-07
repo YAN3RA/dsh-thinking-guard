@@ -40,7 +40,7 @@ async function announceAgent(ctx: Context, id: string): Promise<unknown> {
     status: 'idle',
   } as unknown as { ctx: Context }
   agent.ctx = createScope(ctx, agent as never).ctx
-  await ctx.emit('agent/created', { agent })
+  await ctx.emit('agent/created', { agent: agent as never, source: 'startup' as const })
   return agent
 }
 
@@ -104,7 +104,7 @@ describe('On-demand loop: search, detail and invoke stay reachable', () => {
 
     // Fire agent/created so the policy applies its tools.restrict({ deny }).
     // The listener destructures `{ agent }`, so the payload must be an object.
-    await ctx.emit('agent/created', { agent })
+    await ctx.emit('agent/created', { agent: agent as never, source: 'startup' as const })
     const scoped = ctx.tools.schemas(agent as never).map(s => s.name)
 
     const list = await runOneToolCall(ctx, {

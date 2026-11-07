@@ -83,9 +83,12 @@ function registerNativeTool(ctx: Context, name: string, description: string): st
     name,
     description,
     parameters: {},
-    output: { schema: { type: 'object', additionalProperties: false } },
+    output: {
+      schema: { type: 'object', additionalProperties: false },
+      render: () => [{ type: 'text', text: 'ok' }],
+    },
     async execute() {
-      return { ok: true }
+      return {}
     },
   }))
   return name
@@ -175,7 +178,7 @@ describe('meta-registry', () => {
     expect(skill.find(summary => summary.id === 'frontend-design')?.source).toBe('user-agents')
 
     // Detail for the MCP tool exposes parameters + output.
-    const detail = await ctx.capability.getDetail(issue, { scope: agentStub('agent') })
+    const detail = await ctx.capability.getDetail(issue, undefined, { scope: agentStub('agent') })
     expect(detail?.kind).toBe('tool')
     expect(detail?.parameters).toBeDefined()
     expect((detail?.parameters as { properties?: unknown }).properties).toHaveProperty('title')

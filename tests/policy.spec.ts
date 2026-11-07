@@ -61,14 +61,34 @@ async function setup(config: policy.Config = {}, registryConfig: registry.Config
   return ctx
 }
 
+/**
+ * Build the full `ToolExecution` a `tools/pre-execute` waterfall expects.
+ *
+ * The public type requires `rootCallId` and `token` in addition to the obvious
+ * fields; the tests only care about name/arguments, so those two are derived.
+ */
+function toolExecution(callId: string, name: string, args: Record<string, unknown> = {}): never {
+  return {
+    callId: ToolCallId(callId),
+    rootCallId: ToolCallId(callId),
+    token: ToolCallId(`${callId}:token`),
+    name,
+    arguments: args,
+    signal: new AbortController().signal,
+  } as never
+}
+
 function registerTool(ctx: Context, name: string, description = 'A tool'): void {
   ctx.tools.register(defineTool({
     name,
     description,
     parameters: {},
-    output: { schema: { type: 'object', additionalProperties: false } },
+    output: {
+      schema: { type: 'object', additionalProperties: false },
+      render: () => [{ type: 'text', text: 'ok' }],
+    },
     async execute() {
-      return { ok: true }
+      return {}
     },
   }))
 }
@@ -102,13 +122,13 @@ describe('wildcard / rule matching', () => {
 
   it('gives resident priority over on-demand on conflicts', () => {
     const rules = policy.compileSet({ resident: ['mcp__*'], 'on-demand': ['mcp__*'] })
-    const target = { id: 'mcp__x__y', server: 'x', kind: 'tool' as const, ruleKind: 'tool' as const }
+    const target = { id: 'mcp__x__y', name: 'mcp__x__y', server: 'x', kind: 'tool' as const, ruleKind: 'tool' as const }
     expect(policy.classify(rules, target)).toBe('resident')
   })
 
   it('gives disabled priority over resident on conflicts', () => {
     const rules = policy.compileSet({ resident: ['mcp__*'], disabled: ['mcp__x__*'] })
-    const target = { id: 'mcp__x__y', server: 'x', kind: 'tool' as const, ruleKind: 'tool' as const }
+    const target = { id: 'mcp__x__y', name: 'mcp__x__y', server: 'x', kind: 'tool' as const, ruleKind: 'tool' as const }
     expect(policy.classify(rules, target)).toBe('disabled')
   })
 
@@ -130,7 +150,7 @@ describe('wildcard / rule matching', () => {
       resident: ['mcp__gongfeng__*'],
       'on-demand': ['mcp__gongfeng__create_issue'],
     })
-    const target = { id: 'mcp__gongfeng__create_issue', server: 'gongfeng', kind: 'tool' as const, ruleKind: 'tool' as const }
+    const target = { id: 'mcp__gongfeng__create_issue', name: 'mcp__gongfeng__create_issue', server: 'gongfeng', kind: 'tool' as const, ruleKind: 'tool' as const }
     expect(policy.classify(rules, target)).toBe('on-demand')
   })
 
@@ -139,7 +159,7 @@ describe('wildcard / rule matching', () => {
       resident: ['mcp__gongfeng__create_issue'],
       'on-demand': ['mcp__*'],
     })
-    const target = { id: 'mcp__gongfeng__create_issue', server: 'gongfeng', kind: 'tool' as const, ruleKind: 'tool' as const }
+    const target = { id: 'mcp__gongfeng__create_issue', name: 'mcp__gongfeng__create_issue', server: 'gongfeng', kind: 'tool' as const, ruleKind: 'tool' as const }
     expect(policy.classify(rules, target)).toBe('resident')
   })
 
@@ -149,7 +169,7 @@ describe('wildcard / rule matching', () => {
       'on-demand': ['mcp__x__y'],
       disabled: ['mcp__x__*'],
     })
-    const target = { id: 'mcp__x__y', server: 'x', kind: 'tool' as const, ruleKind: 'tool' as const }
+    const target = { id: 'mcp__x__y', name: 'mcp__x__y', server: 'x', kind: 'tool' as const, ruleKind: 'tool' as const }
     expect(policy.classify(rules, target)).toBe('disabled')
   })
 
@@ -182,7 +202,7 @@ async function announceAgent(ctx: Context, name = 'agent-1'): Promise<{ id: stri
     { id: string; ctx: Context }
   const scoped = createScope(ctx, agent as never)
   agent.ctx = scoped.ctx
-  await ctx.emit('agent/created', { agent: agent as never })
+  await ctx.emit('agent/created', { agent: agent as never, source: 'startup' as const })
   return agent
 }
 
@@ -279,12 +299,7 @@ describe('capability-menu-policy plugin', () => {
     const agent = await announceAgent(ctx)
     expect(agent.ctx.get('tools')?.definitions(agent as never).map(d => d.name)).toContain('a')
     // …and the execution surface still rejects it.
-    const decision = await ctx.waterfall('tools/pre-execute', {
-      callId: ToolCallId('call-disabled'),
-      name: 'a',
-      arguments: {},
-      signal: new AbortController().signal,
-    }, () => Promise.resolve({ kind: 'allow' }))
+    const decision = await ctx.waterfall('tools/pre-execute', toolExecution('call-disabled', 'a', {}), () => Promise.resolve({ kind: 'allow' }))
     expect(decision).toEqual({ kind: 'deny', reason: 'capability "a" is disabled and cannot be executed' })
   })
 
@@ -302,46 +317,26 @@ describe('capability-menu-policy plugin', () => {
   it('denies direct execution of a disabled tool at pre-execute', async () => {
     const ctx = await setup({ tools: { disabled: ['mcp__secret__read'] } })
     registerTool(ctx, 'mcp__secret__read')
-    const decision = await ctx.waterfall('tools/pre-execute', {
-      callId: ToolCallId('call-1'),
-      name: 'mcp__secret__read',
-      arguments: {},
-      signal: new AbortController().signal,
-    }, () => Promise.resolve({ kind: 'allow' }))
+    const decision = await ctx.waterfall('tools/pre-execute', toolExecution('call-1', 'mcp__secret__read', {}), () => Promise.resolve({ kind: 'allow' }))
     expect(decision).toEqual({ kind: 'deny', reason: 'capability "mcp__secret__read" is disabled and cannot be executed' })
   })
 
   it('denies the skill loader for a disabled skill at pre-execute', async () => {
     const ctx = await setup({ skills: { disabled: ['forbidden-skill'] } })
-    const decision = await ctx.waterfall('tools/pre-execute', {
-      callId: ToolCallId('call-1'),
-      name: 'skill',
-      arguments: { name: 'forbidden-skill' },
-      signal: new AbortController().signal,
-    }, () => Promise.resolve({ kind: 'allow' }))
+    const decision = await ctx.waterfall('tools/pre-execute', toolExecution('call-1', 'skill', { name: 'forbidden-skill' }), () => Promise.resolve({ kind: 'allow' }))
     expect(decision).toEqual({ kind: 'deny', reason: 'skill "forbidden-skill" is disabled and cannot be loaded' })
   })
 
   it('denies direct execution of a disabled native tool at pre-execute', async () => {
     const ctx = await setup({ tools: { disabled: ['bash'] } })
     registerTool(ctx, 'bash')
-    const decision = await ctx.waterfall('tools/pre-execute', {
-      callId: ToolCallId('call-1'),
-      name: 'bash',
-      arguments: {},
-      signal: new AbortController().signal,
-    }, () => Promise.resolve({ kind: 'allow' }))
+    const decision = await ctx.waterfall('tools/pre-execute', toolExecution('call-1', 'bash', {}), () => Promise.resolve({ kind: 'allow' }))
     expect(decision).toEqual({ kind: 'deny', reason: 'capability "bash" is disabled and cannot be executed' })
   })
 
   it('does not deny On-demand tools so meta_invoke can still execute them', async () => {
     const ctx = await setup({ tools: { 'on-demand': ['mcp__km__search'] } })
-    const decision = await ctx.waterfall('tools/pre-execute', {
-      callId: ToolCallId('call-1'),
-      name: 'mcp__km__search',
-      arguments: {},
-      signal: new AbortController().signal,
-    }, () => Promise.resolve({ kind: 'allow' }))
+    const decision = await ctx.waterfall('tools/pre-execute', toolExecution('call-1', 'mcp__km__search', {}), () => Promise.resolve({ kind: 'allow' }))
     expect(decision).toEqual({ kind: 'allow' })
   })
 
@@ -366,6 +361,7 @@ describe('capability-menu-policy plugin', () => {
       turn: 1,
       step: 1,
       signal: new AbortController().signal,
+      modelSelection: { provider: 'test', model: 'test' } as never,
     }, () => Promise.resolve({ kind: 'enter', messages: [message] }))
     expect(decision.kind).toBe('enter')
     if (decision.kind !== 'enter') return
@@ -799,21 +795,16 @@ describe('On-demand attribution predicate (isHiddenOnlyByPolicy)', () => {
 
     let armed = false
     let installed = 0
-    await agent.ctx.plugin({
-      name: 'third-party-in-emit',
-      inject: ['tools'],
-      apply(scoped: {
-        on: (n: string, h: () => void) => unknown
-        tools: { restrict: (f: unknown) => () => void }
-      }) {
-        scoped.on('tools/change', () => {
-          if (!armed || installed > 0) return
-          installed += 1
-          // Append our own restriction inside the policy's install emit.
-          scoped.tools.restrict({ deny: ['mcp__km__search'] })
-        })
-      },
-    } as never)
+    // Subscribed directly on the agent scope: the listener must run AFTER this
+    // policy's own `tools/change` handler, which is what makes it able to append
+    // a restriction inside the install emit.
+    const scopedTools = agent.ctx.get('tools')!
+    agent.ctx.on('tools/change', () => {
+      if (!armed || installed > 0) return
+      installed += 1
+      // Append our own restriction inside the policy's install emit.
+      scopedTools.restrict({ deny: ['mcp__km__search'] })
+    })
 
     armed = true
     await ctx.emit('agent/created', { agent: agent as never, source: 'startup' } as never)
@@ -823,6 +814,60 @@ describe('On-demand attribution predicate (isHiddenOnlyByPolicy)', () => {
     // Invisible, but NOT only because of this policy — the forward must not lift it.
     expect(agent.ctx.get('tools')?.get('mcp__km__search', agent as never)).toBeUndefined()
     expect(ctx.capabilityPolicy.isHiddenOnlyByPolicy(agent as never, 'mcp__km__search')).toBe(false)
+  })
+
+  /**
+   * The guard above rests on an implicit contract: installing this policy's own
+   * restriction contributes EXACTLY ONE `tools/change` emit.
+   *
+   * That number is what the attribution window compares against (`> 1` means a
+   * third party touched the view). If DSH ever starts emitting more than once per
+   * `restrict()` — or stops emitting at all — the guard silently changes meaning:
+   * it would either refuse every attribution (On-demand forwards break) or accept
+   * a contaminated sample (the D1 bypass returns). Pin the count so that change
+   * shows up as a test failure rather than a security regression.
+   */
+  it('pins the emit count of one own install to exactly one', async () => {
+    const ctx = await setup({ tools: { 'on-demand': ['mcp__km__search'] } })
+    registerTool(ctx, 'mcp__km__search')
+    await ctx.capability.refresh()
+
+    const agent = {
+      id: 'emit-count-agent',
+      options: {},
+      session: { header: { cwd: process.cwd() } },
+      ctx: new Context(),
+      status: 'idle',
+    } as unknown as { id: string; ctx: Context }
+    agent.ctx = (await import('@deepseek-ai/dsh-scope')).createScope(ctx, agent as never).ctx
+
+    // Count only the emits produced by the install itself. The scope listener is
+    // registered BEFORE `agent/created`, so it sees the same emits the policy's
+    // own attribution window is bracketed by.
+    let emits = 0
+    agent.ctx.on('tools/change', () => { emits += 1 })
+
+    await ctx.emit('agent/created', { agent: agent as never, source: 'startup' } as never)
+
+    // One `restrict()` = one emit. Attribution is allowed on this path.
+    expect(emits).toBe(1)
+    expect(ctx.capabilityPolicy.isHiddenOnlyByPolicy(agent as never, 'mcp__km__search')).toBe(true)
+  })
+
+  /**
+   * The complementary half: a tier move that lifts the restriction must leave no
+   * attribution behind, and must not throw. `deny` becomes empty, so there is
+   * nothing to install and nothing to prove.
+   */
+  it('clears attribution when the deny list becomes empty', async () => {
+    const ctx = await setup({ tools: { 'on-demand': ['mcp__km__search'] } })
+    registerTool(ctx, 'mcp__km__search')
+    await ctx.capability.refresh()
+    const agent = await announceAgent(ctx)
+    expect(ctx.capabilityPolicy.isHiddenOnlyByPolicy(agent, 'mcp__km__search')).toBe(true)
+
+    await ctx.capabilityPolicy.updateConfig({ tools: { resident: ['mcp__km__search'] } })
+    expect(ctx.capabilityPolicy.isHiddenOnlyByPolicy(agent, 'mcp__km__search')).toBe(false)
   })
 })
 

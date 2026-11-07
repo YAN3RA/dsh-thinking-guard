@@ -13,14 +13,23 @@ import { mountTestExecutor, runOneToolCall } from './stubs/test-executor.ts'
 
 const testSignal = new AbortController().signal
 
-function agentStub(name: string) {
+/** A minimal Agent-shaped object; tests only need the session cwd and identity. */
+interface AgentStub {
+  id: string
+  options: Record<string, never>
+  session: { header: { cwd: string } }
+  ctx: Context
+  status: string
+}
+
+function agentStub(name: string): AgentStub {
   return {
     id: name,
     options: {},
     session: { header: { cwd: process.cwd() } },
     ctx: new Context(),
     status: 'idle',
-  } as never
+  }
 }
 
 async function setup(home: string, config: toolMetaSearch.Config = {}, registryConfig: registry.Config = {}): Promise<Context> {
@@ -66,9 +75,12 @@ function registerNativeTool(ctx: Context, name: string, description: string): st
     name,
     description,
     parameters: {},
-    output: { schema: { type: 'object', additionalProperties: false } },
+    output: {
+      schema: { type: 'object', additionalProperties: false },
+      render: () => [{ type: 'text', text: 'ok' }],
+    },
     async execute() {
-      return { ok: true }
+      return {}
     },
   }))
   return name
@@ -107,7 +119,7 @@ describe('capability-menu-search', () => {
     await fs.mkdir(join(project, '.git'), { recursive: true })
     await writeSkill(join(project, '.agents/skills'), 'project-only', 'Project guidance', 'Project body.')
     const ctx = await setup(home)
-    const agent = agentStub('project-agent') as { session: { header: { cwd: string } } }
+    const agent = agentStub('project-agent')
     agent.session.header.cwd = project
     ctx.provide('agents', { list: () => [agent] })
     await ctx.capability.refresh()
@@ -254,7 +266,7 @@ describe('capability-menu-search', () => {
   })
 
   it('hides Resident capabilities from list and exact-id detail', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(join(tmpdir(), 'dsh-meta-search-')))
+    // No temp dir needed: this case only exercises the in-memory catalog.
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)

@@ -438,7 +438,7 @@ describe('capability-menu-invoke', () => {
     const { createScope } = await import('@deepseek-ai/dsh-scope')
     const agent = agentStub('on-demand-agent') as { id: string; ctx: Context }
     agent.ctx = createScope(ctx, agent as never).ctx
-    await ctx.emit('agent/created', { agent: agent as never })
+    await ctx.emit('agent/created', { agent: agent as never, source: 'startup' as const })
     const assembly = await ctx.systemPrompt.assemble({ scope: agent as never })
     expect(assembly.tools.map(tool => tool.name)).not.toContain(grep)
     expect(agent.ctx.get('tools')?.get(grep, agent as never)).toBeUndefined()
@@ -523,7 +523,7 @@ describe('capability-menu-invoke', () => {
 
     const agent = agentStub('on-demand-restricted') as { id: string; ctx: Context }
     agent.ctx = createScope(ctx, agent as never).ctx
-    await ctx.emit('agent/created', { agent: agent as never })
+    await ctx.emit('agent/created', { agent: agent as never, source: 'startup' as const })
 
     // Control: this policy's own mask alone must not block the forward —
     // otherwise the denial below could not be attributed to the third party.

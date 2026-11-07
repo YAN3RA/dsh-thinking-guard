@@ -16,84 +16,46 @@
 
 ## 安装
 
-不需要 npm（这个包不在 npm registry 上）。安装来源是 GitHub Release 附件，通过 DSH 自己的入口
-`dsh plugin --profile desktop add <附件URL>` 装进 profile——它会同时把包登记进 `dsh.profile.bundles`，
-手工改 `package.json` 再 `pnpm install` **不会**，那样装了也不挂载。
+一条命令：
 
-### 方式一：把这句话发给 DSH 对话（推荐）
-
-复制下面整段，粘贴给 DSH：
-
-```
-帮我安装 dsh-thinking-guard。请按顺序做：
-
-1. 取最新 Release 的带哈希附件 URL：
-   curl -s https://api.github.com/repos/YAN3RA/dsh-thinking-guard/releases/latest | grep -o 'https://[^"]*\.tgz'
-2. 用 dsh plugin --profile desktop add '<上一步输出的 URL>' 安装。
-3. 装完确认 ~/.dsh/profiles/desktop/package.json 的 dsh.profile.bundles 里有
-   "dsh-thinking-guard"（没有就告诉我，别自己猜）。
-4. 报告装到的版本号，然后提醒我重启 DSH。
+```bash
+dsh plugin --profile desktop add dsh-thinking-guard
 ```
 
-需要代理就补一句「走代理 http://127.0.0.1:7890」。
+装完**重启 DSH**。
 
-### 方式二：一条命令（Windows PowerShell）
+### 为什么这一条就够
 
-```powershell
-$f="$env:TEMP\install-guard.ps1"; Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/YAN3RA/dsh-thinking-guard/main/scripts/install.ps1' -OutFile $f; pwsh -NoProfile -File $f
+- 包发布在 npm registry，普通版本号即可解析，不需要贴 URL、不需要带哈希。
+- 包内已含构建产物 `lib/`，pnpm 不会跑任何构建脚本，**不需要**在 profile 的 `pnpm-workspace.yaml` 里配 `allowBuilds`。
+- `dsh plugin add` 会在 pnpm 之后多做一次 bundle 协调，把包自动登记进 `dsh.profile.bundles`。**手工改 `package.json` 再 `pnpm install` 不会**，那样装了也不挂载。
+
+### 指定版本 / 升级
+
+```bash
+dsh plugin --profile desktop add dsh-thinking-guard@0.1.16   # 锁定版本
+dsh plugin --profile desktop add dsh-thinking-guard           # 升到最新
 ```
 
-需要代理时末尾加 `-Proxy http://127.0.0.1:7890`；`-DryRun` 只看不改；`-Version v0.1.12` 装指定版本。
-脚本幂等，会自动挑最新 Release、处理升级，并在结束时核对版本、pin 与 `dsh.profile.bundles`。
+### 备用渠道：GitHub Release 附件
 
-### 方式三：手动
+npm 不可达时，可用 Release 附件的带哈希 URL：
 
-1. 取最新 Release 的带哈希附件 URL：
+```bash
+curl -s https://api.github.com/repos/YAN3RA/dsh-thinking-guard/releases/latest \
+  | grep -o 'https://[^"]*\.tgz'
+dsh plugin --profile desktop add '<上一步输出的 URL>'
+```
 
-   ```bash
-   curl -s https://api.github.com/repos/YAN3RA/dsh-thinking-guard/releases/latest \
-     | grep -o 'https://[^"]*\.tgz'
-   ```
+**为什么附件名必须带哈希**：profile 从附件 URL 安装时，pnpm 按「URL + integrity」缓存。用同名覆盖附件后 pnpm 不会重新下载——`--force`、`store prune`、删 `node_modules` 都无效。附件名带 tarball 自身 SHA-256 前 8 位，内容变了 URL 就变，缓存不可能命中旧内容。
 
-2. 用 DSH 自己的入口安装：
+### 不支持的安装来源
 
-   ```bash
-   dsh plugin --profile desktop add '<上一步输出的 URL>'
-   ```
+| 来源 | 结果 | 原因 |
+|---|---|---|
+| `git+https://…` / `github:owner/repo` | ❌ | 仓库不含 `lib/`，pnpm 需现场跑 `prepare` 构建，而 pnpm 默认拦截 git 依赖的构建脚本 |
+| `link:<本地目录>` | ⚠️ 能装不推荐 | 软链到源码目录，peer 依赖不从目标 `node_modules` 解析 |
 
-3. 重启 DSH。
-
-安装后**必须重启 DSH** 才会加载新代码。
-
-### 为什么必须用 `dsh plugin add`
-
-实测结论（隔离 `DSH_HOME`，非生产 profile）：
-
-| 做法 | 包装上了 | 自动写 `dsh.profile.bundles` | 结果 |
-| --- | --- | --- | --- |
-| `dsh plugin add <url>` | 是 | **是** | 插件被挂载 |
-| 手改 `dependencies` + `pnpm install` | 是 | **否** | 装了但不挂载，设置页看不到 |
-
-`dsh plugin` 在 pnpm 跑完后会做一次 bundle 协调：新增的、`package.json` 里声明了
-`dsh.bundle.patch` 的依赖会被追加进 `dsh.profile.bundles`。裸 `pnpm install` 没有这一步。
-
-### 为什么附件名带哈希
-
-profile 从附件 URL 安装时，pnpm 按「URL + integrity」缓存解析结果。**用同一个文件名覆盖附件后，pnpm 不会重新下载**——`--force`、`store prune`、删 `node_modules` 都无效，装回去的还是旧 `lib/`。这个坑实际发生过一次。
-
-因此附件名带 tarball 自身的 SHA-256 前 8 位：内容变了 URL 就变，缓存不可能命中旧内容；内容没变则名字不变，重复发布保持幂等。
-
-发版请用 `node scripts/release.mjs`，它会自动构建、打包并按哈希重命名，打印出准确的附件名与上传命令。
-
-### 其它安装来源
-
-| 来源写法 | 结果 | 说明 |
-| --- | --- | --- |
-| `https://…/releases/download/…/…-<hash>.tgz` | ✅ 可用 | **推荐**。自动登记 bundle，升级正常 |
-| 本地 `.tgz` 绝对路径 | ✅ 可用 | 会记成 `file:...`。只在同机自测有意义，换机即失效 |
-| `git+https://github.com/…git` / `github:owner/repo` | ❌ 默认失败 | 仓库不含 `lib/`，pnpm 需现场跑 `prepare` 构建，而 pnpm 默认拦截 git 依赖的构建脚本 |
-| `link:<本地目录>` | ⚠️ 能装，不推荐 | 软链到源码目录，peer 依赖不从目标 `node_modules` 解析 |
-| 裸包名 `dsh-thinking-guard` | ❌ 404 | 包没发布到 npm registry |
 
 ## 升级
 

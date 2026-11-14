@@ -14,10 +14,12 @@ import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-connection/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { createElement, type ReactElement } from 'react'
-import { installSettingsNavIcon } from './settings-nav-icon.ts'
+import { SETTINGS_NAV_ICON_ID, SettingsNavIcon } from './settings-nav-icon.tsx'
+import type { CallIndexRemoteFace } from './call-index.tsx'
 import { TYPERT_REMOTE, type GuardSwitches } from './remote.ts'
 import type { GuardSwitchRemote as GuardSwitchesRemote } from './GuardContainer.tsx'
 import { USAGE_TYPERT_REMOTE } from './usage-remote.ts'
+import { CALL_INDEX_TYPERT_REMOTE } from './call-index-remote.ts'
 import type { TypertRemoteContribution } from '@deepseek-ai/dsh-typert-protocol'
 import { createUsagePanelApi, type UsagePanelRemote } from './usage-adapter.ts'
 import { UsagePanel, type UsagePanelApi } from './usage.tsx'
@@ -83,19 +85,19 @@ export function UsageSection(props: UsageSectionProps): ReactElement {
 export const inject = ['slots', 'locale', 'remote']
 export const TYPERT_REMOTE_WITH_USAGE: TypertRemoteContribution = {
   package: TYPERT_REMOTE.package,
-  descriptors: [...TYPERT_REMOTE.descriptors, ...USAGE_TYPERT_REMOTE.descriptors],
+  descriptors: [...TYPERT_REMOTE.descriptors, ...USAGE_TYPERT_REMOTE.descriptors, ...CALL_INDEX_TYPERT_REMOTE.descriptors],
 }
 
 
 /** Register the 能力菜单 section once `settings.section` is on the ledger. */
 export async function apply(ctx: ClientContext): Promise<() => void> {
   const zh = {
-    nav: '能力菜单',
-    title: '能力菜单',
+    nav: '能力管理',
+    title: '能力管理',
     tabOverview: '总览',
-    tabGuard: '思考限制',
-    tabCatalog: '能力目录',
-    tabUsage: '调用统计',
+    tabGuard: '执行保护',
+    tabCatalog: '工具与技能',
+    tabUsage: '调用明细',
     overviewTitle: '总览',
     overviewDesc: '插件当前工作状态的概览。数字取自真实统计与配置，不显示示例值；没有数据时如实标注为空。',
     overviewRefresh: '刷新',
@@ -106,13 +108,13 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     tierSummary: '能力策略',
     attention: '需要关注',
     attentionNone: '暂无需关注项。',
-    attentionFailures: '有能力的失败调用较多，可到能力目录调整其策略。',
-    attentionIdle: '有 30 天内零调用的能力，可在调用统计查看建议。',
+    attentionFailures: '有能力的失败调用较多，可到「工具与技能」调整其策略。',
+    attentionIdle: '有 30 天内零调用的能力，可在「调用明细」查看建议。',
     attentionCoverage: '统计覆盖不完整，部分结论不可用。',
     tierResident: '常驻',
     tierOnDemand: '按需',
     tierDisabled: '禁用',
-    guardTitle: '思考限制',
+    guardTitle: '执行保护',
     guardDesc: '只针对有证据的重复与无进展拦截具体操作；不因总步数、工具总次数或任务时长终止任务。',
     guardBoundary: '统计与限制是两件事：Step、工具调用次数、任务时长只用于统计与诊断，不构成硬停止条件。Quick / Normal / Deep 三档里的 Step、工具次数、时长阈值（soft* / hard*）是兼容字段与统计口径，只参与配置校验与计数，不产生提醒，也不停止任务。单个工具自身的超时另由宿主或该工具负责。',
     guardReset: '恢复默认',
@@ -279,12 +281,12 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     guardToastSaved: '已保存',
   } satisfies Record<CapabilityKey | GuardToastKey, string>
   const en = {
-    nav: 'Capability Menu',
-    title: 'Capability Menu',
+    nav: 'Capability Management',
+    title: 'Capability Management',
     tabOverview: 'Overview',
-    tabGuard: 'Thinking Limits',
-    tabCatalog: 'Capabilities',
-    tabUsage: 'Usage',
+    tabGuard: 'Execution Protection',
+    tabCatalog: 'Tools & Skills',
+    tabUsage: 'Call Details',
     overviewTitle: 'Overview',
     overviewDesc: 'A snapshot of what this plugin is doing. Numbers come from real statistics and configuration, never sample values; unknown data is labeled rather than shown as zero.',
     overviewRefresh: 'Refresh',
@@ -301,7 +303,7 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     tierResident: 'Resident',
     tierOnDemand: 'On-demand',
     tierDisabled: 'Disabled',
-    guardTitle: 'Thinking Limits',
+    guardTitle: 'Execution Protection',
     guardDesc: 'Blocks specific operations only when there is evidence of repetition or no progress; never stops a task for step count, tool count or duration.',
     guardBoundary: 'Counting and limiting are separate: steps, tool calls and task duration are statistics and diagnostics only, never hard-stop conditions. The per-level (Quick / Normal / Deep) step, tool-call and duration thresholds (soft* / hard*) are compatibility fields and counting units: they only take part in config validation and tallies, never producing a reminder or stopping a task. A single tool timeout stays with the host or that tool.',
     guardReset: 'Restore defaults',
@@ -480,7 +482,9 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     console.error('[capability-menu] $mount failed:', error)
   }
   const t = ctx.locale.bind(NS) as CapabilitySectionInjected['t']
-  installSettingsNavIcon(ctx, () => t('nav'))
+  // The nav glyph is a real `settings.section.icon` registrant now, addressed by
+  // the same id as our `settings.section` entry (below). No DOM surgery, so
+  // nothing to install here — the shell calls the component with `size`/`active`.
   const remote = (): unknown => {
     try {
       // Resolve the mounted namespace service by its registered key; a property
@@ -607,6 +611,134 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
   // One settings page for the whole plugin, split by capability category. Both
   // views keep their own Remote subscriptions; `PluginSection` owns only the
   // category tab bar and the shared chrome.
+  /**
+   * Resolve the mounted `callIndex` namespace by key, as a PROVIDER.
+   *
+   * Same mechanism as `capabilityPolicy`/`usage` above: `ctx.get` rather than a
+   * property access (this plugin mounts the namespace itself, so `inject` would
+   * hit the "without inject" gate). Returning a function is deliberate — the
+   * namespace only becomes visible after `$mount` settles, and the section is
+   * constructed before that, so reading it here would freeze `undefined`.
+   */
+  const callIndexRemote = (): CallIndexRemoteFace | undefined => {
+    try {
+      const face = (ctx.get as (key: string) => unknown)('remote.callIndex')
+      if (typeof face !== 'object' || face === null) return undefined
+      return face as CallIndexRemoteFace
+    } catch (error) {
+      console.error('[capability-menu] ctx.get("remote.callIndex") failed:', error)
+      return undefined
+    }
+  }
+
+  /**
+   * Resolve the LIVE scope target for 按会话 / 按工作区.
+   *
+   * `settings.section` is a root-scoped slot: the shell hands a section only
+   * `close`, so this component never receives Session standard props. The two
+   * narrowed scopes are therefore resolved on demand from the client services
+   * that do know the selection, and are read at CLICK time rather than
+   * subscribed: a scope switch is a deliberate act, and reading it then is both
+   * enough and cheaper than keeping a subscription for a tab that may never be
+   * opened. When nothing resolves, the panel reports the fallback instead of
+   * filtering on `undefined` and silently showing an empty table.
+   */
+  const readSessionCatalog = (): {
+    ids: readonly string[]
+    byId: Record<string, { cwd?: string; displayTitle?: string; title?: string }>
+    currentId?: string
+  } => {
+    const sessions = (ctx.get as (key: string) => unknown)('sessions') as
+      | {
+        list?: {
+          getSnapshot?: () => {
+            ids?: readonly string[]
+            byId?: Record<string, { cwd?: string; displayTitle?: string; title?: string }>
+          }
+        }
+      }
+      | undefined
+    const uiSession = (ctx.get as (key: string) => unknown)('uiSession') as
+      | { adapter?: { current?: { value?: { key?: string } } } }
+      | undefined
+    const list = sessions?.list?.getSnapshot?.()
+    return {
+      ids: list?.ids ?? [],
+      byId: list?.byId ?? {},
+      ...(uiSession?.adapter?.current?.value?.key === undefined
+        ? {}
+        : { currentId: uiSession.adapter.current.value.key }),
+    }
+  }
+
+  const scopeTarget = (): { sessionId?: string; cwd?: string } => {
+    try {
+      const { byId, currentId: sessionId } = readSessionCatalog()
+      const cwdFromSession = sessionId === undefined ? undefined : byId?.[sessionId]?.cwd
+      // 工作区 falls back to the only workspace when exactly one exists: with a
+      // single project there is no ambiguity, and an empty filter would be worse
+      // than the obvious answer.
+      const cwds = new Set<string>()
+      for (const id of Object.keys(byId)) {
+        const cwd = byId[id]?.cwd
+        if (typeof cwd === 'string' && cwd !== '') cwds.add(cwd)
+      }
+      const soleCwd = cwds.size === 1 ? [...cwds][0] : undefined
+      return {
+        ...(sessionId === undefined || sessionId === '' ? {} : { sessionId }),
+        ...(cwdFromSession ?? soleCwd) === undefined
+          ? {}
+          : { cwd: cwdFromSession ?? soleCwd },
+      }
+    } catch {
+      // Any failure means "cannot bind"; the panel degrades to 全部 and says so.
+      return {}
+    }
+  }
+
+  /**
+   * Session identities for 调用明细: display names, plus the list to switch to.
+   *
+   * The call index wire carries only `sessionId` / `cwd` / `cut` — no title —
+   * because a title is presentation, not index metadata. Showing a truncated id
+   * (「会话 session-f46f」) tells the operator nothing about WHICH conversation
+   * they are reading, which is exactly the complaint. The names therefore come
+   * from the Host's own Session catalog through the client `sessions` service.
+   *
+   * Read on demand, never subscribed: the panel asks when it renders a scope
+   * line or opens the picker, and a missing catalog degrades to the id rather
+   * than blanking the row.
+   */
+  const sessionCatalog = (): {
+    current?: { id: string; name: string }
+    items: readonly { id: string; name: string; cwd?: string }[]
+  } => {
+    try {
+      const { ids, byId, currentId } = readSessionCatalog()
+      const nameOf = (id: string): string => {
+        const row = byId[id]
+        const title = row?.displayTitle ?? row?.title
+        return typeof title === 'string' && title.trim() !== '' ? title.trim() : id
+      }
+      // Every catalogued Session is switchable, not just the ones the index has
+      // already read: a Session with zero calls is a valid answer to
+      // 「这个会话有没有调用」, and hiding it would look like a bug.
+      const items = ids.map(id => ({
+        id,
+        name: nameOf(id),
+        ...(typeof byId[id]?.cwd === 'string' && byId[id]?.cwd !== '' ? { cwd: byId[id]?.cwd as string } : {}),
+      }))
+      return {
+        ...(currentId === undefined || currentId === ''
+          ? {}
+          : { current: { id: currentId, name: nameOf(currentId) } }),
+        items,
+      }
+    } catch {
+      return { items: [] }
+    }
+  }
+
   const tabT = ctx.locale.bind(NS) as (key: PluginSectionKey) => string
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section',
@@ -617,17 +749,32 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     inject: (): PluginSectionInjected => ({
       capability: injected(),
       usageApi,
+      callIndexRemote,
+      scopeTarget,
+      sessionCatalog,
       // The same capability face backs both the Guard switches and the tier
-      // summary, so one remote object serves 思考限制 and 总览.
+      // summary, so one remote object serves 执行保护 and 总览.
       guardRemote,
       t: tabT,
     }),
   }, PluginSection))
 
+  // The nav glyph. `settings.section.icon` is a separate root-scoped list slot
+  // addressed by the id of the section it decorates, so the id here MUST equal
+  // the `settings.section` id above ("unmatched ids never render"). Registering
+  // is purely additive: without it the shell keeps its own default glyph.
+  //
+  // Gated on `settings.section.icon` itself, not on `settings.section`: a host
+  // that predates the icon seat simply never declares this key, so the callback
+  // never runs and we degrade to the shell's default glyph. Registering while
+  // only the section seat existed would instead throw
+  // `slot "settings.section.icon" is not declared` from a microtask.
+  ctx.slots.inject('settings.section.icon', () => ctx.slots.register({
+    name: 'settings.section.icon',
+    id: SETTINGS_NAV_ICON_ID,
+  }, SettingsNavIcon))
+
   return () => {
     disposeRemote?.()
   }
 }
-
-  // Usage descriptors are included in TYPERT_REMOTE_WITH_USAGE above. RemoteStore
-  // rejects a second contribution with the same package, so keep one lifecycle.

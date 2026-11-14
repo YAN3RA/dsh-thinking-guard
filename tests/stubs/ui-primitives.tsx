@@ -90,3 +90,26 @@ export function Toast(props: BasicProps) {
   const { text, tone: _tone, anchor: _a, holdMs: _h, actions: _ac, onDone: _d, ...rest } = props
   return createElement('div', { ...rest, role: 'status' }, text as ReactNode)
 }
+
+/**
+ * Real API: `(props: IconProps) => React.JSX.Element` where `IconProps` is
+ * `{size?: number, className?: string}`. The production component is built by
+ * the package's private `productIcon(glyph, weight)` helper, so its exact
+ * output is: an `<svg>` with `width`/`height` from `size` (default = the
+ * glyph's own drawn size, 16), `className` forwarded, `data-icon` carrying
+ * `dsw-icon-<glyph>-<weight>`, `aria-hidden="true"`, and a single `<use>`
+ * child pointing at that sprite symbol id — the artwork itself lives in the
+ * document icon sprite that `ui-theme` maintains, which is why colour rides
+ * `currentColor` and why no `viewBox`/`fill`/`stroke` appears on the root.
+ *
+ * Mirrored here at contract level only; the artwork is deliberately not
+ * reproduced, and tests must never assert glyph path data.
+ */
+export function IconFlatListOutlineMedium(props: { size?: number | undefined; className?: string | undefined }) {
+  const { size = 16, className } = props
+  return createElement(
+    'svg',
+    { width: size, height: size, className, 'data-icon': 'dsw-icon-flat-list-outline-medium', 'aria-hidden': 'true' },
+    createElement('use', { href: '#dsw-icon-flat-list-outline-medium' }),
+  )
+}

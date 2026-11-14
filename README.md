@@ -1,22 +1,16 @@
 # dsh-thinking-guard
 
-一个 DSH 插件：把**能力目录与按需调用**（Capability Menu 思路）和 **Agent 效率守卫**（重复/循环调用提醒）整合在一起。当前版本 **0.1.19**。
+一个 DSH 插件：把**能力目录与按需调用**（Capability Menu 思路）和 **Agent 效率守卫**（重复/循环调用提醒）整合在一起。
+
+当前版本 **0.1.19**。
 
 ## 它做什么
 
-- `meta_search` 按需查找能力，`meta_invoke` 调用能力；工具与技能按 Resident / On-demand / Disabled 三档分层，Disabled 会在执行入口拒绝调用，不只是隐藏 Schema。
-- Guard 按 Agent / Turn 隔离，用工具签名与 Step 的结果/错误指纹做重复与 A-B 循环检测；只在证据满足门槛时对匹配调用局部拒绝一次，**不停止整个 Turn**。
-- 设置页提供四个页面：总览、防循环、调用统计、能力目录。
-
-## 宿主兼容性
-
-- **实测版本：DSH 0.2.2-rc.1**。本插件的开发、类型检查与测试都以该版本为基线（`devDependencies` 中 `@deepseek-ai/dsh-*` 均为 `0.2.2-rc.1`，`node_modules/@deepseek-ai/dsh-tools` 实测也是 `0.2.2-rc.1`）。
-- `peerDependencies` 声明的范围是 `^0.2.0 || ^0.2.1-rc.3 || ^0.2.2-rc.1`。范围内**除 0.2.2-rc.1 以外的版本均未实测**，属于理论兼容，不代表已验证可用。
-- 只有 `0.2.2-rc.1` 上跑过完整检查；其他 0.2.x 版本请按「提示 DSH 版本不兼容」一节的流程自行评估风险。
+- `meta_search` 按需查找能力，`meta_invoke` 调用能力。工具与技能按 **Resident / On-demand / Disabled** 三档分层：Resident 直接出现在模型工具列表里，On-demand 收起、需要时搜索后调用，Disabled 在**执行入口**拒绝，不只是隐藏 Schema。
+- Guard 按 Agent / Turn 隔离，用工具签名与结果/错误指纹识别**重复调用**与 **A-B 交替循环**。只在证据满足门槛时对匹配调用局部拒绝一次，**不停止整个 Turn**。
+- 设置页四个页面：总览、执行保护、工具与技能、调用明细。
 
 ## 安装
-
-一条命令：
 
 ```bash
 dsh plugin --profile desktop add dsh-thinking-guard
@@ -24,57 +18,63 @@ dsh plugin --profile desktop add dsh-thinking-guard
 
 装完**重启 DSH**。
 
-### 指定版本 / 升级
-
-```bash
-dsh plugin --profile desktop add dsh-thinking-guard@0.1.19   # 锁定版本
-dsh plugin --profile desktop add dsh-thinking-guard           # 升到最新
-```
-
-### 不支持的安装来源
-
-| 来源 | 结果 | 原因 |
-|---|---|---|
-| `git+https://…` / `github:owner/repo` | ❌ | 仓库不含 `lib/`，pnpm 需现场跑 `prepare` 构建，而 pnpm 默认拦截 git 依赖的构建脚本 |
-| `link:<本地目录>` | ⚠️ 能装不推荐 | 软链到源码目录，peer 依赖不从目标 `node_modules` 解析 |
-
+包已发布在 npm registry，普通包名就能装；包内含构建产物 `lib/`，不需要在 profile 里配 `allowBuilds`。
 
 ## 升级
 
-重跑方式一 / 方式二即可。脚本会比对当前 pin 与最新附件：
+```bash
+dsh plugin --profile desktop add dsh-thinking-guard           # 升到最新
+dsh plugin --profile desktop add dsh-thinking-guard@0.1.19    # 锁定某个版本
+```
 
-- 一致 → 只重装同样的字节，`bundles` 不动
-- 不一致 → 打印 `from:` / `to:`，走 `dsh plugin add` 换版本
+装完**重启 DSH**。
 
-手动升级就是把方式三第 2 条的 URL 换成新版本的哈希附件再跑一次。
+> 若当前是通过本地 `.tgz` 或 `file:` 来源安装的，直接 `add` **不会覆盖**已有来源——先 `remove` 再 `add`：
+>
+> ```bash
+> dsh plugin --profile desktop remove dsh-thinking-guard
+> dsh plugin --profile desktop add dsh-thinking-guard
+> ```
 
 ## 配置
 
-默认 Guard 模式为 `normal`。Guard 的行为由三个开关各自独立控制：
+Guard 的行为由三个开关**各自独立**控制：
 
-- `duplicateDetection`：精确重复提醒。开启后，同一操作及相同结果/错误指纹构成的连续重复达到第 3/5/8 次时给出提醒。
-- `alternatingCycleDetection`：交替循环识别。开启后，识别有证据的 A-B 交替循环并给出提醒；它与 `duplicateDetection` 互相独立，关掉其一不影响另一个。
-- `noProgressProtection`：局部拒绝的总闸。关闭时 Guard 仍然提醒，但**绝不拒绝任何调用**；只有开启、且相同操作及结果/错误指纹满足门槛时，才通过 `tools.guard` 对匹配调用局部拒绝一次，不停止整个 Turn。
+- `duplicateDetection`：精确重复提醒。同一操作及相同结果/错误指纹连续重复达到第 3/5/8 次时给出提醒。
+- `alternatingCycleDetection`：交替循环识别。识别有证据的 A-B 交替循环并提醒；与 `duplicateDetection` 互相独立，关掉其一不影响另一个。
+- `noProgressProtection`：局部拒绝的总闸。关闭时仍然提醒，但**绝不拒绝任何调用**；只有开启且证据满足门槛时，才通过 `tools.guard` 对匹配调用局部拒绝一次，不停止整个 Turn。
 
-Quick / Normal / Deep 里的 `soft*` / `hard*` 阈值（Step、Tool 次数、Duration）只是兼容字段与计数口径，**不产生提醒，也不停止任务**。`stepLimitMode: hard-stop` 会归一为 `warn-only`，`duplicateHardBlock: true` 会归一为 `false`，启动时分别记录弃用提示。配置位于插件 root entry 的 `config.guard`，状态按 Agent / Turn 隔离。
+Quick / Normal / Deep 里的 `soft*` / `hard*` 阈值（Step、工具次数、时长）只是兼容字段与计数口径，**不产生提醒，也不停止任务**。`stepLimitMode: hard-stop` 归一为 `warn-only`，`duplicateHardBlock: true` 归一为 `false`，启动时分别记录弃用提示。配置位于插件 root entry 的 `config.guard`，状态按 Agent / Turn 隔离。
 
-## 文档入口
+## 本地开发中的调用索引（未发布）
 
-本文件就是代码仓的 README（工作区里位于 `01_Source_Code/README.md`）。其余文档在**工作区根**，不随仓库发布：
+以下为当前开发工作树的 N23 能力，**不表示 npm 已发布的 0.1.19 包含这些接口**。正式 Host 与 `callIndex` Remote 已接线，设置页仍使用旧 Usage；新的调用明细 UI 留到后续阶段。
 
-| 想做的事 | 去哪 |
-|---|---|
-| 找任意文档 | 根目录 `PROJECT_INDEX.md` |
-| 看现在做到哪 / 接手 | 根目录 `HANDOFF.md` |
-| 长期规则与开发规范 | 根目录 `AGENTS.md` |
-| 查架构与模块方案 | 见项目层 `02_Design/` 下的方案文档（不在本仓库内） |
-| 查历史与归档 | 根目录 `04_Docs/02_history/README.md` |
+根 entry 的 `config.callIndex.scope` 默认是 `disabled`。明确改为 `host-visible` 后，允许索引当前宿主官方会话服务可见的记录，**可能包含其他 Profile**。这不是按 Profile 或工作目录隔离，不主动挂载外部 Session 目录、不读私有会话文件。
 
-## 目录约定
+```yaml
+callIndex:
+  scope: disabled # 明确接受范围后才改为 host-visible
+```
 
-- 本目录是**唯一代码仓**（独立 git，远端 `YAN3RA/dsh-thinking-guard`）。
-- 仓库只发布**源码 + 测试 + 本 README**。`AGENTS.md` / `PROJECT_INDEX.md` / `HANDOFF.md` 与 `docs/` 均为本地保留，不提交。
+`callIndex.getIndexStatus()` 查询范围、覆盖及任务状态；`startIndex({mode:'full'|'incremental'})` 显式启动历史扫描并立即返回任务 ID；`cancelIndex({taskId})` 只取消匹配任务。访问标签或查询状态不会自动全量扫描。实时事件只发布元数据，不逐事件枚举历史。
+
+`getSummary`、`listSessions`、`listCalls` 和 `getCallDetail` 经宿主认证的 Remote 提供元数据。列表默认 50 条、最多 200 条；使用 `snapshotId` 在同一过滤条件下共享冻结快照，后续页用 opaque cursor。缓存默认 60 秒、4 视图、8MiB 序列化元数据，另有 256 游标上限；过期/重扫/范围失效返回 `cursor-stale`，容量不足明确报错，不截断冒充全量。来源归属不确定时保留 unknown，不能把零条过滤结果当“从未使用”。
+
+索引只在内存保存，重启后重建；调用参数、完整输出、正文和隐藏思维链不进入索引、Remote 或日志。历史读取仅在本机 Host 临时解码事件。事件覆盖 complete 只对应已枚举范围及截点，来源/PTC/Skill/拒绝分类的可解释程度另行标注。卸载会取消扫描、关闭句柄、移除 listener/timer 并清空查询视图。
+
+## 宿主兼容性
+
+- **实测版本：DSH 0.2.2-rc.1**。开发、类型检查与测试都以该版本为基线。
+- `peerDependencies` 声明范围 `^0.2.0 || ^0.2.1-rc.3 || ^0.2.2-rc.1`，但**除 0.2.2-rc.1 以外的版本均未实测**，属理论兼容，不代表已验证可用。
+- 安装时 `dsh plugin add` 会比对宿主版本要求，不匹配会拒绝安装并打印放行命令。**那条命令会跳过兼容检查**，只在确认风险后执行。
+
+## 权限与隐私
+
+- 不读取、不保存、不输出隐藏思维链。
+- Guard 只保留 SHA-256 签名与有界计数，不保存原始工具参数或结果。
+- 工具结果的压缩与原文恢复由宿主或 Save Token 负责，本插件不重复实现。
 
 ## 来源与许可
 
-本项目基于 Capability Menu 实现，并按 Apache License 2.0 发布。详见 [LICENSE](LICENSE)。
+基于 Capability Menu 实现，按 Apache License 2.0 发布。详见 [LICENSE](LICENSE)。

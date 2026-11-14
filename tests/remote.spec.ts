@@ -207,8 +207,9 @@ describe('server gateway · Guard switches', () => {
     const ctx = new Context()
     const switches = {
       enabled: true, duplicateDetection: true, alternatingCycleDetection: false, noProgressProtection: true,
+      repeatThresholds: [3, 5, 8],
     }
-    const updateGuard = vi.fn(async (change: Record<string, boolean>) => {
+    const updateGuard = vi.fn(async (change: Record<string, unknown>) => {
       Object.assign(switches, change)
     })
     ctx.provide('capabilityPolicy', {
@@ -218,9 +219,71 @@ describe('server gateway · Guard switches', () => {
 
     const gateway = new CapabilityPolicyGateway(ctx)
     expect(gateway.getGuard().alternatingCycleDetection).toBe(false)
+    // The editable thresholds travel with the switches, so the page can render
+    // and edit the real values instead of a hard-coded 3/5/8 constant.
+    expect(gateway.getGuard().repeatThresholds).toEqual([3, 5, 8])
 
     await gateway.updateGuard({ alternatingCycleDetection: true })
     expect(updateGuard).toHaveBeenCalledWith({ alternatingCycleDetection: true })
     expect(gateway.getGuard().alternatingCycleDetection).toBe(true)
+
+    await gateway.updateGuard({ repeatThresholds: [2, 4] })
+    expect(updateGuard).toHaveBeenLastCalledWith({ repeatThresholds: [2, 4] })
+    expect(gateway.getGuard().repeatThresholds).toEqual([2, 4])
+  })
+
+  it('surfaces a rejected threshold list as a rejected remote call', async () => {
+    // The gateway must not swallow the policy's validation: the settings page
+    // shows the error text, and a silently accepted list is the bug being fixed.
+    const ctx = new Context()
+    ctx.provide('capabilityPolicy', {
+      getGuard: () => ({
+        enabled: true, duplicateDetection: true, alternatingCycleDetection: true,
+        noProgressProtection: true, repeatThresholds: [3, 5, 8],
+      }),
+      updateGuard: async (change: { repeatThresholds?: readonly number[] }) => {
+        const value = change.repeatThresholds
+        if (value !== undefined && (value.length === 0 || value.some((entry, index) => index > 0 && entry <= value[index - 1]!))) {
+          throw new Error('updateGuard: repeatThresholds must be strictly increasing')
+        }
+      },
+    } as unknown as CapabilityPolicyService)
+
+    const gateway = new CapabilityPolicyGateway(ctx)
+    await expect(gateway.updateGuard({ repeatThresholds: [8, 3] }))
+      .rejects.toThrow(/repeatThresholds/)
+  })
+})
+
+describe('server gateway · Guard counters', () => {
+  it('passes the content-free snapshot straight through', () => {
+    const ctx = new Context()
+    const stats = {
+      observations: 12,
+      reminders: { repeat: 3, cycle: 1 },
+      denials: 2,
+      outcomes: { success: 9, error: 2, cancelled: 1 },
+      lastReminderAt: 1_700_000_000_000,
+      lastDenialAt: 1_700_000_000_500,
+      since: 1_699_999_000_000,
+    }
+    const getGuardStats = vi.fn(() => stats)
+    ctx.provide('capabilityPolicy', { getGuardStats } as unknown as CapabilityPolicyService)
+
+    const snapshot = new CapabilityPolicyGateway(ctx).getGuardStats()
+    expect(getGuardStats).toHaveBeenCalledOnce()
+    expect(snapshot).toEqual(stats)
+    // Nothing but counts and timestamps may cross the wire: every leaf value is a
+    // number, so there is no field a tool name, argument or error text could hide
+    // in. This is the shape guarantee, not a sample.
+    const leaves: unknown[] = []
+    const collect = (value: unknown): void => {
+      if (value !== null && typeof value === 'object') {
+        for (const entry of Object.values(value as Record<string, unknown>)) collect(entry)
+      } else leaves.push(value)
+    }
+    collect(snapshot)
+    expect(leaves.length).toBeGreaterThan(0)
+    for (const leaf of leaves) expect(typeof leaf).toBe('number')
   })
 })

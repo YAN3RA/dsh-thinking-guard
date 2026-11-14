@@ -122,4 +122,54 @@ describe('Guard switch persistence', () => {
     }))
     await expect(readGuardState(stateFile)).rejects.toThrow(/guard\.enabled must be a boolean/)
   })
+
+  it('round-trips the repeat thresholds and keeps them out of a re-save', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-menu-state-'))
+    const stateFile = join(dir, 'capability-menu-policy.json')
+
+    expect(await writeGuardState(stateFile, { repeatThresholds: [2, 4, 6] })).toBe(true)
+    expect((await readGuardState(stateFile)).repeatThresholds).toEqual([2, 4, 6])
+    // An identical list is not a change; a different one is.
+    expect(await writeGuardState(stateFile, { repeatThresholds: [2, 4, 6] })).toBe(false)
+    expect(await writeGuardState(stateFile, { repeatThresholds: [2, 4] })).toBe(true)
+    expect((await readGuardState(stateFile)).repeatThresholds).toEqual([2, 4])
+  })
+
+  it('reads a pre-thresholds guard section as unset so the caller can default it', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-menu-state-'))
+    const stateFile = join(dir, 'capability-menu-policy.json')
+    // Written by a release before the field existed: four booleans only.
+    await writeFile(stateFile, JSON.stringify({
+      version: 3,
+      tools: {},
+      skills: {},
+      guard: { enabled: true, duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: true },
+      search: { descriptions: {} },
+    }))
+    const guard = await readGuardState(stateFile)
+    // 'undefined', not '[]': an empty list would mean "never remind".
+    expect(guard.repeatThresholds).toBeUndefined()
+    expect(guard.enabled).toBe(true)
+  })
+
+  it('rejects an illegal threshold list instead of writing it', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-menu-state-'))
+    const stateFile = join(dir, 'capability-menu-policy.json')
+    const illegal: readonly (readonly number[])[] = [[], [8, 3], [3, 3], [1], [51], [2, 3, 4, 5, 6, 7]]
+    for (const value of illegal) {
+      await expect(writeGuardState(stateFile, { repeatThresholds: value }))
+        .rejects.toThrow(/repeatThresholds/)
+    }
+    // Nothing was written by the rejected calls.
+    expect(await readGuardState(stateFile)).toEqual({})
+  })
+
+  it('rejects a hand-edited illegal list already in the file', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-menu-state-'))
+    const stateFile = join(dir, 'capability-menu-policy.json')
+    await writeFile(stateFile, JSON.stringify({
+      version: 3, tools: {}, skills: {}, guard: { repeatThresholds: [3, 3] }, search: { descriptions: {} },
+    }))
+    await expect(readGuardState(stateFile)).rejects.toThrow(/guard\.repeatThresholds must be strictly increasing/)
+  })
 })

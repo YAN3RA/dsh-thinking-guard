@@ -2,7 +2,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import { TOOL_ABORTED } from '@deepseek-ai/dsh-tools'
 import { describe, expect, it, vi } from 'vitest'
 import { apply, Config } from '../src/guard.ts'
-import { FINGERPRINT_MAX_BYTES } from '../src/guard-loop-core.ts'
+import { DEFAULT_REPEAT_THRESHOLDS, FINGERPRINT_MAX_BYTES } from '../src/guard-loop-core.ts'
+import { processGuardStats } from '../src/guard-core.ts'
 
 /**
  * Counts real fingerprint computations without changing them. The wrapper
@@ -287,8 +288,9 @@ describe('Guard live switches from the settings page', () => {
   function setupWithSwitches(initial: {
     enabled: boolean; duplicateDetection: boolean
     alternatingCycleDetection: boolean; noProgressProtection: boolean
+    repeatThresholds?: readonly number[]
   }) {
-    const switches = { ...initial }
+    const switches = { repeatThresholds: DEFAULT_REPEAT_THRESHOLDS, ...initial }
     const hooks = new Map<string, (...args: any[]) => any>()
     const info = vi.fn()
     let registeredGuard: ((execution: any) => string | undefined) | undefined
@@ -521,6 +523,189 @@ describe('Guard live switches from the settings page', () => {
     host.toggle({ enabled: false })
     const denials = await repeatIdentical(host, agent, 9)
     expect(denials).toEqual([])
+  })
+
+  /**
+   * The thresholds used to be a hard-coded `3 / 5 / 8` constant that the settings
+   * page could only display — "阈值3-5-8次数无法修改". This case and the next drive
+   * the same call sequence through the same hooks and differ only in the live
+   * switch list, so a Guard that still reads the constant fails both.
+   */
+  it('reads the repeat thresholds from the live switches instead of the constant', async () => {
+    const host = setupWithSwitches({
+      enabled: true, duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: true,
+      repeatThresholds: [2, 4],
+    })
+    const agent = { inject: vi.fn() }
+    // Five identical calls: the 2nd and 4th must remind, and the highest entry (4)
+    // also gates the denial, so the 5th call is refused. With the shipped 3/5/8
+    // list the 2nd and 4th would be silent and the 5th would run.
+    const denials = await repeatIdentical(host, agent, 5)
+    const text = injectedText(agent)
+    expect(text).toContain('第 2 次')
+    expect(text).toContain('第 4 次')
+    expect(text).not.toContain('第 3 次')
+    expect(text).not.toContain('第 8 次')
+    expect(denials.length).toBeGreaterThan(0)
+  })
+
+  it('follows a threshold change made after the turn already started', async () => {
+    const host = setupWithSwitches({
+      enabled: true, duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: true,
+      repeatThresholds: [9],
+    })
+    const agent = { inject: vi.fn() }
+    // With [9] nothing at 3/5/8 may fire…
+    expect(await repeatIdentical(host, agent, 8)).toEqual([])
+    expect(injectedText(agent)).not.toContain('第 8 次')
+    // …and lowering the list to [3] makes the next run remind again. A fresh
+    // agent keeps its own per-Agent loop history, so this measures the switch
+    // rather than the eight calls above.
+    host.toggle({ repeatThresholds: [3] })
+    const fresh = { inject: vi.fn() }
+    expect(await repeatIdentical(host, fresh, 3)).toEqual([])
+    expect(injectedText(fresh)).toContain('第 3 次')
+  })
+})
+
+describe('Guard execution counters', () => {
+  /** Counter deltas over one test, so earlier tests cannot make this pass. */
+  function statsDelta(before: ReturnType<typeof processGuardStats.snapshot>): {
+    observations: number; repeat: number; cycle: number; denials: number
+    success: number; error: number; cancelled: number
+  } {
+    const after = processGuardStats.snapshot()
+    return {
+      observations: after.observations - before.observations,
+      repeat: after.reminders.repeat - before.reminders.repeat,
+      cycle: after.reminders.cycle - before.reminders.cycle,
+      denials: after.denials - before.denials,
+      success: after.outcomes.success - before.outcomes.success,
+      error: after.outcomes.error - before.outcomes.error,
+      cancelled: after.outcomes.cancelled - before.outcomes.cancelled,
+    }
+  }
+
+  it('counts observations, reminders, denials and outcomes as real calls happen', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    const before = processGuardStats.snapshot()
+    const same = success({ stable: true })
+    // Eight admitted identical calls, then one locally denied 9th.
+    for (let index = 1; index <= 8; index += 1) {
+      expect(await runTool(host, execution(agent, 'write', { path: 'same' }, `count-${index}`), same)).toBeUndefined()
+    }
+    expect(await runTool(host, execution(agent, 'write', { path: 'same' }, 'count-9'), same)).toContain('局部拒绝')
+
+    const delta = statsDelta(before)
+    // The denial itself is never dispatched, so it is not an observation.
+    expect(delta.observations).toBe(8)
+    expect(delta.success).toBe(8)
+    expect(delta.error).toBe(0)
+    expect(delta.cancelled).toBe(0)
+    expect(delta.repeat).toBe(3) // thresholds 3, 5 and 8 all fired
+    expect(delta.cycle).toBe(0)
+    expect(delta.denials).toBe(1)
+
+    const snapshot = processGuardStats.snapshot()
+    expect(snapshot.lastReminderAt).toBeTypeOf('number')
+    expect(snapshot.lastDenialAt).toBeTypeOf('number')
+    expect(snapshot.since).toBeLessThanOrEqual(snapshot.lastReminderAt!)
+  })
+
+  it('counts error and cancelled outcomes without counting excluded or polling calls', async () => {
+    const host = setup({ pollingTools: ['custom_wait'] })
+    const agent = { inject: vi.fn() }
+    const before = processGuardStats.snapshot()
+    const failed: Result = {
+      isError: true, error: { message: 'boom', info: { name: 'Error', code: 'E_BOOM' } }, content: [],
+    }
+    const cancelled: Result = {
+      isError: true, error: { message: 'cancelled', info: { name: 'AbortError', code: TOOL_ABORTED } }, content: [],
+    }
+    await runTool(host, execution(agent, 'fetch', { url: 'a' }, 'out-err'), failed)
+    await runTool(host, execution(agent, 'fetch', { url: 'b' }, 'out-cancel'), cancelled)
+    // Excluded by name: the detector skips them, so they are not observations.
+    for (const name of ['job_output', 'custom_wait', 'meta_search']) {
+      await runTool(host, execution(agent, name, { id: 'job-1' }, `skip-${name}`), success({ running: true }))
+    }
+
+    const delta = statsDelta(before)
+    expect(delta.observations).toBe(2)
+    expect(delta.error).toBe(1)
+    expect(delta.cancelled).toBe(1)
+    expect(delta.success).toBe(0)
+    expect(delta.repeat).toBe(0)
+    expect(delta.cycle).toBe(0)
+    expect(delta.denials).toBe(0)
+  })
+
+  it('counts a cycle reminder separately from a repeat reminder', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    const before = processGuardStats.snapshot()
+    const unchanged = success({ stable: true })
+    for (const [name, args, id] of [
+      ['tool-a', { step: 1 }, 'cyc-1'],
+      ['tool-b', { step: 2 }, 'cyc-2'],
+      ['tool-a', { step: 1 }, 'cyc-3'],
+      ['tool-b', { step: 2 }, 'cyc-4'],
+    ] as const) {
+      await runTool(host, execution(agent, name, args, id), unchanged)
+    }
+    expect(injectedText(agent)).toContain('交替工具调用循环')
+    const delta = statsDelta(before)
+    expect(delta.cycle).toBeGreaterThan(0)
+    expect(delta.observations).toBe(4)
+  })
+
+  it('never retains arguments, results or error text in the snapshot', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    // Canaries: unique strings that only exist in the call/result payloads. If any
+    // of them survives into the snapshot, the wire would carry session content.
+    const argumentCanary = 'CANARY-ARG-6c1f9a'
+    const resultCanary = 'CANARY-RESULT-2b7d4e'
+    const errorCanary = 'CANARY-ERROR-9f0c3d'
+    const toolNameCanary = 'canary_tool_4a2e'
+    const same = success({ secret: resultCanary }, JSON.stringify({ secret: resultCanary }))
+    for (let index = 1; index <= 9; index += 1) {
+      await runTool(host, execution(agent, toolNameCanary, { secret: argumentCanary }, `canary-${index}`), same)
+    }
+    const failed: Result = {
+      isError: true,
+      error: { message: errorCanary, info: { name: 'Error', code: 'CANARY_CODE' } },
+      content: [{ type: 'text', text: errorCanary }],
+    }
+    for (let index = 1; index <= 3; index += 1) {
+      await runTool(host, execution(agent, toolNameCanary, { secret: argumentCanary }, `canary-err-${index}`), failed)
+    }
+
+    const serialized = JSON.stringify(processGuardStats.snapshot())
+    expect(serialized).not.toContain(argumentCanary)
+    expect(serialized).not.toContain(resultCanary)
+    expect(serialized).not.toContain(errorCanary)
+    expect(serialized).not.toContain(toolNameCanary)
+    // The snapshot is exactly the documented shape — counts and timestamps only.
+    expect(Object.keys(JSON.parse(serialized) as object).sort()).toEqual([
+      'denials', 'lastDenialAt', 'lastReminderAt', 'observations', 'outcomes', 'reminders', 'since',
+    ])
+  })
+
+  it('keeps counting when the host refuses to deliver a reminder', async () => {
+    const host = setup()
+    // `inject` throwing must not lose the observation: the call happened and
+    // the Guard saw it, but a reminder that was never delivered is not counted.
+    const agent = { inject: vi.fn(() => { throw new Error('agent disposed') }) }
+    const before = processGuardStats.snapshot()
+    const same = success({ stable: true })
+    for (let index = 1; index <= 3; index += 1) {
+      await runTool(host, execution(agent, 'write', { path: 'boom' }, `throw-${index}`), same)
+    }
+    expect(agent.inject).toHaveBeenCalled()
+    const delta = statsDelta(before)
+    expect(delta.observations).toBe(3)
+    expect(delta.repeat).toBe(0)
   })
 })
 

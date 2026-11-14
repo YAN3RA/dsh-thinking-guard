@@ -2,7 +2,7 @@
 
 一个 DSH 插件：把**能力目录与按需调用**（Capability Menu 思路）和 **Agent 效率守卫**（重复/循环调用提醒）整合在一起。
 
-当前版本 **0.1.19**。
+当前版本 **0.1.20**。
 
 ## 它做什么
 
@@ -24,7 +24,7 @@ dsh plugin --profile desktop add dsh-thinking-guard
 
 ```bash
 dsh plugin --profile desktop add dsh-thinking-guard           # 升到最新
-dsh plugin --profile desktop add dsh-thinking-guard@0.1.19    # 锁定某个版本
+dsh plugin --profile desktop add dsh-thinking-guard@0.1.20    # 锁定某个版本
 ```
 
 装完**重启 DSH**。
@@ -46,15 +46,15 @@ Guard 的行为由三个开关**各自独立**控制：
 
 Quick / Normal / Deep 里的 `soft*` / `hard*` 阈值（Step、工具次数、时长）只是兼容字段与计数口径，**不产生提醒，也不停止任务**。`stepLimitMode: hard-stop` 归一为 `warn-only`，`duplicateHardBlock: true` 归一为 `false`，启动时分别记录弃用提示。配置位于插件 root entry 的 `config.guard`，状态按 Agent / Turn 隔离。
 
-## 本地开发中的调用索引（未发布）
+## 调用索引
 
-以下为当前开发工作树的 N23 能力，**不表示 npm 已发布的 0.1.19 包含这些接口**。正式 Host 与 `callIndex` Remote 已接线，设置页仍使用旧 Usage；新的调用明细 UI 留到后续阶段。
+设置页的「调用明细」与「总览」由本插件自己的调用索引提供：Host 侧读历史与实时事件，浏览器侧经宿主认证的 Remote 取元数据。
 
-根 entry 的 `config.callIndex.scope` 默认是 `disabled`。明确改为 `host-visible` 后，允许索引当前宿主官方会话服务可见的记录，**可能包含其他 Profile**。这不是按 Profile 或工作目录隔离，不主动挂载外部 Session 目录、不读私有会话文件。
+根 entry 的 `config.callIndex.scope` **默认是 `host-visible`**（D-029，2026-11-11 按操作者要求反转了 D-026 的 fail-closed 默认）。该范围是当前宿主官方会话服务可见的记录，**可能包含其他 Profile**。这不是按 Profile 或工作目录隔离，不主动挂载外部 Session 目录、不读私有会话文件。
 
 ```yaml
 callIndex:
-  scope: disabled # 明确接受范围后才改为 host-visible
+  scope: host-visible # 改回 disabled 即恢复 fail-closed：不索引历史
 ```
 
 `callIndex.getIndexStatus()` 查询范围、覆盖及任务状态；`startIndex({mode:'full'|'incremental'})` 显式启动历史扫描并立即返回任务 ID；`cancelIndex({taskId})` 只取消匹配任务。访问标签或查询状态不会自动全量扫描。实时事件只发布元数据，不逐事件枚举历史。
@@ -65,8 +65,8 @@ callIndex:
 
 ## 宿主兼容性
 
-- **实测版本：DSH 0.2.2-rc.1**。开发、类型检查与测试都以该版本为基线。
-- `peerDependencies` 声明范围 `^0.2.0 || ^0.2.1-rc.3 || ^0.2.2-rc.1`，但**除 0.2.2-rc.1 以外的版本均未实测**，属理论兼容，不代表已验证可用。
+- **基线版本：DSH 0.2.2-rc.1**（`devDependencies` 全部 pin 在该版本）。0.2.2-rc.3 上做过一次端到端兼容实测：20 个 peer 依赖范围全部满足、引用的导出与注册的 hook 名均在、设置页四个 Tab 与导航图标正常渲染。
+- `peerDependencies` 声明范围 `^0.2.0 || ^0.2.1-rc.3 || ^0.2.2-rc.1`，**除 0.2.2-rc.1 与 0.2.2-rc.3 以外的版本均未实测**，属理论兼容，不代表已验证可用。
 - 安装时 `dsh plugin add` 会比对宿主版本要求，不匹配会拒绝安装并打印放行命令。**那条命令会跳过兼容检查**，只在确认风险后执行。
 
 ## 权限与隐私

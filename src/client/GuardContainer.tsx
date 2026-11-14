@@ -16,7 +16,7 @@
  */
 import { createElement, useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
 import { Toast } from '@deepseek-ai/dsh-client-ui-primitives'
-import { GuardPanel, type GuardSectionId } from './GuardPanel.tsx'
+import { GuardPanel, type GuardSectionId, type GuardStatsSnapshotView } from './GuardPanel.tsx'
 import type { PluginSectionKey } from './PluginSection.tsx'
 import type { GuardSwitches } from './remote.ts'
 
@@ -34,6 +34,11 @@ export type GuardContainerKey = PluginSectionKey | 'guardToastSaved'
 export interface GuardSwitchRemote {
   getGuard?(): Promise<{ ok: true; value: GuardSwitches } | { ok: false; error: { code: string; message: string } }>
   updateGuard?(change: Partial<GuardSwitches>): Promise<{ ok: true; value: void } | { ok: false; error: { code: string; message: string } }>
+  /**
+   * Real Guard counters. Optional so an older Host degrades to 「—」 instead of
+   * failing the whole page — the board is diagnostic, not load-bearing.
+   */
+  getGuardStats?(): Promise<{ ok: true; value: GuardStatsSnapshotView } | { ok: false; error: { code: string; message: string } }>
   /** Used by 总览 for the tier split; declared here so one object serves both. */
   classifyAll?(): Promise<
     { ok: true; value: readonly { class: 'resident' | 'on-demand' | 'disabled' }[] }
@@ -57,6 +62,7 @@ const SECTION_FIELD: Readonly<Record<GuardSectionId, keyof GuardSwitches>> = {
 
 interface State {
   readonly switches?: GuardSwitches
+  readonly stats?: GuardStatsSnapshotView
   readonly error?: string
   readonly busy: boolean
 }
@@ -95,9 +101,16 @@ export function GuardContainer(props: GuardContainerProps): ReactElement {
       setState({ busy: false, error: 'Host does not expose Guard switches.' })
       return
     }
-    const result = await remote.getGuard()
+    // Read the switches and the counters together: the board answers 「它是否在
+    // 工作」, and showing it empty while the switches loaded would read as
+    // "the Guard has never done anything".
+    const [result, statsResult] = await Promise.all([
+      remote.getGuard(),
+      remote.getGuardStats === undefined ? Promise.resolve(undefined) : remote.getGuardStats(),
+    ])
     if (!alive.current) return
-    if (result.ok) setState({ switches: result.value, busy: false })
+    const stats = statsResult !== undefined && statsResult.ok ? statsResult.value : undefined
+    if (result.ok) setState({ switches: result.value, busy: false, ...(stats === undefined ? {} : { stats }) })
     else setState({ busy: false, error: result.error.message })
   }, [remote])
 
@@ -121,6 +134,25 @@ export function GuardContainer(props: GuardContainerProps): ReactElement {
     } else setState({ switches: previous, busy: false, error: result.error.message })
   }, [remote, state.switches, showSaved])
 
+  /**
+   * Persist an edited threshold list.
+   *
+   * No optimistic update: the Host validates the list and may refuse it, and a
+   * field that first shows a value the detector rejected is worse than one that
+   * waits. The previous value stays on screen until the write is accepted.
+   */
+  const changeThresholds = useCallback(async (next: readonly number[]): Promise<void> => {
+    const previous = state.switches
+    if (previous === undefined || remote.updateGuard === undefined) return
+    setState(current => ({ ...current, busy: true }))
+    const result = await remote.updateGuard({ repeatThresholds: next })
+    if (!alive.current) return
+    if (result.ok) {
+      setState({ switches: { ...previous, repeatThresholds: next }, busy: false })
+      showSaved()
+    } else setState({ switches: previous, busy: false, error: result.error.message })
+  }, [remote, state.switches, showSaved])
+
   const reset = useCallback(async (): Promise<void> => {
     const previous = state.switches
     if (previous === undefined || remote.updateGuard === undefined) return
@@ -129,6 +161,7 @@ export function GuardContainer(props: GuardContainerProps): ReactElement {
       duplicateDetection: true,
       alternatingCycleDetection: true,
       noProgressProtection: true,
+      repeatThresholds: [3, 5, 8],
     }
     setState({ switches: defaults, busy: true })
     const result = await remote.updateGuard(defaults)
@@ -153,7 +186,11 @@ export function GuardContainer(props: GuardContainerProps): ReactElement {
     state.error !== undefined && createElement('p', { className: 'mc-error-hint' }, state.error),
     createElement(GuardPanel, {
       t,
-      duplicateThresholds,
+      // Prefer the LIVE thresholds from the Host over the shell's constant: the
+      // operator can now edit them, so the prop is only the first-paint fallback.
+      duplicateThresholds: switches?.repeatThresholds ?? duplicateThresholds,
+      ...(switches === undefined || state.busy ? {} : { onThresholdsChange: (next: readonly number[]) => { void changeThresholds(next) } }),
+      ...(state.stats === undefined ? {} : { stats: state.stats }),
       // Undefined while loading or after a failed read: the panel then renders
       // the switches disabled rather than as a false "off".
       enabled: switches === undefined

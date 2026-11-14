@@ -231,6 +231,18 @@ export type CapabilityKey =
   | 'guardStateOn'
   | 'guardStateOff'
   | 'guardThresholds'
+  | 'guardStatsTitle'
+  | 'guardStatObservations'
+  | 'guardStatObservationsHint'
+  | 'guardStatOutcomes'
+  | 'guardStatOutcomesHint'
+  | 'guardStatReminders'
+  | 'guardStatRemindersHint'
+  | 'guardStatDenials'
+  | 'guardStatDenialsHint'
+  | 'guardStatsSince'
+  | 'guardThresholdsEditableHint'
+  | 'guardThresholdsFixedHint'
   | 'recentCalls'
   | 'tierSummary'
   | 'attention'
@@ -473,6 +485,25 @@ body[data-ds-dark-theme] .mc-count--disabled{color:#b8abad}
 .mc-guard-boundary{margin:0;padding:8px 12px;border-radius:8px;font-size:12px;line-height:18px;
   border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);
   color:var(--dsw-alias-label-secondary)}
+/* v3 数据看板：真实计数板 + 可编辑阈值 */
+.mc-guard-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1px;
+  background:var(--dsw-alias-border-l2);border:1px solid var(--dsw-alias-border-l2);
+  border-radius:8px;overflow:hidden;margin:10px 0}
+.mc-guard-stat{background:var(--dsw-alias-bg-l1);padding:10px 12px}
+.mc-guard-stat-label{font-size:11px;color:var(--dsw-alias-label-tertiary);margin-bottom:4px}
+.mc-guard-stat-value{font-size:19px;font-weight:600;line-height:1.15;
+  font-variant-numeric:tabular-nums;font-family:var(--dsw-font-code)}
+.mc-guard-stat-hint{font-size:10.5px;color:var(--dsw-alias-label-tertiary);margin-top:3px;line-height:1.35}
+.mc-guard-stats-since{grid-column:1/-1;margin:0;padding:7px 12px;font-size:10.5px;
+  color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-l2)}
+.mc-guard-threshold-edit{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.mc-guard-threshold-edit-label{font-size:11.5px;color:var(--dsw-alias-label-tertiary)}
+.mc-guard-threshold-edit-input{width:150px;padding:3px 7px;border-radius:6px;font-size:12px;
+  font-family:var(--dsw-font-code);color:inherit;background:transparent;
+  border:1px solid var(--dsw-alias-border-l2)}
+.mc-guard-threshold-edit-input:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
+.mc-guard-threshold-edit-input:disabled{opacity:.6}
+.mc-guard-threshold-edit-hint{font-size:10.5px;color:var(--dsw-alias-label-tertiary)}
 .mc-guard-card{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;overflow:hidden}
 .mc-guard-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 12px;
   background:var(--dsw-alias-bg-layer-2)}

@@ -25,12 +25,41 @@ export interface GuardPanelProps {
   readonly t: (key: PluginSectionKey) => string
   /** Which sections are currently enabled, keyed by section id. */
   readonly enabled?: Readonly<Record<GuardSectionId, boolean>>
-  /** Fixed reminder thresholds; the implementation does not offer per-level edits. */
+  /** Reminder thresholds, in the order they fire. Editable since 0.1.20. */
   readonly duplicateThresholds?: readonly number[]
   /** Toggle one section. Omitted = read-only surface. */
   readonly onToggle?: (id: GuardSectionId, next: boolean) => void
+  /**
+   * Commit an edited threshold list. Omitted = the thresholds are read-only,
+   * which is what an older Host (no `repeatThresholds` on the wire) gets.
+   */
+  readonly onThresholdsChange?: (next: readonly number[]) => void
+  /**
+   * Real counters from the Host Guard.
+   *
+   * Present is the whole point: without it the page can only describe what the
+   * Guard WOULD do, never whether it has actually observed, reminded or denied
+   * anything — the "black box" the operator reported.
+   */
+  readonly stats?: GuardStatsSnapshotView
   /** Restore the shipped defaults. */
   readonly onReset?: () => void
+}
+
+/**
+ * What the panel renders for the Guard counters.
+ *
+ * Structural mirror of the wire type: `undefined` fields mean "the Host did not
+ * report it", which the panel prints as 「—」 rather than a fabricated zero.
+ */
+export interface GuardStatsSnapshotView {
+  readonly observations?: number
+  readonly reminders?: { readonly repeat?: number; readonly cycle?: number }
+  readonly denials?: number
+  readonly outcomes?: { readonly success?: number; readonly error?: number; readonly cancelled?: number }
+  readonly lastReminderAt?: number
+  readonly lastDenialAt?: number
+  readonly since?: number
 }
 
 /**
@@ -50,8 +79,118 @@ const SECTIONS: readonly {
   { id: 'no_progress', titleKey: 'guardSectionC', bodyKeys: ['guardCBody1', 'guardCBody2', 'guardCBody3'] },
 ]
 
+/** `—` for a counter the Host did not report; never a fabricated 0. */
+function statText(value: number | undefined): string {
+  return value === undefined || !Number.isFinite(value) ? '—' : String(value)
+}
+
+/**
+ * The Guard's real activity board.
+ *
+ * Answers the two questions the page previously could not: 「它是否在工作」
+ * (observations / since) and 「调用成功还是失败」 (outcome split). Every number
+ * comes from the Host; a missing counter renders `—`, so an older Host reads as
+ * "unknown" rather than "zero".
+ */
+function GuardStatsBoard(props: { readonly t: (key: PluginSectionKey) => string; readonly stats?: GuardStatsSnapshotView }): ReactElement {
+  const { t, stats } = props
+  const outcomes = stats?.outcomes
+  const reminders = stats?.reminders
+  const cell = (label: string, value: string, hint?: string): ReactElement => createElement('div', {
+    className: 'mc-guard-stat',
+    'data-guard-stat': label,
+  },
+  createElement('div', { className: 'mc-guard-stat-label' }, label),
+  createElement('div', { className: 'mc-guard-stat-value' }, value),
+  hint === undefined ? null : createElement('div', { className: 'mc-guard-stat-hint' }, hint),
+  )
+  return createElement('div', { className: 'mc-guard-stats', 'data-guard-stats': 'true', role: 'group', 'aria-label': t('guardStatsTitle') },
+    cell(t('guardStatObservations'), statText(stats?.observations), t('guardStatObservationsHint')),
+    cell(t('guardStatOutcomes'), `${statText(outcomes?.success)} / ${statText(outcomes?.error)}`, t('guardStatOutcomesHint')),
+    cell(t('guardStatReminders'), `${statText(reminders?.repeat)} / ${statText(reminders?.cycle)}`, t('guardStatRemindersHint')),
+    cell(t('guardStatDenials'), statText(stats?.denials), t('guardStatDenialsHint')),
+    stats?.since === undefined
+      ? null
+      : createElement('p', { className: 'mc-guard-stats-since', 'data-guard-stats-since': 'true' },
+          `${t('guardStatsSince')} ${formatGuardTime(stats.since)}`),
+  )
+}
+
+/** `YYYY-MM-DD HH:mm` in the browser zone; `—` when unknown. */
+function formatGuardTime(time: number | undefined): string {
+  if (time === undefined || !Number.isFinite(time)) return '—'
+  const date = new Date(time)
+  if (Number.isNaN(date.getTime())) return '—'
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/**
+ * Editable reminder thresholds.
+ *
+ * The thresholds were a hard-coded 3/5/8 the operator could read but not change,
+ * which made the section look decorative. They are now one comma-separated
+ * field: the list is short, order matters, and a number-per-input row would be
+ * more chrome than content. Invalid input is refused by the Host and reported
+ * back, so this input never claims a value the detector rejected.
+ */
+function GuardThresholdEditor(props: {
+  readonly t: (key: PluginSectionKey) => string
+  readonly thresholds?: readonly number[]
+  readonly onChange?: (next: readonly number[]) => void
+}): ReactElement | null {
+  const { t, thresholds, onChange } = props
+  if (thresholds === undefined) return null
+  const editable = onChange !== undefined
+  return createElement('div', { className: 'mc-guard-threshold-edit', 'data-guard-thresholds': 'true' },
+    createElement('label', { className: 'mc-guard-threshold-edit-label', htmlFor: 'mc-guard-thresholds-input' }, t('guardThresholds')),
+    createElement('input', {
+      id: 'mc-guard-thresholds-input',
+      className: 'mc-guard-threshold-edit-input',
+      type: 'text',
+      inputMode: 'numeric',
+      // The current value is always the Host's: a rejected edit must not leave
+      // the field showing what the user typed.
+      value: thresholds.join(', '),
+      readOnly: !editable,
+      disabled: !editable,
+      'aria-label': t('guardThresholds'),
+      onChange: (event: { target: { value: string } }) => {
+        if (!editable) return
+        const parsed = parseGuardThresholds(event.target.value)
+        if (parsed === undefined) return
+        onChange(parsed)
+      },
+    }),
+    createElement('span', { className: 'mc-guard-threshold-edit-hint' },
+      editable ? t('guardThresholdsEditableHint') : t('guardThresholdsFixedHint')),
+  )
+}
+
+/**
+ * Parse `3, 5, 8` into a threshold list.
+ *
+ * Returns `undefined` for anything the Host would reject (empty, non-integer,
+ * out of range, not strictly increasing). Parsing here as well as on the Host is
+ * deliberate: it keeps an invalid keystroke from round-tripping through the
+ * remote and flickering the field.
+ */
+export function parseGuardThresholds(text: string): readonly number[] | undefined {
+  const parts = text.split(',').map(part => part.trim()).filter(part => part !== '')
+  if (parts.length === 0 || parts.length > 5) return undefined
+  const parsed: number[] = []
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) return undefined
+    const value = Number(part)
+    if (!Number.isSafeInteger(value) || value < 2 || value > 50) return undefined
+    if (parsed.length > 0 && value <= parsed[parsed.length - 1]) return undefined
+    parsed.push(value)
+  }
+  return parsed
+}
+
 export function GuardPanel(props: GuardPanelProps): ReactElement {
-  const { t, enabled, duplicateThresholds, onToggle, onReset } = props
+  const { t, enabled, duplicateThresholds, onToggle, onThresholdsChange, stats, onReset } = props
 
   const section = (entry: typeof SECTIONS[number]): ReactElement => {
     const isOn = enabled?.[entry.id] ?? false
@@ -83,8 +222,11 @@ export function GuardPanel(props: GuardPanelProps): ReactElement {
         // mark (`：` is Chinese-only), so spacing does the job in both locales.
         entry.id === 'duplicate_call' && duplicateThresholds !== undefined &&
           createElement('div', { className: 'mc-guard-thresholds' },
-            createElement('span', { className: 'mc-guard-thresholds-label' }, t('guardThresholds')),
-            createElement('span', { className: 'mc-guard-thresholds-value' }, duplicateThresholds.join(' / '))),
+            createElement(GuardThresholdEditor, {
+              t,
+              thresholds: duplicateThresholds,
+              ...(onThresholdsChange === undefined ? {} : { onChange: onThresholdsChange }),
+            })),
       ),
     )
   }
@@ -101,6 +243,9 @@ export function GuardPanel(props: GuardPanelProps): ReactElement {
     ),
     createElement('p', { className: 'mc-desc' }, t('guardDesc')),
     createElement('p', { className: 'mc-guard-boundary' }, t('guardBoundary')),
+    // The activity board sits ABOVE the switches: the first thing an operator
+    // wants to know is whether this thing is doing anything at all.
+    createElement(GuardStatsBoard, { t, ...(stats === undefined ? {} : { stats }) }),
     ...SECTIONS.map(section),
   )
 }

@@ -104,6 +104,18 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     guardStateOn: '已启用',
     guardStateOff: '已关闭',
     guardThresholds: '重复提醒阈值',
+    guardStatsTitle: '执行保护活动',
+    guardStatObservations: '已观察调用',
+    guardStatObservationsHint: 'Guard 实际观察到的工具调用数',
+    guardStatOutcomes: '成功 / 失败',
+    guardStatOutcomesHint: '被观察调用的结果分布',
+    guardStatReminders: '提醒（重复 / 交替）',
+    guardStatRemindersHint: '实际发出的提醒次数',
+    guardStatDenials: '局部拒绝',
+    guardStatDenialsHint: '实际阻止的重复调用次数',
+    guardStatsSince: '统计自',
+    guardThresholdsEditableHint: '逗号分隔，2–50 递增，最多 5 个',
+    guardThresholdsFixedHint: '当前 Host 不支持修改',
     recentCalls: '近期调用',
     tierSummary: '能力策略',
     attention: '需要关注',
@@ -293,6 +305,18 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     guardStateOn: 'Enabled',
     guardStateOff: 'Off',
     guardThresholds: 'Repeat reminder thresholds',
+    guardStatsTitle: 'Guard activity',
+    guardStatObservations: 'Calls observed',
+    guardStatObservationsHint: 'Tool calls the Guard actually inspected',
+    guardStatOutcomes: 'Succeeded / failed',
+    guardStatOutcomesHint: 'Outcome split of the observed calls',
+    guardStatReminders: 'Reminders (repeat / cycle)',
+    guardStatRemindersHint: 'Reminders actually delivered',
+    guardStatDenials: 'Local denials',
+    guardStatDenialsHint: 'Repeated calls actually blocked',
+    guardStatsSince: 'Counting since',
+    guardThresholdsEditableHint: 'Comma separated, 2–50 ascending, up to 5',
+    guardThresholdsFixedHint: 'This Host cannot edit them',
     recentCalls: 'Recent calls',
     tierSummary: 'Capability tiers',
     attention: 'Needs attention',
@@ -606,6 +630,15 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
       (remote() as { updateGuard(c: Partial<GuardSwitches>): ReturnType<NonNullable<GuardSwitchesRemote['updateGuard']>> })
         .updateGuard(change),
     classifyAll: () => (remote() as { classifyAll(): ReturnType<NonNullable<GuardSwitchesRemote['classifyAll']>> }).classifyAll(),
+    // Guarded: an older Host has no `getGuardStats`, and the board must degrade
+    // to 「—」 rather than reject the whole face and blank the switches too.
+    getGuardStats: () => {
+      const face = remote() as { getGuardStats?(): ReturnType<NonNullable<GuardSwitchesRemote['getGuardStats']>> }
+      if (typeof face.getGuardStats !== 'function') {
+        return Promise.resolve({ ok: false as const, error: { code: 'unsupported', message: 'Host does not expose Guard stats.' } })
+      }
+      return face.getGuardStats()
+    },
   } satisfies GuardSwitchesRemote
 
   // One settings page for the whole plugin, split by capability category. Both
@@ -728,11 +761,30 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
         name: nameOf(id),
         ...(typeof byId[id]?.cwd === 'string' && byId[id]?.cwd !== '' ? { cwd: byId[id]?.cwd as string } : {}),
       }))
+      // Disambiguate duplicate names.
+      //
+      // Untitled conversations fall back to the workspace basename, so several
+      // Sessions of one project all read 「dsh-thinking-guard」 — a picker where
+      // every row is identical cannot be used to choose. Duplicates therefore get
+      // a short id suffix, which is unique and still far more readable than a
+      // bare id everywhere.
+      const seen = new Map<string, number>()
+      for (const item of items) seen.set(item.name, (seen.get(item.name) ?? 0) + 1)
+      const labelled = items.map(item => (
+        (seen.get(item.name) ?? 0) > 1
+          ? { ...item, name: `${item.name} · ${item.id.slice(-6)}` }
+          : item
+      ))
       return {
         ...(currentId === undefined || currentId === ''
           ? {}
-          : { current: { id: currentId, name: nameOf(currentId) } }),
-        items,
+          : {
+              current: {
+                id: currentId,
+                name: labelled.find(item => item.id === currentId)?.name ?? nameOf(currentId),
+              },
+            }),
+        items: labelled,
       }
     } catch {
       return { items: [] }

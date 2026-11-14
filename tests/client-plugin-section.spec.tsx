@@ -28,7 +28,7 @@ import {
 } from '../src/client/PluginSection.tsx'
 import { UsagePanel, type UsagePanelApi } from '../src/client/usage.tsx'
 import { OverviewContainer } from '../src/client/OverviewContainer.tsx'
-import { GuardPanel } from '../src/client/GuardPanel.tsx'
+import { GuardPanel, parseGuardThresholds } from '../src/client/GuardPanel.tsx'
 import { GuardContainer } from '../src/client/GuardContainer.tsx'
 import type { CapabilitySectionInjected } from '../src/client/CapabilitySection.tsx'
 
@@ -84,6 +84,32 @@ function walk(node: ReactNode, visit: (element: TreeNode) => void): void {
   const element = node as unknown as TreeNode
   visit(element)
   walk(element.props.children as ReactNode, visit)
+}
+
+/**
+ * Every element matching `predicate`, in tree order, EXPANDING function
+ * components.
+ *
+ * `walk` deliberately does not expand components — the combined-page tests
+ * depend on seeing `PluginSectionView` as a single node. The Guard board and
+ * threshold editor are separate hook-free components, so their contents are
+ * only reachable through this variant.
+ */
+function nodesWhere(node: ReactNode, predicate: (element: TreeNode) => boolean): TreeNode[] {
+  const out: TreeNode[] = []
+  const visit = (current: ReactNode): void => {
+    if (current === null || current === undefined || typeof current === 'boolean') return
+    if (Array.isArray(current)) { for (const child of current) visit(child); return }
+    if (!isElement(current)) return
+    const element = current as unknown as TreeNode
+    if (predicate(element)) out.push(element)
+    if (typeof element.type === 'function') {
+      visit((element.type as (props: unknown) => ReactNode)(element.props))
+    }
+    visit(element.props.children as ReactNode)
+  }
+  visit(node)
+  return out
 }
 
 function find(node: ReactNode, predicate: (element: TreeNode) => boolean): TreeNode | undefined {
@@ -289,37 +315,106 @@ describe('思考限制 page', () => {
     ]))
   })
 
-  it('still renders the fixed thresholds for section A only', () => {
+  it('renders the thresholds as one editable field, in section A only', () => {
+    // These thresholds used to be a hard-coded 3/5/8 rendered as text, so the
+    // operator could read them but not change them. They are now one
+    // comma-separated input whose value comes from the Host.
     const element = GuardPanel({
       t: (key: string) => key,
       enabled: { duplicate_call: true, alternating_cycle: true, no_progress: true },
       duplicateThresholds: [3, 5, 8],
+      onThresholdsChange: () => {},
     }) as ReactElement
-    const text: string[] = []
-    walk(element, (node) => {
-      if (typeof node.props.children === 'string') text.push(node.props.children)
-    })
-    const thresholdLines = text.filter(value => value.includes('3 / 5 / 8'))
-    expect(thresholdLines).toHaveLength(1)
+    const inputs = nodesWhere(element, node => node.props['data-guard-thresholds'] === 'true')
+    expect(inputs).toHaveLength(1)
+    const field = nodesWhere(element, node => node.type === 'input')
+    expect(field).toHaveLength(1)
+    expect(field[0]?.props.value).toBe('3, 5, 8')
+    expect(field[0]?.props.readOnly).toBe(false)
   })
 
-  it('keeps the threshold line free of Chinese-only punctuation', () => {
-    // The label and the numbers are separate nodes on purpose. Interpolating them
-    // into one string forced a literal `：`, which then leaked into the English
-    // UI as "Repeat reminder thresholds：3 / 5 / 8".
+  it('reads the field back as a plain list, with no Chinese-only punctuation', () => {
+    // The label and the value are separate nodes on purpose: interpolating them
+    // forced a literal `：`, which then leaked into the English UI.
     const element = GuardPanel({
       t: (key: string) => labels[key] ?? key,
       enabled: { duplicate_call: true, alternating_cycle: true, no_progress: true },
       duplicateThresholds: [3, 5, 8],
+      onThresholdsChange: () => {},
     }) as ReactElement
-
+    // The value lives on the <input>, so it is read from props rather than from
+    // text nodes — and the helper must expand the editor component to reach it.
+    const field = nodesWhere(element, node => node.type === 'input')
+    expect(field[0]?.props.value).toBe('3, 5, 8')
     const text: string[] = []
     walk(element, (node) => {
       if (typeof node.props.children === 'string') text.push(node.props.children)
     })
-    const thresholdLine = text.find(value => value.includes('3 / 5 / 8'))
-    expect(thresholdLine).toBe('3 / 5 / 8')
     expect(text.some(value => value.includes('：'))).toBe(false)
+  })
+
+  it('refuses an invalid threshold list instead of sending it', () => {
+    // Parsing happens here as well as on the Host so a bad keystroke never
+    // round-trips and flickers the field.
+    expect(parseGuardThresholds('3, 5, 8')).toEqual([3, 5, 8])
+    expect(parseGuardThresholds('3,5,8')).toEqual([3, 5, 8])
+    expect(parseGuardThresholds('8, 5, 3')).toBeUndefined()   // not ascending
+    expect(parseGuardThresholds('3, 3, 8')).toBeUndefined()   // not strictly
+    expect(parseGuardThresholds('1, 5')).toBeUndefined()      // below 2
+    expect(parseGuardThresholds('3, 51')).toBeUndefined()     // above 50
+    expect(parseGuardThresholds('3, x')).toBeUndefined()      // not a number
+    expect(parseGuardThresholds('')).toBeUndefined()          // empty
+    expect(parseGuardThresholds('2,3,4,5,6,7')).toBeUndefined() // over 5
+  })
+
+  it('shows the real Guard counters, and — when the Host reports none', () => {
+    const withStats = GuardPanel({
+      t: (key: string) => key,
+      enabled: { duplicate_call: true, alternating_cycle: true, no_progress: true },
+      duplicateThresholds: [3, 5, 8],
+      stats: {
+        observations: 128,
+        outcomes: { success: 120, error: 8, cancelled: 0 },
+        reminders: { repeat: 4, cycle: 1 },
+        denials: 2,
+        since: Date.UTC(2026, 10, 15, 1, 0),
+      },
+    }) as ReactElement
+    const values = nodesWhere(withStats, node => node.props['data-guard-stat'] !== undefined)
+      .map(node => node.props['data-guard-stat'] as string)
+    expect(values.length).toBe(4)
+    // Read the four value cells through the expanding helper: the board is its
+    // own component, so a plain `walk` never reaches them.
+    const cells = nodesWhere(withStats, node => node.props['data-guard-stat'] !== undefined)
+    const valuesText = cells.map(node => {
+      const kids = node.props.children as ReactNode[]
+      const flat: string[] = []
+      walk(kids as ReactNode, (inner) => {
+        if (typeof inner.props.children === 'string') flat.push(inner.props.children)
+      })
+      return flat.join('|')
+    })
+    expect(valuesText.some(value => value.includes('128'))).toBe(true)
+    expect(valuesText.some(value => value.includes('120 / 8'))).toBe(true)
+    expect(valuesText.some(value => value.includes('4 / 1'))).toBe(true)
+    // An older Host reports nothing: the board must read 「—」, never a fake 0.
+    const withoutStats = GuardPanel({
+      t: (key: string) => key,
+      enabled: { duplicate_call: true, alternating_cycle: true, no_progress: true },
+      duplicateThresholds: [3, 5, 8],
+    }) as ReactElement
+    const bareCells = nodesWhere(withoutStats, node => node.props['data-guard-stat'] !== undefined)
+    const bareText = bareCells.map(node => {
+      const flat: string[] = []
+      walk(node.props.children as ReactNode, (inner) => {
+        if (typeof inner.props.children === 'string') flat.push(inner.props.children)
+      })
+      return flat.join('|')
+    })
+    // Four cells, each showing 「—」 and never a fabricated 0.
+    expect(bareText).toHaveLength(4)
+    expect(bareText.every(value => value.includes('—'))).toBe(true)
+    expect(bareText.some(value => /\b0\b/.test(value))).toBe(false)
   })
 
   it('toggles a section through the callback', () => {

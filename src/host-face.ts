@@ -132,6 +132,7 @@ const METHODS: ReadonlyArray<readonly [string, readonly string[], readonly strin
   ['updateConfig', ['partial'], []],
   ['getGuard', [], []],
   ['updateGuard', ['change'], []],
+  ['getGuardStats', [], []],
   ['classifyAll', [], []],
   ['getDiagnostics', [], []],
   ['refresh', [], []],

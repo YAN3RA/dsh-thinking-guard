@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import type { CapabilityClass } from './policy.ts'
+import { normalizeRepeatThresholds } from './guard-loop-core.ts'
 
 export interface TierState {
   readonly tool: Map<string, CapabilityClass>
@@ -26,6 +27,12 @@ export interface GuardState {
   readonly duplicateDetection?: boolean
   readonly alternatingCycleDetection?: boolean
   readonly noProgressProtection?: boolean
+  /**
+   * Editable repeat thresholds. Absent in files written before the field
+   * existed, which is why every reader must fall back to the shipped default
+   * instead of treating the absence as "empty list".
+   */
+  readonly repeatThresholds?: readonly number[]
 }
 
 export interface MenuState {
@@ -82,14 +89,24 @@ function parseSearch(value: unknown): SearchState {
 function parseGuard(value: unknown): GuardState {
   if (value === undefined) return {}
   const record = object(value, 'guard state')
-  const state: Record<string, boolean> = {}
+  const state: Record<string, boolean | readonly number[]> = {}
   for (const key of ['enabled', 'duplicateDetection', 'alternatingCycleDetection', 'noProgressProtection'] as const) {
     const field = record[key]
     if (field === undefined) continue
     if (typeof field !== 'boolean') throw new Error(`guard.${key} must be a boolean`)
     state[key] = field
   }
-  return state
+  const thresholds = record['repeatThresholds']
+  if (thresholds !== undefined) {
+    // Same validator the settings page uses: a hand-edited state file cannot
+    // smuggle in an unsorted, duplicated or out-of-range list.
+    try {
+      state['repeatThresholds'] = normalizeRepeatThresholds(thresholds, 'guard.repeatThresholds')
+    } catch (error) {
+      throw new Error((error as Error).message)
+    }
+  }
+  return state as GuardState
 }
 
 function parseMenuState(source: string): MenuState {
@@ -260,6 +277,12 @@ export async function writeSearchState(
   })
 }
 
+/** Structural equality for a threshold list, so a re-save reports "no change". */
+function sameThresholds(a: readonly number[] | undefined, b: readonly number[] | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b
+  return a.length === b.length && a.every((value, index) => value === b[index])
+}
+
 /** Merge one instance's Guard switch changes with the latest file. */
 export async function writeGuardState(file: string, change: GuardState): Promise<boolean> {
   const keys = Object.keys(change) as (keyof GuardState)[]
@@ -267,11 +290,19 @@ export async function writeGuardState(file: string, change: GuardState): Promise
   return withStateLock(file, async () => {
     const state = await readMenuState(file)
     let changed = false
-    const guard: Record<string, boolean> = { ...state.guard }
+    const guard: { -readonly [K in keyof GuardState]: GuardState[K] } = { ...state.guard }
     for (const key of keys) {
       const next = change[key]
-      if (next === undefined || state.guard[key] === next) continue
-      guard[key] = next
+      if (next === undefined) continue
+      if (key === 'repeatThresholds') {
+        const thresholds = normalizeRepeatThresholds(next, 'guard.repeatThresholds')
+        if (sameThresholds(state.guard.repeatThresholds, thresholds)) continue
+        guard.repeatThresholds = thresholds
+        changed = true
+        continue
+      }
+      if (state.guard[key] === next) continue
+      ;(guard as Record<string, boolean | readonly number[]>)[key] = next
       changed = true
     }
     if (!changed) return false

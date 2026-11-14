@@ -18,6 +18,7 @@ import {
   DEFAULT_GUARD_PROFILES,
   DEFAULT_HOST_INTEGRATION,
   EfficiencyGuard,
+  processGuardStats,
   type GuardConfig,
   type GuardProfile,
   type HostIntegrationConfig,
@@ -49,7 +50,13 @@ export interface Config {
   alternatingCycleDetection?: boolean
   /** No-progress protection: may locally deny a repeated call. Defaults to on. */
   noProgressProtection?: boolean
-  /** @deprecated Accepted for config migration only; N7 uses fixed 3/5/8 thresholds. */
+  /**
+   * Repeat counts that raise a reminder (1-5 strictly increasing integers in
+   * 2..50). The settings page owns the live value; this is the patch-file base
+   * for a deployment that never opens the page.
+   */
+  repeatThresholds?: number[]
+  /** @deprecated Accepted for config migration only; see `repeatThresholds`. */
   duplicateWarnAfter?: number
   duplicateHardBlock?: boolean
   /** Exact names excluded from duplicate and cycle detection. */
@@ -78,6 +85,7 @@ export const Config: z<Config> = z.object({
   duplicateDetection: z.boolean().default(true),
   alternatingCycleDetection: z.boolean().default(true),
   noProgressProtection: z.boolean().default(true),
+  repeatThresholds: z.array(z.number()).default([...DEFAULT_REPEAT_THRESHOLDS]),
   duplicateWarnAfter: z.number().default(2),
   duplicateHardBlock: z.boolean().default(false),
   excludedTools: z.array(z.string()).default([]),
@@ -231,6 +239,10 @@ function handleLoopObservation(
   }, options)
   state.loopState = loopObserved.state
   const decision = loopObserved.decision
+  // "Did the Guard look at this call at all?" — an excluded/polling call is
+  // skipped by the detector and must not inflate the observation count, or the
+  // settings page would report activity the detector never had.
+  if (!decision.ignored) processGuardStats.observe(observation.outcome)
   const signature = decision.signature
   // No-progress protection is the evidence gate for the LOCAL denial. With it off
   // the call is still reminded about (below), but never becomes blockable, so the
@@ -250,17 +262,22 @@ function handleLoopObservation(
       : '检测到交替工具调用循环且结果/错误指纹未变化；后续相同循环调用可能被局部拒绝，当前 Turn 会继续。'
     : `检测到工具调用连续重复（第 ${decision.repeatThreshold ?? decision.repeatCount} 次）；请检查已有结果，避免无意义重复。`
   agent.inject(shortMessage(message))
+  // Counted after the inject returns: a reminder the host refused to deliver is
+  // not a reminder the user was ever told about.
+  processGuardStats.remind(decision.warning === 'alternating-cycle' ? 'cycle' : 'repeat')
 }
 function createLoopOptions(
   ctx: Context,
   excludedTools: ReadonlySet<string>,
   pollingTools: ReadonlySet<string>,
   warnOnlyTools: ReadonlySet<string>,
+  repeatThresholds: readonly number[],
   repeatDetectionEnabled: boolean,
   alternatingCycleEnabled: boolean,
 ): GuardLoopOptions {
   return {
-    repeatThresholds: DEFAULT_REPEAT_THRESHOLDS,
+    // Configured, not constant: the settings page owns this list now.
+    repeatThresholds,
     excludedTools: new Set([...excludedTools, ...ctx.capabilityPolicy.metaTools(), ...RESERVED_TRANSPORT_TOOLS]),
     pollingTools,
     warnOnlyTools,
@@ -276,6 +293,7 @@ function toGuardConfig(config: Config): Partial<GuardConfig> {
     duplicateDetection: config.duplicateDetection,
     alternatingCycleDetection: config.alternatingCycleDetection,
     noProgressProtection: config.noProgressProtection,
+    repeatThresholds: config.repeatThresholds,
     duplicateWarnAfter: config.duplicateWarnAfter,
     duplicateHardBlock: config.duplicateHardBlock,
     profiles: config.profiles === undefined ? undefined : { ...DEFAULT_GUARD_PROFILES, ...config.profiles },
@@ -292,7 +310,9 @@ function toGuardConfig(config: Config): Partial<GuardConfig> {
  * deployment that never opens the page.
  */
 function readSwitches(ctx: Context, config: Config): Required<Pick<Config,
-  'enabled' | 'duplicateDetection' | 'alternatingCycleDetection' | 'noProgressProtection'>> {
+  'enabled' | 'duplicateDetection' | 'alternatingCycleDetection' | 'noProgressProtection'>> & {
+    readonly repeatThresholds: readonly number[]
+  } {
   const live = ctx.get('capabilityPolicy')?.getGuard()
   return {
     enabled: live?.enabled ?? config.enabled ?? true,
@@ -300,6 +320,9 @@ function readSwitches(ctx: Context, config: Config): Required<Pick<Config,
     alternatingCycleDetection:
       live?.alternatingCycleDetection ?? config.alternatingCycleDetection ?? true,
     noProgressProtection: live?.noProgressProtection ?? config.noProgressProtection ?? true,
+    // The persisted list is validated where it is written; an unreadable one here
+    // must not disable detection, so the shipped default is the fallback.
+    repeatThresholds: live?.repeatThresholds ?? config.repeatThresholds ?? DEFAULT_REPEAT_THRESHOLDS,
   }
 }
 
@@ -342,7 +365,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     const sw = switches()
     return {
       ...createLoopOptions(ctx, excludedTools, pollingTools, warnOnlyTools,
-        sw.duplicateDetection, sw.alternatingCycleDetection),
+        sw.repeatThresholds, sw.duplicateDetection, sw.alternatingCycleDetection),
       noProgressProtection: sw.noProgressProtection,
     }
   }
@@ -374,6 +397,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       rememberBlockedSignature(state, signature)
       rememberDeniedCall(state, String(execution.callId))
       state.localLoopDenials += 1
+      // The one counter that answers "did it actually refuse anything?".
+      processGuardStats.deny()
       return '检测到相同工具调用及相同结果/错误证据；已局部拒绝本次重复调用，当前 Turn 继续运行。'
     } catch {
       // Fail open: a Guard fault must never block a real tool call.

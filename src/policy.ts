@@ -13,6 +13,11 @@ import { escapeText } from '@deepseek-ai/dsh-skill'
 import { serverNameOf, type CapabilityKind } from './registry.ts'
 import { readGuardState, readTierState, writeGuardState, writeTierState, type GuardState, type TierState } from './policy-state.ts'
 import {
+  DEFAULT_REPEAT_THRESHOLDS,
+  normalizeRepeatThresholds,
+} from './guard-loop-core.ts'
+import { processGuardStats, type GuardStatsSnapshot } from './guard-core.ts'
+import {
   LocationRegistry,
   defaultLocationConfig,
   type McpInput,
@@ -397,6 +402,14 @@ export interface CapabilityPolicyService {
    */
   updateGuard(change: Partial<GuardSwitches>): Promise<void>
   /**
+   * Content-free counters proving whether the Guard ran and what it did.
+   *
+   * Counts and timestamps only: no tool name, argument, result or error text is
+   * retained, so this is safe to show (and to log) without leaking what the
+   * Agent was working on. Process-scoped, so the numbers do not reset per turn.
+   */
+  getGuardStats(): GuardStatsSnapshot
+  /**
    * Classify every capability currently indexed by `ctx.capability` (the
    * registry sibling). Returns an empty array when the registry is not mounted.
    */
@@ -435,20 +448,30 @@ declare module '@deepseek-ai/cordis' {
 }
 
 /**
- * The three Guard switches the settings page exposes.
+ * The Guard switches the settings page exposes.
  *
  * They are separate booleans, not one master flag, because the page presents
- * them as independent controls; the detector honours each one.
+ * them as independent controls; the detector honours each one. The repeat
+ * thresholds are editable as well — they used to be a hard-coded 3/5/8 constant
+ * that the page could only display, which is what made the control look dead.
  */
 export interface GuardSwitches {
   /** Master switch: off means no reminders and no denials at all. */
   readonly enabled: boolean
-  /** Repeated identical calls: remind at the fixed 3/5/8 thresholds. */
+  /** Repeated identical calls: remind at the configured {@link repeatThresholds}. */
   readonly duplicateDetection: boolean
   /** A -> B -> A -> B sequences: detect and explain. */
   readonly alternatingCycleDetection: boolean
   /** Evidence gate for the local denial of one repeated call. */
   readonly noProgressProtection: boolean
+  /**
+   * Consecutive-repeat counts that raise a reminder.
+   *
+   * 1-5 strictly increasing integers in 2..50. The highest entry is also the
+   * repeat count at which an unchanged result/error becomes a denial candidate,
+   * so lowering it makes the Guard act earlier and raising it makes it quieter.
+   */
+  readonly repeatThresholds: readonly number[]
 }
 
 /** Shipped defaults for {@link GuardSwitches}. */
@@ -457,6 +480,7 @@ export const DEFAULT_GUARD_SWITCHES: GuardSwitches = {
   duplicateDetection: true,
   alternatingCycleDetection: true,
   noProgressProtection: true,
+  repeatThresholds: DEFAULT_REPEAT_THRESHOLDS,
 }
 
 /**
@@ -534,8 +558,18 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     }
   }
 
-  /** Live Guard switches: defaults, patch config, then persisted UI choices. */
-  let guardSwitches: GuardSwitches = { ...DEFAULT_GUARD_SWITCHES, ...savedGuard }
+  /**
+   * Live Guard switches: defaults, then persisted UI choices.
+   *
+   * A state file written before `repeatThresholds` existed simply has no such
+   * field, and the spread keeps the shipped default — that is the backward
+   * compatibility path, no migration step needed.
+   */
+  let guardSwitches: GuardSwitches = {
+    ...DEFAULT_GUARD_SWITCHES,
+    ...savedGuard,
+    repeatThresholds: savedGuard.repeatThresholds ?? DEFAULT_GUARD_SWITCHES.repeatThresholds,
+  }
   const locations = new LocationRegistry(ctx, {
     patchFile,
     skillsDir: (config.skillsDir ?? defaults.skillsDir).trim(),
@@ -792,12 +826,18 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       return guardSwitches
     },
     async updateGuard(change: Partial<GuardSwitches>): Promise<void> {
-      const next: Record<string, boolean> = { ...guardSwitches }
+      const next: { -readonly [K in keyof GuardSwitches]: GuardSwitches[K] } = { ...guardSwitches }
       for (const key of ['enabled', 'duplicateDetection', 'alternatingCycleDetection', 'noProgressProtection'] as const) {
         const value = change[key]
         if (value === undefined) continue
         if (typeof value !== 'boolean') throw new Error(`updateGuard: ${key} must be a boolean`)
         next[key] = value
+      }
+      if (change.repeatThresholds !== undefined) {
+        // Throws on anything but 1-5 strictly increasing integers in 2..50, so an
+        // illegal list is rejected here instead of silently ignored by the detector
+        // (which fails open and would look like "the setting does nothing").
+        next.repeatThresholds = normalizeRepeatThresholds(change.repeatThresholds, 'updateGuard: repeatThresholds')
       }
       // Persist first: a disk failure must not leave the live process claiming a
       // switch the next reload would not honour.
@@ -808,8 +848,11 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
           throw new Error(`cannot persist Guard switches to ${stateFile}: ${String(error)}`)
         }
       }
-      guardSwitches = next as unknown as GuardSwitches
+      guardSwitches = next
       ctx.logger.info(`capability-policy: Guard switches updated: ${JSON.stringify(next)}`)
+    },
+    getGuardStats(): GuardStatsSnapshot {
+      return processGuardStats.snapshot()
     },
     classifyAll(): readonly CapabilityClassification[] {
       // The registry default maxResults (20) would truncate the management

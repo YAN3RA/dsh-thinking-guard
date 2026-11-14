@@ -3,6 +3,43 @@ import { createHash } from 'node:crypto'
 export const LOOP_HISTORY_LIMIT = 16
 export const DEFAULT_REPEAT_THRESHOLDS = Object.freeze([3, 5, 8] as const)
 
+/** Smallest accepted repeat threshold. */
+export const REPEAT_THRESHOLD_MIN = 2
+/** Largest accepted repeat threshold. */
+export const REPEAT_THRESHOLD_MAX = 50
+/** How many thresholds one configuration may carry. */
+export const REPEAT_THRESHOLD_LIMIT = 5
+
+/**
+ * Validate a repeat-threshold list and return a frozen copy.
+ *
+ * One shared validator so the settings page, the persisted state file and the
+ * detector cannot disagree about what a legal list is. It throws instead of
+ * coercing: silently sorting, deduplicating or clamping would make the settings
+ * page claim a behaviour the detector does not have.
+ */
+export function normalizeRepeatThresholds(
+  value: unknown,
+  label = 'repeatThresholds',
+): readonly number[] {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array of integers`)
+  if (value.length < 1 || value.length > REPEAT_THRESHOLD_LIMIT) {
+    throw new Error(`${label} must contain 1 to ${REPEAT_THRESHOLD_LIMIT} integers`)
+  }
+  const normalized: number[] = []
+  for (const entry of value as readonly unknown[]) {
+    if (typeof entry !== 'number' || !Number.isSafeInteger(entry)
+      || entry < REPEAT_THRESHOLD_MIN || entry > REPEAT_THRESHOLD_MAX) {
+      throw new Error(`${label} must contain integers between ${REPEAT_THRESHOLD_MIN} and ${REPEAT_THRESHOLD_MAX}`)
+    }
+    if (normalized.length > 0 && entry <= normalized[normalized.length - 1]) {
+      throw new Error(`${label} must be strictly increasing`)
+    }
+    normalized.push(entry)
+  }
+  return Object.freeze(normalized)
+}
+
 /**
  * Fingerprint budgets, checked *while* canonicalizing.
  *
@@ -302,11 +339,11 @@ export function observeGuardLoop(
     }
   }
 
-  const thresholds = [...(options.repeatThresholds ?? DEFAULT_REPEAT_THRESHOLDS)].sort((a, b) => a - b)
-  if (thresholds.length === 0 || thresholds.some(value => !Number.isSafeInteger(value) || value < 2)
-    || new Set(thresholds).size !== thresholds.length) {
-    throw new Error('repeatThresholds must contain unique integers >= 2')
-  }
+  // Sorted before validation so an unsorted but otherwise legal list keeps working;
+  // the shared validator then enforces range, count and strict ordering.
+  const thresholds = normalizeRepeatThresholds(
+    [...(options.repeatThresholds ?? DEFAULT_REPEAT_THRESHOLDS)].sort((a, b) => a - b),
+  )
   const repeatThreshold = thresholds.includes(repeatCount) ? repeatCount : undefined
   // Repeat detection and cycle detection are independent switches: neither may
   // suppress the other. `repeatCount` keeps counting even when reminders are off.

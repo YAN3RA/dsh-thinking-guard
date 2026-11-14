@@ -16,6 +16,7 @@ import type {
   Config as CapabilityPolicyConfig,
   GuardSwitches,
 } from '../policy.ts'
+import type { GuardStatsSnapshot } from '../guard-core.ts'
 import type { CapabilityDetail, SkillDirEntry, CapabilityService, CapabilityDiagnostics, SearchMetadata, SearchMetadataUpdate } from '../registry.ts'
 import { describeSkillEntry, isProjectSkillsDir } from '../locations.ts'
 import type { McpInput, McpLocation, McpUpdateInput, SkillLocation } from '../locations.ts'
@@ -107,6 +108,18 @@ export class CapabilityPolicyGateway extends TypertRemoteService {
   @Remote('updateGuard')
   async updateGuard(change: Partial<GuardSwitches>): Promise<void> {
     await this.ctx.capabilityPolicy.updateGuard(change)
+  }
+
+  /**
+   * Content-free Guard counters: was the Guard running, and did it do anything?
+   *
+   * Counts and timestamps only — never a tool name, argument, result or error
+   * text — so the settings page can prove the Guard is live without the wire
+   * ever carrying what the Agent was working on.
+   */
+  @Remote('getGuardStats')
+  getGuardStats(): GuardStatsSnapshot {
+    return this.ctx.capabilityPolicy.getGuardStats()
   }
 
   /** Classify every capability currently indexed by `ctx.capability`. */

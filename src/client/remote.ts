@@ -66,12 +66,34 @@ export interface SelfUpdateStatus {
   readonly sourcePath?: string
 }
 
-/** The three Guard switches surfaced by 思考限制. */
+/** The Guard switches surfaced by 思考限制, including the editable thresholds. */
 export interface GuardSwitches {
   readonly enabled: boolean
   readonly duplicateDetection: boolean
   readonly alternatingCycleDetection: boolean
   readonly noProgressProtection: boolean
+  /**
+   * 1-5 strictly increasing repeat counts in 2..50; the highest also gates a
+   * denial. Optional on the wire because a Host older than this field omits it —
+   * the panel then shows the shipped default instead of failing to load.
+   */
+  readonly repeatThresholds?: readonly number[]
+}
+
+/**
+ * Content-free Guard counters (mirror of `GuardStatsSnapshot` in guard-core).
+ *
+ * Numbers and timestamps only: the wire never carries a tool name, argument,
+ * result or error text, so the panel can show this without leaking the session.
+ */
+export interface GuardStatsSnapshot {
+  readonly observations: number
+  readonly reminders: { readonly repeat: number; readonly cycle: number }
+  readonly denials: number
+  readonly outcomes: { readonly success: number; readonly error: number; readonly cancelled: number }
+  readonly lastReminderAt?: number
+  readonly lastDenialAt?: number
+  readonly since: number
 }
 
 const guardSwitches$schema = z.object({
@@ -79,6 +101,7 @@ const guardSwitches$schema = z.object({
   duplicateDetection: z.boolean(),
   alternatingCycleDetection: z.boolean(),
   noProgressProtection: z.boolean(),
+  repeatThresholds: z.array(z.number()).optional(),
 })
 
 const guardSwitchesPatch$schema = z.object({
@@ -86,6 +109,17 @@ const guardSwitchesPatch$schema = z.object({
   duplicateDetection: z.boolean().optional(),
   alternatingCycleDetection: z.boolean().optional(),
   noProgressProtection: z.boolean().optional(),
+  repeatThresholds: z.array(z.number()).optional(),
+})
+
+const guardStats$schema = z.object({
+  observations: z.number(),
+  reminders: z.object({ repeat: z.number(), cycle: z.number() }),
+  denials: z.number(),
+  outcomes: z.object({ success: z.number(), error: z.number(), cancelled: z.number() }),
+  lastReminderAt: z.number().optional(),
+  lastDenialAt: z.number().optional(),
+  since: z.number(),
 })
 
 const selfUpdateStatus$schema = z.object({
@@ -417,6 +451,12 @@ export const TYPERT_REMOTE: TypertRemoteContribution = {
       service: 'capabilityPolicy', namespace: 'capabilityPolicy', method: 'getGuard',
       invocation: { kind: 'direct' }, parameters: [],
       result: strictCodec('GuardSwitches', guardSwitches$schema),
+    },
+    {
+      id: 'dsh-thinking-guard#capabilityPolicy/getGuardStats',
+      service: 'capabilityPolicy', namespace: 'capabilityPolicy', method: 'getGuardStats',
+      invocation: { kind: 'direct' }, parameters: [],
+      result: strictCodec('GuardStatsSnapshot', guardStats$schema),
     },
     {
       id: 'dsh-thinking-guard#capabilityPolicy/updateGuard',

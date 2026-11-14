@@ -1,4 +1,11 @@
-import { createGuardLoopState, type GuardLoopBlockSource, type GuardLoopState, type GuardToolOutcome } from './guard-loop-core.ts'
+import {
+  DEFAULT_REPEAT_THRESHOLDS,
+  createGuardLoopState,
+  normalizeRepeatThresholds,
+  type GuardLoopBlockSource,
+  type GuardLoopState,
+  type GuardToolOutcome,
+} from './guard-loop-core.ts'
 
 export type GuardProfileName = 'quick' | 'normal' | 'deep'
 
@@ -45,12 +52,14 @@ export interface GuardConfig {
    * the detector keeps its history and the reminder path is unchanged.
    */
   readonly noProgressProtection: boolean
-  /** @deprecated Compatibility-only; N7 uses fixed 3/5/8 thresholds. */
+  /** @deprecated Compatibility-only; see `repeatThresholds` for the live list. */
   readonly duplicateWarnAfter: number
   /** @deprecated Accepted for migration only; validated as false. */
   readonly duplicateHardBlock: boolean
   readonly profiles: Readonly<Record<GuardProfileName, GuardProfile>>
   readonly hostIntegration: HostIntegrationConfig
+  /** Repeat counts that raise a reminder; strictly increasing, 2..50, 1..5 entries. */
+  readonly repeatThresholds: readonly number[]
 }
 
 export interface ToolCallObservation {
@@ -117,6 +126,103 @@ export interface TurnState {
 
 export type GuardDecision = { readonly kind: 'allow' }
 
+/** Which reminder the Guard actually delivered. */
+export type GuardReminderKind = 'repeat' | 'cycle'
+
+/**
+ * Content-free Guard counters for the settings page.
+ *
+ * This is the answer to "is it running, and did it do anything?". Every field is
+ * a number or a timestamp: no tool name, argument, result, error message or
+ * reasoning text is ever stored, so the snapshot can be shown (and serialized)
+ * without leaking anything the Guard saw. All counters are plain accumulators —
+ * there is no per-call key space that could grow without bound.
+ */
+export interface GuardStatsSnapshot {
+  /** Tool calls the detector actually observed (excluded/polling calls are not counted). */
+  readonly observations: number
+  /** Reminders actually delivered, split by which detector produced them. */
+  readonly reminders: { readonly repeat: number; readonly cycle: number }
+  /** Local denials actually enforced by `ctx.tools.guard`. */
+  readonly denials: number
+  /** Outcome class of the observed calls. Denials are counted in `denials`, not here. */
+  readonly outcomes: { readonly success: number; readonly error: number; readonly cancelled: number }
+  /** Milliseconds timestamp of the most recent delivered reminder. */
+  readonly lastReminderAt?: number
+  /** Milliseconds timestamp of the most recent enforced denial. */
+  readonly lastDenialAt?: number
+  /** Milliseconds timestamp this recorder started counting. */
+  readonly since: number
+}
+
+/** Saturating increment: counters stay finite and exact for any real session. */
+function bumpCounter(value: number): number {
+  return value >= Number.MAX_SAFE_INTEGER ? value : value + 1
+}
+
+/**
+ * Bounded, process-lifetime Guard counters.
+ *
+ * Deliberately not per-Agent or per-Turn: the question the settings page asks is
+ * "has this process's Guard been working at all", which a per-turn counter would
+ * answer with a zero every time the page is opened mid-turn. Mutators are total
+ * (they cannot throw), so instrumentation can never turn a real tool call into a
+ * failure.
+ */
+export class GuardStatsRecorder {
+  private readonly startedAt: number
+  private observations = 0
+  private repeatReminders = 0
+  private cycleReminders = 0
+  private denials = 0
+  private successes = 0
+  private errors = 0
+  private cancellations = 0
+  private lastReminderAt: number | undefined
+  private lastDenialAt: number | undefined
+
+  constructor(now = Date.now()) {
+    this.startedAt = now
+  }
+
+  /** Record one call the detector observed, by its outcome class. */
+  observe(outcome: GuardToolOutcome, _now = Date.now()): void {
+    this.observations = bumpCounter(this.observations)
+    if (outcome === 'success') this.successes = bumpCounter(this.successes)
+    else if (outcome === 'error') this.errors = bumpCounter(this.errors)
+    else if (outcome === 'cancelled') this.cancellations = bumpCounter(this.cancellations)
+  }
+
+  /** Record one reminder that was really delivered to the Agent. */
+  remind(kind: GuardReminderKind, now = Date.now()): void {
+    if (kind === 'cycle') this.cycleReminders = bumpCounter(this.cycleReminders)
+    else this.repeatReminders = bumpCounter(this.repeatReminders)
+    this.lastReminderAt = now
+  }
+
+  /** Record one local denial that was really enforced. */
+  deny(now = Date.now()): void {
+    this.denials = bumpCounter(this.denials)
+    this.lastDenialAt = now
+  }
+
+  /** Frozen, content-free copy. Safe to serialize over the remote wire. */
+  snapshot(): GuardStatsSnapshot {
+    return {
+      observations: this.observations,
+      reminders: { repeat: this.repeatReminders, cycle: this.cycleReminders },
+      denials: this.denials,
+      outcomes: { success: this.successes, error: this.errors, cancelled: this.cancellations },
+      ...(this.lastReminderAt !== undefined ? { lastReminderAt: this.lastReminderAt } : {}),
+      ...(this.lastDenialAt !== undefined ? { lastDenialAt: this.lastDenialAt } : {}),
+      since: this.startedAt,
+    }
+  }
+}
+
+/** Counters for this process; imported by the policy service that serves them. */
+export const processGuardStats = new GuardStatsRecorder()
+
 export const DEFAULT_GUARD_PROFILES: Readonly<Record<GuardProfileName, GuardProfile>> = {
   quick: {
     softSteps: 3,
@@ -165,6 +271,7 @@ export const DEFAULT_GUARD_CONFIG: GuardConfig = {
   duplicateHardBlock: false,
   profiles: DEFAULT_GUARD_PROFILES,
   hostIntegration: DEFAULT_HOST_INTEGRATION,
+  repeatThresholds: DEFAULT_REPEAT_THRESHOLDS,
 }
 
 function assertPositiveInteger(name: string, value: unknown): asserts value is number {
@@ -201,6 +308,10 @@ export function validateGuardConfig(input: Partial<GuardConfig> = {}): GuardConf
   assertPositiveInteger('hostIntegration.maxConvergenceSteersPerTurn', host.maxConvergenceSteersPerTurn)
   assertPositiveInteger('hostIntegration.maxNoProgressCycles', host.maxNoProgressCycles)
   if (host.loopBreakMode !== 'stop-next-step') throw new Error('hostIntegration.loopBreakMode must be stop-next-step')
+  // An absent list falls back to the shipped default; a present one must be legal.
+  const repeatThresholds = input.repeatThresholds === undefined
+    ? DEFAULT_REPEAT_THRESHOLDS
+    : normalizeRepeatThresholds(input.repeatThresholds)
   return {
     ...DEFAULT_GUARD_CONFIG,
     ...input,
@@ -215,6 +326,7 @@ export function validateGuardConfig(input: Partial<GuardConfig> = {}): GuardConf
     profiles,
     duplicateWarnAfter,
     hostIntegration: host,
+    repeatThresholds,
   }
 }
 

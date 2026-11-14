@@ -92,6 +92,11 @@
     - id: thinking-guard
       name: 'dsh-thinking-guard'
       config:
+        # D-029 (2026-11-11): default flipped to host-visible at the operator's
+        # request; the official service corpus may include OTHER PROFILES.
+        # Set `scope: disabled` to restore D-026's fail-closed default.
+        callIndex:
+          scope: host-visible
         guard:
           enabled: true
           profile: normal

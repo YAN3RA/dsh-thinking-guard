@@ -109,7 +109,8 @@
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.4",
     "js-yaml": "^4.1.0",
-    "yaml": "^2.8.1"
+    "yaml": "^2.8.1",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.1.0",
@@ -138,7 +139,6 @@
     "clsx": "^2.1.1",
     "tsdown": "^0.22.2",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.8",
-    "zod": "^4.4.3"
+    "vitest": "^4.1.8"
   }
 }

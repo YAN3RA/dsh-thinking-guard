@@ -32,6 +32,10 @@ import { UsageGateway } from './server/usage-remote.ts'
 import { usageHostFace } from './usage/usage-host-face.ts'
 import * as AgentEfficiencyGuard from './guard.ts'
 import { installUsageRuntime } from './usage/usage-runtime.ts'
+import z from '@deepseek-ai/schemastery'
+import * as CallIndexHost from './usage/call-index-host.ts'
+import { CallIndexConfig, type CallIndexRuntimeConfig } from './usage/call-index-runtime.ts'
+import { callIndexHostFace } from './usage/call-index-host-face.ts'
 export interface Config {
   guard?: AgentEfficiencyGuard.Config
   /**
@@ -43,7 +47,14 @@ export interface Config {
    * dependency for it.
    */
   usageRuntime?: boolean
+  /** Explicit D-026 corpus scope; disabled by default. Never enables history by visiting a tab. */
+  callIndex?: CallIndexRuntimeConfig
 }
+export const Config: z<Config> = z.object({
+  guard: AgentEfficiencyGuard.Config,
+  usageRuntime: z.boolean().default(true),
+  callIndex: CallIndexConfig,
+})
 
 /**
  * Install the usage runtime once per root context and expose the handle as
@@ -79,10 +90,11 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.plugin(UsageGateway)
   ctx.plugin(AgentEfficiencyGuard, config.guard ?? {})
   if (config.usageRuntime !== false) installUsageRoot(ctx)
+  ctx.plugin(CallIndexHost, config.callIndex ?? {})
   ctx.inject(['typert'], (registry) => {
     // One contribution, not two: Typert keys contributions by `package`, and a
     // second `register()` for an already-mounted package withdraws the first
     // one's strict definitions (see mergeHostFaces in ./host-face.ts).
-    registerCapabilityPolicyHostFace(registry, [usageHostFace()])
+    registerCapabilityPolicyHostFace(registry, [usageHostFace(), callIndexHostFace()])
   })
 }

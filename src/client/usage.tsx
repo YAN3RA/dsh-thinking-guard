@@ -529,7 +529,7 @@ function usageMetrics(
     metric('技能调用', formatUsageCount(totals?.skillCalls)),
     metric('插件工具', formatUsageCount(totals?.pluginToolCalls)),
     metric('原生与其他', formatUsageCount(totals?.nativeCalls)),
-    metric('未知来源', formatUsageCount(totals?.unknownCalls)),
+    metric('来源未解析', formatUsageCount(totals?.unknownCalls)),
   ]
   if ((totals?.denied ?? 0) > 0) metrics.push(metric('拒绝', formatUsageCount(totals?.denied)))
   if ((totals?.cancelled ?? 0) > 0) metrics.push(metric('取消', formatUsageCount(totals?.cancelled)))

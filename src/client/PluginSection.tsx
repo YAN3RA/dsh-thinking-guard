@@ -17,9 +17,19 @@
  * renders no panels, so all panels stay caller-owned here — which is what we
  * want, because they are toggled with `hidden` instead of unmounting.
  */
-import { createElement, useState, type ReactElement } from 'react'
+import { createElement, useEffect, useState, type ReactElement } from 'react'
 import { SegmentedTabs, type SegmentedTab } from '@deepseek-ai/dsh-client-ui-primitives'
 import { CapabilitySection, type CapabilitySectionInjected } from './CapabilitySection.tsx'
+import {
+  CallIndexDetailPanel,
+  CallIndexDiagnostics,
+  CallIndexOverviewPanel,
+  createCallIndexPanelApi,
+  type CallIndexPanelApi,
+  type CallIndexPanelFailure,
+  type CallIndexRemoteFace,
+} from './call-index.tsx'
+import type { CallIndexStatusView } from './call-index-adapter.ts'
 import { UsagePanel, type UsagePanelApi } from './usage.tsx'
 import { OverviewContainer } from './OverviewContainer.tsx'
 import { GuardContainer } from './GuardContainer.tsx'
@@ -29,11 +39,53 @@ import type { GuardSwitches } from './remote.ts'
 export type PluginCategory = 'overview' | 'guard' | 'catalog' | 'usage'
 
 export interface PluginSectionProps {
-  /** Props for the 能力目录 view, unchanged from its previous section entry. */
+  /** Props for the 工具与技能 view, unchanged from its previous section entry. */
   readonly capability: CapabilitySectionInjected
-  /** Data source for the 调用统计 view. */
-  readonly usageApi: UsagePanelApi
-  /** Guard switch face for 思考限制 and the 总览 status row. */
+  /**
+   * Legacy usage face, still accepted so an older Host (or a test double) that
+   * only knows `remote.usage` keeps rendering instead of showing an empty page.
+   * The 调用明细/总览 panels read `callIndexRemote` when it resolves.
+   */
+  readonly usageApi?: UsagePanelApi | undefined
+  /**
+   * Resolves the `callIndex` remote face, or `undefined` when it is not mounted.
+   *
+   * A provider rather than a value: the namespace only becomes visible on
+   * `ctx.get` after this plugin's `$mount` settles, so reading it once at
+   * section construction would capture `undefined` forever.
+   */
+  readonly callIndexRemote?: (() => CallIndexRemoteFace | undefined) | undefined
+  /**
+   * Resolves the live target for the 按会话 / 按工作区 scopes.
+   *
+   * `settings.section` is root-scoped, so the shell passes no Session props;
+   * the plugin resolves the selection from the client services instead. Read on
+   * demand (a scope click), never subscribed.
+   */
+  readonly scopeTarget?: (() => { sessionId?: string; cwd?: string }) | undefined
+  /**
+   * Session display names plus the switchable list for 调用明细.
+   *
+   * The call index wire carries no title, so a scope line built from the wire
+   * alone can only show a truncated id — which does not answer "which
+   * conversation am I looking at". Names come from the Host Session catalog.
+   */
+  readonly sessionCatalog?: (() => {
+    current?: { id: string; name: string }
+    items: readonly { id: string; name: string; cwd?: string }[]
+  }) | undefined
+  /**
+   * Latest index health, read by the container.
+   *
+   * Passed down as a value so this view stays hook-free. When present the shared
+   * red box renders under the tab bar on every tab; when absent it renders
+   * nothing, which is the healthy case.
+   */
+  readonly diagnostics?: {
+    readonly status?: CallIndexStatusView
+    readonly failure?: CallIndexPanelFailure
+  } | undefined
+  /** Guard switch face for 执行保护 and the 总览 status row. */
   readonly guardRemote: {
     getGuard?(): Promise<{ ok: true; value: GuardSwitches } | { ok: false; error: { code: string; message: string } }>
     updateGuard?(change: Partial<GuardSwitches>): Promise<{ ok: true; value: void } | { ok: false; error: { code: string; message: string } }>
@@ -107,15 +159,68 @@ const CATEGORY_KEYS: Readonly<Record<PluginCategory, PluginSectionKey>> = {
   usage: 'tabUsage',
 }
 
+/**
+ * Memo of `createCallIndexPanelApi` keyed by provider identity.
+ *
+ * The panels hold their own request state and re-run effects when the `api`
+ * object changes, so handing them a fresh object on every render would refetch
+ * on each paint. Keying on the provider (`index.ts` passes one stable function)
+ * gives the same object across renders while still letting a test pass a
+ * different provider and get a fresh face.
+ *
+ * A module-level memo, not `useState`: this view must stay hook-free so the
+ * suite can invoke it directly.
+ */
+const callIndexApis = new WeakMap<object, CallIndexPanelApi>()
+let callIndexApiForNoProvider: CallIndexPanelApi | undefined
+
+function callIndexApiFor(provider: (() => CallIndexRemoteFace | undefined) | undefined): CallIndexPanelApi {
+  if (provider === undefined) {
+    callIndexApiForNoProvider ??= createCallIndexPanelApi(undefined)
+    return callIndexApiForNoProvider
+  }
+  const cached = callIndexApis.get(provider)
+  if (cached !== undefined) return cached
+  const created = createCallIndexPanelApi(provider)
+  callIndexApis.set(provider, created)
+  return created
+}
+
 export function PluginSection(props: PluginSectionProps): ReactElement {
   const [active, setActive] = useState<PluginCategory>('overview')
+  // Read index health once here, so the shared red box can appear on ALL four
+  // tabs — 执行保护 and 工具与技能 never touch the call index, and a broken
+  // index used to look fine until the operator opened 调用明细.
+  const callIndexApi = callIndexApiFor(props.callIndexRemote)
+  const [diagnostics, setDiagnostics] = useState<{
+    readonly status?: CallIndexStatusView
+    readonly failure?: CallIndexPanelFailure
+  } | undefined>(undefined)
+  useEffect(() => {
+    let live = true
+    void (async () => {
+      const result = await callIndexApi.getStatus()
+      if (!live) return
+      setDiagnostics(result.ok ? { status: result.value } : { failure: result })
+    })()
+    return () => { live = false }
+  }, [callIndexApi])
   return createElement(PluginSectionView, {
     capability: props.capability,
     usageApi: props.usageApi,
+    // MUST be forwarded: this component is what `settings.section` actually
+    // registers, so dropping it here silently sends both panels to the legacy
+    // fallback no matter what `index.ts` injects. The prop is optional, so
+    // neither tsc nor a `PluginSectionView` test can catch the omission —
+    // `client-plugin-section.spec.tsx` calls `PluginSection` itself for that.
+    callIndexRemote: props.callIndexRemote,
+    scopeTarget: props.scopeTarget,
+    sessionCatalog: props.sessionCatalog,
     guardRemote: props.guardRemote,
     t: props.t,
     active,
     onSelect: setActive,
+    ...(diagnostics === undefined ? {} : { diagnostics }),
   })
 }
 
@@ -132,7 +237,14 @@ export interface PluginSectionViewProps extends PluginSectionProps {
  * `UsagePanelView`.
  */
 export function PluginSectionView(props: PluginSectionViewProps): ReactElement {
-  const { capability, usageApi, guardRemote, t, active, onSelect } = props
+  const { capability, usageApi, callIndexRemote, scopeTarget, sessionCatalog, guardRemote, t, active, onSelect, diagnostics } = props
+
+  // One stable API object per provider identity. A `useState` initializer would
+  // be the idiomatic way to hold it, but this view is deliberately hook-free so
+  // the test suite can call it as a plain function and walk the element tree
+  // (same pattern as `UsagePanelView`). Caching by provider keeps the panels'
+  // effects from restarting on every render without introducing a hook.
+  const callIndexApi = callIndexApiFor(callIndexRemote)
 
   const panel = (
     category: PluginCategory,
@@ -158,12 +270,34 @@ export function PluginSectionView(props: PluginSectionViewProps): ReactElement {
       label: t('nav'),
     }),
 
+    // One loud error box directly under the tab bar, shared by all four tabs.
+    // Requested after several rounds of "it fails and I cannot tell why": the
+    // per-page grey hints were easy to miss and some failures were never shown.
+    // Data comes in as props: this view must stay hook-free (the suite calls it
+    // as a plain function), so the container owns the read.
+    CallIndexDiagnostics({
+      ...(diagnostics?.status === undefined ? {} : { status: diagnostics.status }),
+      ...(diagnostics?.failure === undefined ? {} : { failure: diagnostics.failure }),
+    }),
+
     // `hidden` instead of unmounting: the catalog and usage views own live
     // Remote subscriptions and scroll positions, and re-mounting on every tab
     // click would refetch the whole catalog each time.
-    panel('overview', createElement(OverviewContainer, { t, usageApi, guardRemote, policyRemote: guardRemote })),
+    // 总览 and 调用明细 read the call index. `UsagePanel` stays reachable as a
+    // fallback only when the call-index namespace is absent AND a legacy usage
+    // face exists, so a Host that predates N23 still shows something real
+    // instead of an empty page.
+    panel('overview', callIndexRemote === undefined && usageApi !== undefined
+      ? createElement(OverviewContainer, { t, usageApi, guardRemote, policyRemote: guardRemote })
+      : createElement(CallIndexOverviewPanel, { api: callIndexApi })),
     panel('guard', createElement(GuardContainer, { t, remote: guardRemote, duplicateThresholds: [3, 5, 8] })),
     panel('catalog', createElement(CapabilitySection, capability)),
-    panel('usage', createElement(UsagePanel, { api: usageApi })),
+    panel('usage', callIndexRemote === undefined && usageApi !== undefined
+      ? createElement(UsagePanel, { api: usageApi })
+      : createElement(CallIndexDetailPanel, {
+          api: callIndexApi,
+          ...(scopeTarget === undefined ? {} : { resolveScopeTarget: scopeTarget }),
+          ...(sessionCatalog === undefined ? {} : { resolveSessionCatalog: sessionCatalog }),
+        })),
   )
 }

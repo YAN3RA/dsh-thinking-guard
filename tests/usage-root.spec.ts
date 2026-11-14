@@ -5,6 +5,7 @@ import { apply } from '../src/index.ts'
 import { CapabilityPolicyGateway } from '../src/server/remote.ts'
 import { UsageGateway } from '../src/server/usage-remote.ts'
 import * as guardModule from '../src/guard.ts'
+import * as callIndexHost from '../src/usage/call-index-host.ts'
 import type { UsageRuntime } from '../src/usage/usage-runtime.ts'
 
 const TIME = Date.UTC(2026, 10, 4, 12, 0, 0)
@@ -123,7 +124,8 @@ describe('root usage runtime wiring', () => {
 
     // Existing root behavior: the policy gateway and Guard plugin are still
     // mounted, and the Typert host face still registers through ctx.inject.
-    expect(host.pluginCalls).toHaveLength(3)
+    expect(host.pluginCalls).toHaveLength(4)
+    expect(host.pluginCalls[3]?.[0]).toBe(callIndexHost)
     expect(host.pluginCalls[0]?.[0]).toBe(CapabilityPolicyGateway)
     expect(host.pluginCalls[1]?.[0]).toBe(UsageGateway)
     expect(host.pluginCalls[2]?.[0]).toBe(guardModule)
@@ -150,7 +152,8 @@ describe('root usage runtime wiring', () => {
 
     expect(host.subscribeNames).toEqual([])
     expect(host.provideCalls).toEqual([])
-    expect(host.pluginCalls).toHaveLength(3)
+    expect(host.pluginCalls).toHaveLength(4)
+    expect(host.pluginCalls[3]?.[0]).toBe(callIndexHost)
     expect(host.injectCalls).toHaveLength(1)
   })
 

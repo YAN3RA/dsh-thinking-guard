@@ -133,7 +133,7 @@ describe('usage gateway · @Remote wiring', () => {
   it('mounts capability and usage descriptors as one package contribution', async () => {
     const source = await readFile(new URL('../src/client/index.ts', import.meta.url), 'utf8')
     expect(source).toContain("export const inject = ['slots', 'locale', 'remote']")
-    expect(source).toContain('descriptors: [...TYPERT_REMOTE.descriptors, ...USAGE_TYPERT_REMOTE.descriptors]')
+    expect(source).toContain('descriptors: [...TYPERT_REMOTE.descriptors, ...USAGE_TYPERT_REMOTE.descriptors, ...CALL_INDEX_TYPERT_REMOTE.descriptors]')
     expect([...source.matchAll(/ctx\.remote\.\$mount\(/g)]).toHaveLength(1)
     expect(source).not.toContain('$mount(USAGE_TYPERT_REMOTE)')
   })

@@ -675,7 +675,7 @@ describe('Typert host face: one merged contribution, every endpoint resolvable',
     const source = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8')
     const registrations = source.match(/registerCapabilityPolicyHostFace\(/g) ?? []
     expect(registrations).toHaveLength(1)
-    expect(source).toMatch(/registerCapabilityPolicyHostFace\(registry, \[usageHostFace\(\)\]\)/)
+    expect(source).toMatch(/registerCapabilityPolicyHostFace\(registry, \[usageHostFace\(\), callIndexHostFace\(\)\]\)/)
     expect(source).not.toMatch(/registerUsageHostFace\(/)
   })
 })

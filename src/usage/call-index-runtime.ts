@@ -46,11 +46,11 @@ export const CallIndexConfig: z<CallIndexRuntimeConfig> = z.object({
    */
   scope: z.union(['disabled', 'host-visible']).default('host-visible'),
   liveDebounceMs: z.number().min(0).max(60_000).default(200),
-  maxEventsPerRun: z.number().min(1).max(1_000_000).default(400_000),
+  maxEventsPerRun: z.number().min(1).max(20_000_000).default(2_000_000),
   queryTtlMs: z.number().min(1).max(300_000).default(60_000),
   queryMaxViews: z.number().min(1).max(16).default(4),
   queryMaxBytes: z.number().min(1024).max(64 * 1024 * 1024).default(8 * 1024 * 1024),
-  pageSize: z.number().min(1).max(250).default(250),
+  pageSize: z.number().min(1).max(8192).default(2048),
   maxBytes: z.number().min(1024).max(256 * 1024 * 1024).default(64 * 1024 * 1024),
   maxCalls: z.number().min(1).max(100_000).default(100_000),
   maxSessions: z.number().min(1).max(10_000).default(5_000),
@@ -239,6 +239,33 @@ export function installCallIndexRuntime(ctx: Context, config: CallIndexRuntimeCo
     taskId: task.taskId, mode: task.mode, phase: task.phase, startedAt: task.startedAt,
     ...(task.finishedAt === undefined ? {} : { finishedAt: task.finishedAt }), cancelRequested: task.cancelRequested,
   } : {})
+  /**
+   * Start one scan pass.
+   *
+   * `invalidateQueries` exists because the automatic scan now runs a
+   * CONTINUATION pass as soon as the previous one finishes with a backlog. Each
+   * pass used to bump `queryVersion`, which changes the query stamp and drops
+   * every captured view — so a browser paginating a list saw `cursor-stale`
+   * every few hundred milliseconds during the first scan. An internal
+   * continuation therefore does NOT invalidate: captured views stay stable
+   * (they are frozen copies anyway), and the UI re-reads once the scan ends.
+   * Explicit `startIndex` calls still invalidate, because the operator asked
+   * for a fresh read.
+   */
+  const begin = (mode: 'full' | 'incremental', invalidateQueries: boolean): CallIndexReply => {
+    if (invalidateQueries) { queryVersion++; queries.invalidate() }
+    task = { taskId: randomUUID(), mode, phase: 'running', startedAt: now(), cancelRequested: false }
+    const owner = task
+    active = index.start({ full: mode === 'full', maxEvents: config.maxEventsPerRun }).then(result => {
+      if (disposed || task !== owner) return
+      owner.phase = result.phase === 'cancelled' ? 'cancelled' : result.phase === 'failed' ? 'failed' : result.coverage === 'complete' ? 'complete' : 'partial'
+      owner.finishedAt = now()
+    }).catch(() => { if (!disposed && task === owner) { owner.phase = 'failed'; owner.finishedAt = now() } }).finally(() => {
+      active = undefined
+      if (needsFlush && !disposed) { needsFlush = false; scheduleFlush() }
+    })
+    return taskReply()
+  }
   const runtime: CallIndexRuntime = {
     getIndexStatus() {
       if (disposed) return callIndexError('runtime-unavailable')
@@ -264,18 +291,7 @@ export function installCallIndexRuntime(ctx: Context, config: CallIndexRuntimeCo
       if (active) return taskReply()
       if (config.maxEventsPerRun !== undefined && (!Number.isSafeInteger(config.maxEventsPerRun) || config.maxEventsPerRun < 1)) return callIndexError('invalid-request')
       const mode = record(request) && request.mode === 'full' ? 'full' : 'incremental'
-      queryVersion++; queries.invalidate()
-      task = { taskId: randomUUID(), mode, phase: 'running', startedAt: now(), cancelRequested: false }
-      const owner = task
-      active = index.start({ full: mode === 'full', maxEvents: config.maxEventsPerRun }).then(result => {
-        if (disposed || task !== owner) return
-        owner.phase = result.phase === 'cancelled' ? 'cancelled' : result.phase === 'failed' ? 'failed' : result.coverage === 'complete' ? 'complete' : 'partial'
-        owner.finishedAt = now()
-      }).catch(() => { if (!disposed && task === owner) { owner.phase = 'failed'; owner.finishedAt = now() } }).finally(() => {
-        active = undefined
-        if (needsFlush && !disposed) { needsFlush = false; scheduleFlush() }
-      })
-      return taskReply()
+      return begin(mode, true)
     },
     cancelIndex(request) {
       if (disposed) return callIndexError('runtime-unavailable')
@@ -336,7 +352,7 @@ export function installCallIndexRuntime(ctx: Context, config: CallIndexRuntimeCo
     if (scopeMode() !== 'host-visible') return
     if (round > AUTO_ROUNDS_MAX) return
     try {
-      const started = runtime.startIndex(round === 0 && config.autoIndexMode === 'full' ? { mode: 'full' } : undefined)
+      const started = begin(round === 0 && config.autoIndexMode === 'full' ? 'full' : 'incremental', false)
       if (started.ok === false) {
         // Never silent: a refused automatic scan is the exact failure that made
         // the page show a permanent zero with no explanation.

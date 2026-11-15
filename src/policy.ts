@@ -662,7 +662,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   }
 
   const persistTiers = (): Promise<void> => {
-    persistInFlight = persistInFlight.then(writeTiers)
+    persistInFlight = persistInFlight.catch(() => undefined).then(writeTiers)
     return persistInFlight
   }
 
@@ -826,30 +826,37 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       return guardSwitches
     },
     async updateGuard(change: Partial<GuardSwitches>): Promise<void> {
-      const next: { -readonly [K in keyof GuardSwitches]: GuardSwitches[K] } = { ...guardSwitches }
+      // Persist ONLY the keys this call actually changes. Passing a full snapshot
+      // made every writer rewrite the operating system's whole Guard state from
+      // its own memory: a concurrent toggle (or a second process) silently
+      // reverted the other writer's switch — including the safety switch. The
+      // state-file writer merges per key under its lock, so the narrow patch is
+      // both correct and conflict-free.
+      const patch: { -readonly [K in keyof GuardSwitches]?: GuardSwitches[K] } = {}
       for (const key of ['enabled', 'duplicateDetection', 'alternatingCycleDetection', 'noProgressProtection'] as const) {
         const value = change[key]
         if (value === undefined) continue
         if (typeof value !== 'boolean') throw new Error(`updateGuard: ${key} must be a boolean`)
-        next[key] = value
+        patch[key] = value
       }
       if (change.repeatThresholds !== undefined) {
         // Throws on anything but 1-5 strictly increasing integers in 2..50, so an
         // illegal list is rejected here instead of silently ignored by the detector
         // (which fails open and would look like "the setting does nothing").
-        next.repeatThresholds = normalizeRepeatThresholds(change.repeatThresholds, 'updateGuard: repeatThresholds')
+        patch.repeatThresholds = normalizeRepeatThresholds(change.repeatThresholds, 'updateGuard: repeatThresholds')
       }
+      if (Object.keys(patch).length === 0) return
       // Persist first: a disk failure must not leave the live process claiming a
       // switch the next reload would not honour.
       if (stateFile.length > 0) {
         try {
-          await writeGuardState(stateFile, next)
+          await writeGuardState(stateFile, patch)
         } catch (error) {
           throw new Error(`cannot persist Guard switches to ${stateFile}: ${String(error)}`)
         }
       }
-      guardSwitches = next
-      ctx.logger.info(`capability-policy: Guard switches updated: ${JSON.stringify(next)}`)
+      guardSwitches = { ...guardSwitches, ...patch }
+      ctx.logger.info(`capability-policy: Guard switches updated: ${JSON.stringify(patch)}`)
     },
     getGuardStats(): GuardStatsSnapshot {
       return processGuardStats.snapshot()

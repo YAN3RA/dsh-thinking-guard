@@ -50,7 +50,7 @@ export const CallIndexConfig: z<CallIndexRuntimeConfig> = z.object({
   queryTtlMs: z.number().min(1).max(300_000).default(60_000),
   queryMaxViews: z.number().min(1).max(16).default(4),
   queryMaxBytes: z.number().min(1024).max(64 * 1024 * 1024).default(8 * 1024 * 1024),
-  pageSize: z.number().min(1).max(250).default(128),
+  pageSize: z.number().min(1).max(250).default(250),
   maxBytes: z.number().min(1024).max(256 * 1024 * 1024).default(64 * 1024 * 1024),
   maxCalls: z.number().min(1).max(100_000).default(100_000),
   maxSessions: z.number().min(1).max(10_000).default(5_000),
@@ -316,27 +316,63 @@ export function installCallIndexRuntime(ctx: Context, config: CallIndexRuntimeCo
    * observed through the session/event subscription, and a scan is idempotent
    * on the Host, so a restart is the only thing that re-triggers it.
    */
-  const autoIndex = (): void => {
+  /**
+   * One automatic pass is not enough on a real corpus: `maxEventsPerRun`
+   * bounds how much a single run may read, so a large history finishes as
+   * `partial` with Sessions still pending. The previous implementation only
+   * ever ran ONE pass per mount, which is why a restarted Host could show
+   * "scanning" forever with the same pending count — nothing was going to
+   * resume it. Each follow-up pass is incremental and reuses the runtime's own
+   * single-flight guard, so this can never overlap a manual start.
+   */
+  const AUTO_ROUNDS_MAX = 500
+  let autoTimer: ReturnType<typeof setTimeout> | undefined
+  /** Progress guard: three rounds without a smaller backlog stop the loop. */
+  let lastPending = -1
+  let stagnantRounds = 0
+  const autoPass = (round: number): void => {
+    autoTimer = undefined
     if (disposed || config.autoIndex === false) return
     if (scopeMode() !== 'host-visible') return
+    if (round > AUTO_ROUNDS_MAX) return
     try {
-      const started = runtime.startIndex(config.autoIndexMode === 'full' ? { mode: 'full' } : undefined)
+      const started = runtime.startIndex(round === 0 && config.autoIndexMode === 'full' ? { mode: 'full' } : undefined)
       if (started.ok === false) {
         // Never silent: a refused automatic scan is the exact failure that made
         // the page show a permanent zero with no explanation.
         console.error('[capability-menu] callIndex auto-index refused:', started.reason)
+        return
       }
     } catch (error) {
       console.error('[capability-menu] callIndex auto-index failed:', error instanceof Error ? error.name : 'unknown')
+      return
     }
+    const pass = active
+    if (pass === undefined) return
+    void pass.then(() => {
+      if (disposed || config.autoIndex === false) return
+      let snapshot: ReturnType<typeof index.snapshot>
+      try { snapshot = index.snapshot(false) } catch { return }
+      if (snapshot.scope.status !== 'ready') return
+      if (snapshot.phase === 'cancelled' || snapshot.phase === 'failed') return
+      if (snapshot.pendingSessions <= 0) return
+      // A live session can stay "pending" without its history moving, so three
+      // rounds without a smaller backlog stop the loop instead of spinning.
+      stagnantRounds = snapshot.pendingSessions < lastPending ? 0 : stagnantRounds + 1
+      lastPending = snapshot.pendingSessions
+      if (stagnantRounds > 3) return
+      autoTimer = setTimeout(() => autoPass(round + 1), 250)
+    })
   }
 
   ctx.effect(() => {
     // Defer so the mount finishes and the scope controller has resolved; running
     // inside the effect body would race the first syncScope().
-    const timer = setTimeout(autoIndex, Math.max(0, config.autoIndexDelayMs ?? 1500))
+    const timer = setTimeout(() => autoPass(0), Math.max(0, config.autoIndexDelayMs ?? 1500))
     return () => {
       try { clearTimeout(timer) } catch { /* Teardown continues regardless. */ }
+      try { if (autoTimer !== undefined) clearTimeout(autoTimer) } catch { /* Teardown continues regardless. */ }
+      autoTimer = undefined
       void runtime.dispose()
     }
   })

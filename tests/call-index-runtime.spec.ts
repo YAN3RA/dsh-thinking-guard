@@ -119,6 +119,21 @@ describe('formal call-index Host runtime', () => {
     await h.dispose()
   })
 
+  // A real corpus is bigger than one run's event budget. Before this fix the
+  // automatic pass ran ONCE, so a `partial` scan stayed partial forever and the
+  // page kept saying "scanning" with a frozen pending count.
+  it('keeps scanning until the backlog is drained when one run hits maxEventsPerRun', async () => {
+    const h = host(), f = fixture()
+    f.add()
+    f.add()
+    h.services.set('sessionPersistence', f.backend)
+    installCallIndexRuntime(h.ctx, { maxEventsPerRun: 2 }, h.options)
+    // Each follow-up pass opens the Session again; one pass would call it once.
+    await vi.waitFor(() => {
+      expect((f.backend.open as unknown as { mock: { calls: unknown[] } }).mock.calls.length).toBeGreaterThanOrEqual(2)
+    }, { timeout: 8000 })
+    await h.dispose()
+  })
   it('leaves history alone when autoIndex is turned off', async () => {
     const h = host(), f = fixture()
     h.services.set('sessionPersistence', f.backend)

@@ -28,7 +28,8 @@
  *
  * @module dsh-thinking-guard/client/call-index
  */
-import { createElement, useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
+import { createElement, useCallback, useEffect, useRef, useState, type ReactElement, type ReactNode } from 'react'
+import { V3Styles } from './v3-ui.ts'
 import { Button, Pill } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import {
@@ -1019,16 +1020,192 @@ function CallIndexStyles(): ReactElement {
     + '.mc-ci-metric-label{font-size:11px;opacity:.7}'
     + '.mc-ci-metric-value{font-size:18px;font-variant-numeric:tabular-nums}'
     + '.mc-ci-metric-hint{font-size:11px;opacity:.75}'
-    + '.mc-ci-trend svg{width:100%;max-width:640px;height:auto}',
+    + '.mc-ci-trend svg{width:100%;max-width:640px;height:auto}'
+    // ---- v3 page-specific classes (container/breakpoints live in V3Styles) ----
+    + '.v3-status-pills{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:12px}'
+    + '.v3-statusline.v3-status-dash{border-style:dashed;color:var(--v3-t4)}'
+    + '.v3-filtercard{padding:11px 14px 13px}'
+    + '.v3-filter-row{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:9px}'
+    + '.v3-search{display:flex;align-items:center;gap:6px;height:26px;padding:0 8px;border:1px solid var(--v3-line);border-radius:var(--v3-r-sm);background:var(--v3-panel-2);min-width:150px;flex:1 1 150px}'
+    + '.v3-search input{border:0;background:transparent;color:var(--v3-t1);font:inherit;font-size:12px;width:100%;outline:0;min-width:0}'
+    + '.v3-search input::placeholder{color:var(--v3-t4)}'
+    + '.v3-kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}'
+    + '.v3-kv-l{font-size:11px;color:var(--v3-t4)}'
+    + '.v3-kv-v{font-size:12px;color:var(--v3-t2);margin-top:2px;overflow-wrap:anywhere}'
+    + '.v3-ts.v3-ts--h330{max-height:330px}'
+    + '.v3-src i[data-zero="true"]{background:var(--v3-panel-2)}',
   )
 }
 
-/** Small label + value cell used by both pages. */
-function Metric(label: string, value: string, hint?: string): ReactElement {
-  return createElement('div', { className: 'mc-ci-metric', 'data-call-index-metric': label },
-    createElement('div', { className: 'mc-ci-metric-label' }, label),
-    createElement('div', { className: 'mc-ci-metric-value mc-ci-num' }, value),
-    hint === undefined ? null : createElement('div', { className: 'mc-ci-metric-hint' }, hint),
+/** One v3 `.v3-stat` cell: label, big value, optional hint line, optional sparkline. */
+function V3Stat(props: {
+  readonly label: string
+  readonly value: ReactNode
+  readonly hint?: ReactNode
+  readonly spark?: ReactNode
+}): ReactElement {
+  return createElement('div', { className: 'v3-stat', 'data-call-index-metric': props.label },
+    createElement('div', { className: 'v3-stat-l' }, props.label),
+    createElement('div', { className: 'v3-stat-v v3-num' }, props.value),
+    props.hint === undefined ? null : createElement('div', { className: 'v3-stat-d' }, props.hint),
+    props.spark ?? null,
+  )
+}
+
+/** Values → `x,y` points inside a 100×22 viewBox, baselined at 0. */
+function sparkPoints(values: readonly number[]): { readonly line: string; readonly area: string } {
+  const W = 100, H = 22
+  const max = values.reduce((m, v) => Math.max(m, v), 0)
+  const scale = max > 0 ? max : 1
+  const xAt = (i: number): number => (values.length <= 1 ? W / 2 : (i * W) / (values.length - 1))
+  const yAt = (v: number): number => H - 2 - (v / scale) * (H - 4)
+  const pts = values.map((v, i) => `${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`)
+  return { line: pts.join(' '), area: `0,${H} ${pts.join(' ')} ${W},${H}` }
+}
+
+/** 22px trend sparkline: a line plus a translucent area fill, coloured by tone. */
+function Sparkline(props: {
+  readonly values: readonly number[]
+  readonly tone: 'info' | 'ok' | 'bad'
+}): ReactElement | null {
+  if (props.values.length < 2) return null
+  const points = sparkPoints(props.values)
+  const colour = props.tone === 'ok' ? 'var(--v3-ok)' : props.tone === 'bad' ? 'var(--v3-bad)' : 'var(--v3-info)'
+  return createElement('svg', {
+    className: 'v3-spark', viewBox: '0 0 100 22', preserveAspectRatio: 'none', 'aria-hidden': 'true',
+    'data-call-index-spark': props.tone,
+  },
+  createElement('polygon', { className: 'v3-spark-fl', points: points.area, fill: colour }),
+  createElement('polyline', { className: 'v3-spark-ln', points: points.line, stroke: colour }),
+  )
+}
+
+/** `server · tool` for an `mcp__` name, otherwise the bare tool name. */
+function toolDisplayLabel(toolName: string): string {
+  if (toolName.startsWith('mcp__')) {
+    const parts = toolName.split('__')
+    return parts.length >= 3 ? `${parts[1]} · ${parts.slice(2).join('__')}` : toolName
+  }
+  return toolName
+}
+
+/**
+ * The v3 overview trend: a 720×212 line + area (calls), failure底柱 (error), a
+ * dashed "recent week" band and a peak label. Drawn from `callIndexTrend`'s bars
+ * so its numbers are the same ones the caption quotes — no second data path.
+ */
+function OverviewTrendSvg(props: { readonly chart: CallIndexTrendChart }): ReactElement {
+  const { chart } = props
+  const W = 720, H = 212, padL = 34, padR = 10, padT = 12, padB = 26
+  const plotW = W - padL - padR
+  const plotH = H - padT - padB
+  const bars = chart.bars
+  const n = bars.length
+  const maxV = chart.maxCalls > 0 ? Math.ceil(chart.maxCalls / 10) * 10 : 1
+  const xAt = (i: number): number => padL + (n <= 1 ? plotW / 2 : (i * plotW) / (n - 1))
+  const yAt = (v: number): number => padT + plotH - (v / maxV) * plotH
+  const points = bars.map((bar, i) => `${xAt(i).toFixed(1)},${yAt(bar.calls).toFixed(1)}`)
+  let peak = 0
+  for (let i = 1; i < n; i++) if (bars[i]!.calls > bars[peak]!.calls) peak = i
+  const children: ReactNode[] = []
+  if (n > 0) {
+    const start = Math.max(0, n - 7)
+    const slot = n > 1 ? plotW / (n - 1) : plotW
+    const left = Math.max(padL, xAt(start) - slot / 2)
+    const right = Math.min(W - padR, xAt(n - 1) + slot / 2)
+    children.push(createElement('rect', {
+      key: 'hl', className: 'v3-hlbox', x: left.toFixed(1), y: padT,
+      width: Math.max(0, right - left).toFixed(1), height: plotH.toFixed(1), rx: 4,
+    }))
+  }
+  for (let g = 0; g <= 4; g++) {
+    const value = (maxV * g) / 4
+    const y = yAt(value)
+    children.push(createElement('line', { key: `grid-${g}`, className: 'v3-grid', x1: padL, y1: y.toFixed(1), x2: W - padR, y2: y.toFixed(1) }))
+    children.push(createElement('text', { key: `tick-${g}`, className: 'v3-axis', x: padL - 7, y: (y + 3.5).toFixed(1), 'text-anchor': 'end' }, String(Math.round(value))))
+  }
+  const barWidth = Math.max(4, plotW / Math.max(1, n) - 8)
+  bars.forEach((bar, i) => {
+    if (bar.error <= 0) return
+    const errH = Math.max(2.5, (bar.error / maxV) * plotH)
+    children.push(createElement('rect', {
+      key: `err-${bar.day}`, className: 'v3-bar-er', x: (xAt(i) - barWidth / 2).toFixed(1),
+      y: (padT + plotH - errH).toFixed(1), width: barWidth.toFixed(1), height: errH.toFixed(1), rx: 1.5,
+    }, createElement('title', null, `${bar.day}：失败 ${bar.error} 次`)))
+  })
+  children.push(createElement('polygon', { key: 'area', className: 'v3-area', points: `${padL},${padT + plotH} ${points.join(' ')} ${W - padR},${padT + plotH}` }))
+  children.push(createElement('polyline', { key: 'line', className: 'v3-line', points: points.join(' ') }))
+  bars.forEach((bar, i) => {
+    if (i % 4 !== 0 && i !== n - 1 && i !== peak) return
+    children.push(createElement('circle', {
+      key: `pt-${bar.day}`, className: 'v3-pt', cx: xAt(i).toFixed(1), cy: yAt(bar.calls).toFixed(1), r: 2.6,
+    }, createElement('title', null, `${bar.day}：${bar.calls} 次调用，失败 ${bar.error} 次`)))
+  })
+  if (n > 0) {
+    children.push(createElement('text', { key: 'peak', className: 'v3-lbl-b', x: (xAt(peak) - 8).toFixed(1), y: (yAt(bars[peak]!.calls) - 9).toFixed(1), 'text-anchor': 'end' }, `峰值 ${bars[peak]!.calls}`))
+    for (let m = 0; m < n; m += 5) children.push(createElement('text', { key: `xl-${m}`, className: 'v3-axis', x: xAt(m).toFixed(1), y: H - 8, 'text-anchor': 'middle' }, bars[m]!.day.slice(5)))
+    children.push(createElement('text', { key: 'xl-last', className: 'v3-axis', x: W - padR, y: H - 8, 'text-anchor': 'end' }, bars[n - 1]!.day.slice(5)))
+  }
+  return createElement('svg', {
+    className: 'v3-chart', viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', role: 'img',
+    'aria-label': `每日调用与失败数：${n} 天，峰值 ${chart.maxCalls} 次`, 'data-call-index-svg': 'trend',
+  }, ...children)
+}
+
+/** 来源构成: a one-segment donut (未解析) + five-source list + an honesty note. */
+function OverviewSourcePanel(props: {
+  readonly bySource?: CallIndexSourceCounts
+  readonly totalExact?: boolean
+}): ReactElement {
+  if (props.bySource === undefined) {
+    return createElement('div', { className: 'v3-panel' },
+      createElement('div', { className: 'v3-ph' }, createElement('span', { className: 'v3-pt' }, '来源构成')),
+      createElement('p', { className: 'v3-hint', 'data-call-index-missing': 'by-source' }, 'Host 未返回来源分布（bySource）；这不是「全部为 0」。'),
+    )
+  }
+  const data = callIndexSourceData(props.bySource)
+  const total = data.reduce((sum, item) => sum + item.count, 0)
+  const unknownCount = data.find(item => item.kind === 'unknown')?.count ?? 0
+  const share = total > 0 ? unknownCount / total : 0
+  const percent = Math.round(share * 100)
+  const radius = 43
+  const circumference = 2 * Math.PI * radius
+  const segment = share * circumference
+  const allUnresolved = total > 0 && unknownCount === total
+  return createElement('div', { className: 'v3-panel' },
+    createElement('div', { className: 'v3-ph' },
+      createElement('span', { className: 'v3-pt' }, '来源构成'),
+      createElement('span', { className: 'v3-pn' }, `${formatCallIndexCount(total, props.totalExact)} 次`),
+    ),
+    createElement('div', { className: 'v3-donut-wrap' },
+      createElement('div', { className: 'v3-donut' },
+        createElement('svg', { viewBox: '0 0 104 104', 'aria-hidden': 'true' },
+          createElement('circle', { className: 'v3-trk', cx: 52, cy: 52, r: radius }),
+          createElement('circle', {
+            className: 'v3-seg', cx: 52, cy: 52, r: radius, 'data-seg': 'unknown',
+            strokeDasharray: `${segment.toFixed(1)} ${(circumference - segment).toFixed(1)}`, strokeDashoffset: 0,
+          }),
+        ),
+        createElement('div', { className: 'v3-mid' },
+          createElement('b', { className: 'v3-num' }, `${percent}%`),
+          createElement('span', null, '未解析'),
+        ),
+      ),
+      createElement('div', { className: 'v3-src-list' },
+        ...data.map(item => createElement('div', { key: item.kind, className: 'v3-src', 'data-source-row': item.kind },
+          createElement('i', item.count === 0 ? { 'data-zero': 'true' } : {}),
+          createElement('span', { className: 'v3-nm' }, item.label),
+          createElement('b', null, formatCallIndexCount(item.count, props.totalExact)),
+          createElement('em', null, total > 0 ? `${Math.round(item.share * 100)}%` : '0%'),
+        )),
+      ),
+    ),
+    createElement('p', { className: 'v3-src-note' },
+      allUnresolved
+        ? `Host 无法证明插件 owner，非 mcp__ 前缀的调用也不带归属证据，所以 ${formatCallIndexCount(total, props.totalExact)} 次调用全部落在「来源未解析」——这是当前唯一真实的分布形态，不是抽样。`
+        : 'Host 无法证明插件 owner，非 mcp__ 前缀的调用也不带归属证据；未解析出归属的调用单列为「来源未解析」，其余按 Host 能证明的 kind 归类。',
+      createElement('b', { style: { color: 'var(--v3-t3)' } }, ' 0 在这里不等于未使用'),
+    ),
   )
 }
 
@@ -1465,33 +1642,67 @@ export function callIndexToolRows(page: CallIndexCallPageView | undefined): Call
     .sort((a, b) => b.calls - a.calls || a.toolName.localeCompare(b.toolName))
 }
 
-function CallIndexCallTable(props: {
-  readonly page: CallIndexCallPageView
-  readonly selected?: { readonly sessionId: string; readonly callSeq: number }
-  readonly onSelect?: (row: CallIndexCallRow) => void
+/** Short source marker for the tool cell: MCP / 技能 / 插件 / 来源未解析. */
+function sourceNoteForKind(kind: CallIndexSourceKind): string | undefined {
+  switch (kind) {
+    case 'mcp': return 'MCP'
+    case 'skill': return '技能'
+    case 'plugin-tool': return '插件'
+    case 'unknown': return '来源未解析'
+    default: return undefined
+  }
+}
+
+/**
+ * The v3 "完整工具表": one sticky-header row per TOOL, inside a bounded
+ * `.v3-ts` scroller (330px here — the two charts above it already tell the big
+ * picture). Takes pre-computed rows so the same filtered set feeds the charts.
+ */
+function CallIndexToolTable(props: {
+  readonly rows: readonly CallIndexToolRow[]
 }): ReactElement {
-  const { page } = props
-  const rows = callIndexToolRows(page)
-  // One line per tool: 时间 / 工具 / 来源 / 成功 / 失败 / 平均耗时.
-  const header = ['时间', '工具', '来源', '成功', '失败', '平均耗时']
-  return createElement('div', { className: 'mc-ci-table-scroll' },
-    createElement('table', { className: 'mc-ci-table', 'data-call-index-table': 'tools' },
-    createElement('thead', null, createElement('tr', null,
-      ...header.map(title => createElement('th', { key: title, scope: 'col' }, title)))),
-    createElement('tbody', null,
-      ...rows.map(row => createElement('tr', {
-        key: row.toolName + '::' + row.sourceKind,
-        'data-call-index-tool': row.toolName,
-      },
-      createElement('td', { className: 'mc-ci-num' }, formatCallIndexTime(row.lastAt)),
-      createElement('td', { title: row.toolName }, row.toolName),
-      // `unknown` renders as 来源未解析 — the wire cannot prove the real source.
-      createElement('td', null, CALL_INDEX_SOURCE_LABELS[row.sourceKind]),
-      createElement('td', { className: 'mc-ci-num' }, String(row.success)),
-      createElement('td', { className: 'mc-ci-num' }, String(row.error)),
-      createElement('td', { className: 'mc-ci-num' }, formatCallIndexDuration(row.averageDurationMs)),
-      ))),
-  ))
+  const header: ReadonlyArray<{ readonly label: string; readonly right: boolean }> = [
+    { label: '工具', right: false },
+    { label: '调用', right: true },
+    { label: '失败', right: true },
+    { label: '成功率', right: true },
+    { label: '平均耗时', right: true },
+    { label: '最近调用', right: true },
+  ]
+  return createElement('div', { className: 'v3-ts v3-ts--h330' },
+    createElement('table', { className: 'v3-table', 'data-call-index-table': 'tools' },
+      createElement('thead', null, createElement('tr', null,
+        ...header.map(col => createElement('th', { key: col.label, scope: 'col', ...(col.right ? { className: 'v3-r' } : {}) }, col.label)),
+      )),
+      createElement('tbody', null,
+        ...props.rows.map(row => {
+          const known = row.success + row.error
+          const rate = known > 0 ? row.success / known : undefined
+          const bad = row.error > 0 && row.error / row.calls >= 0.2
+          const note = sourceNoteForKind(row.sourceKind)
+          const server = row.toolName.startsWith('mcp__') ? row.toolName.split('__')[1] : undefined
+          const shortName = row.sourceKind === 'mcp' && row.toolName.startsWith('mcp__')
+            ? row.toolName.split('__').slice(2).join('__')
+            : row.toolName
+          return createElement('tr', { key: row.toolName + '::' + row.sourceKind, 'data-call-index-tool': row.toolName },
+            createElement('td', null, createElement('div', { className: 'v3-c-tool' },
+              note === undefined ? null : createElement('span', { className: 'v3-srcnote' }, note),
+              createElement('span', { className: 'v3-nm', title: row.toolName }, shortName),
+              server === undefined ? null : createElement('span', { className: 'v3-srv' }, server),
+            )),
+            createElement('td', { className: 'v3-r' }, String(row.calls)),
+            createElement('td', { className: 'v3-r' }, String(row.error)),
+            createElement('td', { className: 'v3-r' }, createElement('span', { className: 'v3-rt' },
+              createElement('span', { className: 'v3-tk' }, createElement('span', { className: 'v3-fl', ...(bad ? { 'data-bad': 'true' } : {}), style: { width: `${Math.round((rate ?? 0) * 100)}%` } })),
+              createElement('b', null, formatCallIndexRate(rate)),
+            )),
+            createElement('td', { className: 'v3-r' }, formatCallIndexDuration(row.averageDurationMs)),
+            createElement('td', { className: 'v3-r' }, formatCallIndexTime(row.lastAt)),
+          )
+        }),
+      ),
+    ),
+  )
 }
 
 /**
@@ -1549,6 +1760,13 @@ export interface CallIndexDetailPanelViewProps {
   readonly onResolveScope?: (() => CallIndexScopeTarget) | undefined
   /** Session names + the switchable list for 按会话. */
   readonly catalog?: CallIndexSessionCatalog | undefined
+  /**
+   * Tool-name search inside the detail card. A local client-side filter over the
+   * already-fetched per-tool rows — NOT a wire field, so it never narrows the
+   * query the Host sees.
+   */
+  readonly search?: string
+  readonly onSearchChange?: (value: string) => void
   /** Deprecated: the panel refreshes itself while scanning (D-031). */
   readonly onRefresh?: () => void
   /** Deprecated: indexing is automatic (D-031). */
@@ -1579,6 +1797,7 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
     loading, loadingMore, failure, onQueryChange, onResolveScope, catalog,
     moreFailure,
     startFailure, startTask,
+    search, onSearchChange,
   } = props
   const state = callIndexDetailState({
     status,
@@ -1591,13 +1810,15 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
   const totalText = page === undefined
     ? undefined
     : formatCallIndexCount(page.total ?? page.summary.total, page.totalExact)
-  const activity = loading === true
-    ? page === undefined ? '正在读取…' : '正在刷新…'
-    : page === undefined ? '尚未读取' : `快照代 ${page.generation}`
-  // There is no manual trigger any more (D-031), so the page never has to
-  // explain a disabled button. What it must still explain is WHY the index is
-  // empty: a status that never arrived, or a scope that is not ready. Those are
-  // config/wiring facts the operator can act on, so they stay visible.
+  const coverageLabel = page === undefined ? undefined : COVERAGE_LABELS[page.coverage]
+  const scanning = status !== undefined
+    && (status.phase === 'running' || (status.sessions?.pending ?? 0) > 0 || (status.sessions?.pendingLive ?? 0) > 0)
+  // The status pill states the snapshot + coverage + how rows are folded — the
+  // three facts the table's own numbers depend on. It replaces the old title row.
+  const statusText = page === undefined
+    ? (loading === true ? '正在读取调用明细…' : '尚未读取调用明细')
+    : `快照代 ${page.generation} · 覆盖 ${coverageLabel ?? '未知'} · 按工具聚合`
+
   // Rates come from the page's own summary, so they describe exactly what the
   // table below shows. `page.summary` is the wire's outcome breakdown.
   const rates = callIndexRates(page?.summary)
@@ -1607,14 +1828,42 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
   const rateHint = (stats: CallIndexRate | undefined): string => stats === undefined
     ? '没有已知结果的调用，无法计算比例'
     : `${stats.numerator} / ${stats.denominator} 次已知结果`
-  // 建议 = what deserves a second look: unresolved pairs and errors.
+  // 需要关注 = what deserves a second look: unresolved pairs and errors.
   const suggestionCount = page === undefined
     ? undefined
     : (page.summary.unresolved ?? 0) + page.summary.error
-  const suggestionText = (): string => suggestionCount === undefined ? '—' : String(suggestionCount)
   const suggestionHint = (): string => page === undefined
     ? '尚未读取'
     : `失败 ${page.summary.error} + 未配对 ${page.summary.unresolved ?? 0}；未配对表示没有捕获到结果，不等于失败`
+
+  // One row per TOOL: the same filtered set feeds the two charts and the table.
+  const allRows = page === undefined ? [] : callIndexToolRows(page)
+  const term = (search ?? '').trim().toLowerCase()
+  const rows = term === '' ? allRows : allRows.filter(row => row.toolName.toLowerCase().includes(term))
+
+  // 平均耗时: mean over calls that reported a duration; never a fabricated zero.
+  const durations = page === undefined
+    ? []
+    : page.items.map(item => item.durationMs).filter((ms): ms is number => ms !== undefined && Number.isFinite(ms))
+  const averageDuration = durations.length > 0 ? durations.reduce((sum, ms) => sum + ms, 0) / durations.length : undefined
+
+  const rankRows = rows.slice(0, 12)
+  const rankMax = rankRows.length > 0 ? rankRows[0]!.calls : 1
+  const failingRows = rows.filter(row => row.error > 0).slice().sort((a, b) => b.error - a.error)
+  const failMax = failingRows.length > 0 ? failingRows[0]!.error : 1
+
+  const searchInput = createElement('label', { className: 'v3-search' },
+    createElement('svg', { width: 12, height: 12, viewBox: '0 0 14 14', fill: 'none', 'aria-hidden': 'true', style: { color: 'var(--v3-t4)', flex: 'none' } },
+      createElement('circle', { cx: 6.2, cy: 6.2, r: 4.4, stroke: 'currentColor', 'stroke-width': 1.3 }),
+      createElement('path', { d: 'm9.6 9.6 3 3', stroke: 'currentColor', 'stroke-width': 1.3, 'stroke-linecap': 'round' }),
+    ),
+    createElement('input', onSearchChange === undefined
+      ? { type: 'search', placeholder: '筛选工具名…', 'aria-label': '筛选工具名', defaultValue: search ?? '', 'data-call-index-search': 'true' }
+      : {
+          type: 'search', placeholder: '筛选工具名…', 'aria-label': '筛选工具名', value: search ?? '', 'data-call-index-search': 'true',
+          onChange: (event: { target: { value: string } }) => onSearchChange(event.target.value),
+        }),
+  )
 
   const indexBlockedReason = status === undefined
     ? '尚未收到索引状态，无法判断索引进度（Host 未应答或回复被拒绝）'
@@ -1622,47 +1871,53 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
       ? '索引范围未启用，插件不会自动索引历史会话'
       : undefined
 
-  return createElement('section', { className: 'mc-section', 'aria-label': '调用明细', 'aria-busy': loading === true },
+  return createElement('section', { className: 'v3-root mc-section', 'aria-label': '调用明细', 'aria-busy': loading === true },
     CallIndexStyles(),
-    createElement('header', { className: 'mc-heading-row' },
-      createElement('div', { className: 'mc-heading-meta' },
-        createElement('h2', { className: 'mc-heading' }, '调用明细'),
-        createElement('span', { className: 'mc-version' }, activity),
-      ),
-      // No action buttons: indexing is automatic (D-031) and the panel re-reads
-      // itself while a scan is running, so there is nothing left to press.
-      null,
+    V3Styles(),
+    // status pills: snapshot/coverage/aggregation + the "N tools · M calls" figure
+    createElement('div', { className: 'v3-status-pills' },
+      createElement('span', { className: 'v3-statusline', ...(state.kind === 'failure' || state.kind === 'disconnected' ? { 'data-tone': 'bad' } : {}) },
+        createElement('span', {
+          className: 'v3-dot',
+          'data-tone': state.kind === 'failure' || state.kind === 'disconnected' ? 'bad' : scanning ? 'run' : 'ok',
+          'aria-hidden': 'true',
+        }),
+        statusText),
+      createElement('span', { className: 'v3-statusline v3-status-dash' },
+        `${rows.length} 个工具 · ${rows.reduce((sum, row) => sum + row.calls, 0)} 次调用`),
     ),
-    createElement('p', { className: 'mc-desc' },
-      '按工具调用记录会话内的每一次调用；只统计调用次数与元数据，不代表 Token 数，也不包含参数与返回值。'),
-    indexBlockedReason === undefined ? null : createElement('p', {
-      className: 'mc-desc',
-      'data-call-index-note': 'index-blocked',
-      role: 'status',
-    }, `自动索引不可用：${indexBlockedReason}`),
-    CallIndexFilters({
-      query,
-      ...(onQueryChange === undefined ? {} : { onChange: onQueryChange }),
-      ...(onResolveScope === undefined ? {} : { onResolveScope }),
-      ...(catalog === undefined ? {} : { catalog }),
-    }),
-    CallIndexScanBar({ ...(status === undefined ? {} : { status }) }),
+    // filter card: three scopes + search + bind hint + scan progress
+    createElement('div', { className: 'v3-panel v3-filtercard' },
+      createElement('div', { className: 'v3-filter-row' },
+        CallIndexFilters({
+          query,
+          ...(onQueryChange === undefined ? {} : { onChange: onQueryChange }),
+          ...(onResolveScope === undefined ? {} : { onResolveScope }),
+          ...(catalog === undefined ? {} : { catalog }),
+        }),
+        searchInput,
+      ),
+      CallIndexScanBar({ ...(status === undefined ? {} : { status }) }),
+    ),
     createElement(StateNotice, { state, ...(failure === undefined ? {} : { failure }) }),
     // Indexing is automatic, so the operator no longer presses a button whose
     // failure could go unseen. What still must be visible is whether that
     // automatic pass ran and what it did — otherwise a refused or failed scan
     // looks exactly like an empty corpus.
     startFailure === undefined ? null : createElement('p', {
-      className: 'mc-desc',
+      className: 'v3-hint',
       'data-call-index-note': 'start-failure',
       role: 'status',
     }, `自动索引失败：${callIndexFailureText(startFailure)}`),
     startTask === undefined ? null : createElement('p', {
-      className: 'mc-desc',
+      className: 'v3-hint',
       'data-call-index-note': 'start-task',
     }, `自动索引：${startTask.phase}${startTask.mode === 'full' ? '（全量）' : '（增量）'} · 任务 ${startTask.taskId.slice(0, 8)}`),
-    // The multi-line coverage block is gone (operator request). Only real
-    // problems remain, in the shared red box.
+    indexBlockedReason === undefined ? null : createElement('p', {
+      className: 'v3-hint',
+      'data-call-index-note': 'index-blocked',
+      role: 'status',
+    }, `自动索引不可用：${indexBlockedReason}`),
     CallIndexDiagnostics({
       ...(status === undefined ? {} : { status }),
       ...(page === undefined ? {} : { page }),
@@ -1670,52 +1925,95 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
       ...(startFailure === undefined ? {} : { startFailure }),
       ...(moreFailure === undefined ? {} : { moreFailure }),
     }),
-    // One block of numbers, not two.
-    //
-    // This used to print 「本页合计 / 成功 / 失败 / 未配对结果」 here AND
-    // 「总调用 / 失败·未完成 / …」 in the overview, both in raw counts. The
-    // operator asked for RATES (成功率 / 失败率) once, clearly, so the page now
-    // shows a percentage with the counts as a sub-line instead of four unrelated
-    // integers that have to be divided by hand.
-    createElement('div', { className: 'mc-ci-summary', 'data-call-index-summary': 'rates' },
-      Metric('成功率', rateText(successStats?.rate),
-        `${rateHint(successStats)}${totalText === undefined ? '' : ` · 本页合计 ${totalText}`}`),
-      Metric('失败率', rateText(failureStats?.rate), rateHint(failureStats)),
-      Metric('建议', suggestionText(), suggestionHint()),
+    // Four stats (v3 adds 平均耗时 as the fourth). Counts sit under the rates so a
+    // percentage never floats without its denominator.
+    createElement('div', { className: 'v3-stats', 'data-call-index-summary': 'rates' },
+      V3Stat({
+        label: '成功率',
+        value: rateText(successStats?.rate),
+        hint: totalText === undefined ? rateHint(successStats) : `${rateHint(successStats)} · 本页合计 ${totalText}`,
+      }),
+      V3Stat({ label: '失败率', value: rateText(failureStats?.rate), hint: rateHint(failureStats) }),
+      V3Stat({ label: '需要关注', value: suggestionCount === undefined ? '—' : String(suggestionCount), hint: suggestionHint() }),
+      V3Stat({ label: '平均耗时', value: formatCallIndexDuration(averageDuration), hint: '按有耗时的调用平均' }),
     ),
     page !== undefined && page.droppedItems > 0
-      ? createElement('p', { className: 'mc-desc', 'data-call-index-note': 'dropped' },
+      ? createElement('p', { className: 'v3-hint', 'data-call-index-note': 'dropped', style: { marginTop: 8 } },
           `本页有 ${page.droppedItems} 行未通过白名单投影（字段不合法），已丢弃，未计入合计。`)
       : null,
-    // The per-call detail pane is gone with the per-call table: a row now
-    // represents a TOOL, so "open this row's single call" has no meaning. That
-    // also removes the popup the operator saw flash open and close.
-    createElement('div', null,
-      createElement('div', { style: { minWidth: 0 } },
-        page !== undefined && page.items.length > 0
-          ? createElement(CallIndexCallTable, { page })
-          : null,
-        // Every tool row is on the page; the box above scrolls instead of the
-        // page growing. 「加载更多」 is still requested in the background when the
-        // wire returned a cursor — it now feeds the table rather than gating a
-        // button the operator had to find and press.
-        page?.nextCursor !== undefined && loadingMore === true
-          ? createElement('p', { className: 'mc-desc', 'data-call-index-note': 'loading-more' },
-              '正在加载其余工具…')
-          : null,
-        // A silent failure is indistinguishable from a broken feature, which is
-        // exactly how paging was reported before. Keep it visible.
-        moreFailure === undefined ? null : createElement('p', {
-          className: 'mc-desc',
-          'data-call-index-note': 'more-failure',
-          role: 'status',
-        }, `加载失败：${callIndexFailureText(moreFailure)}`),
+    // two-column charts: volume distribution (left) vs failure concentration (right)
+    createElement('div', { className: 'v3-board', style: { marginTop: 12 } },
+      createElement('div', { className: 'v3-panel' },
+        createElement('div', { className: 'v3-ph' },
+          createElement('span', { className: 'v3-pt' }, '调用量分布（本范围工具）'),
+          createElement('span', { className: 'v3-pn' }, term === '' ? '前 12 名' : '筛选结果'),
+        ),
+        rankRows.length === 0
+          ? createElement('p', { className: 'v3-hint' }, term === '' ? '当前范围没有工具调用。' : '没有匹配的工具。')
+          : createElement('div', { className: 'v3-rank' },
+              ...rankRows.map(row => {
+                const bad = row.error > 0 && row.error / row.calls >= 0.2
+                return createElement('div', { key: row.toolName + '::' + row.sourceKind, className: 'v3-rank-row', title: row.toolName },
+                  createElement('span', { className: 'v3-nm' }, toolDisplayLabel(row.toolName)),
+                  createElement('span', { className: 'v3-bar' }, createElement('span', {
+                    ...(bad ? { 'data-bad': 'true' } : {}),
+                    style: { width: `${Math.max(3, Math.round((row.calls / rankMax) * 100))}%` },
+                  })),
+                  createElement('span', { className: 'v3-n' }, String(row.calls)),
+                )
+              })),
+        createElement('p', { className: 'v3-hint', style: { marginTop: 9 } },
+          '条长 = 调用量，按最大值归一；失败率 ≥ 20% 的条变红。'),
       ),
-      // The detail surface used to be a permanently mounted 240px aside. With
-      // the table's own columns that overflowed the panel, so the two blocks
-      // painted over each other. It now appears only when a row is selected,
-      // and flexWrap lets it drop below the table instead of squeezing it.
+      createElement('div', { className: 'v3-panel' },
+        createElement('div', { className: 'v3-ph' },
+          createElement('span', { className: 'v3-pt' }, '失败与耗时'),
+          createElement('span', { className: 'v3-pn' }, '按失败数排序'),
+        ),
+        failingRows.length === 0
+          ? createElement('p', { className: 'v3-hint' }, '当前范围没有失败调用。')
+          : createElement('div', { className: 'v3-rank' },
+              ...failingRows.slice(0, 8).map(row => {
+                const perTool = Math.round((row.error / row.calls) * 100)
+                return createElement('div', { key: 'fail-' + row.toolName + '::' + row.sourceKind, className: 'v3-rank-row', title: row.toolName },
+                  createElement('span', { className: 'v3-nm' }, toolDisplayLabel(row.toolName)),
+                  createElement('span', { className: 'v3-bar' }, createElement('span', {
+                    'data-bad': 'true',
+                    style: { width: `${Math.max(4, Math.round((row.error / failMax) * 100))}%` },
+                  })),
+                  createElement('span', { className: 'v3-n', style: { color: 'var(--v3-bad)', fontWeight: 600 } }, `${row.error} 次`),
+                  createElement('span', { className: 'v3-e', 'data-bad': 'true' }, `占该工具 ${perTool}%`),
+                )
+              })),
+        createElement('p', { className: 'v3-hint', style: { marginTop: 9 } },
+          `条长 = 失败次数（不是失败率）。共 ${failingRows.length} 个工具出现过失败。`),
+      ),
     ),
+    // full tool table, demoted to an appendix: bounded 330px scroller, sticky head
+    createElement('div', { className: 'v3-panel', style: { marginTop: 12 } },
+      createElement('div', { className: 'v3-ph' },
+        createElement('span', { className: 'v3-pt' }, '完整工具表'),
+        createElement('span', { className: 'v3-pn' }, `${rows.length} 行 · 表内滚动`),
+      ),
+      createElement(CallIndexToolTable, { rows }),
+      createElement('div', { className: 'v3-tfoot' },
+        createElement('span', null, `${rows.length} 个工具 · 表内滚动`),
+        page === undefined ? null : createElement('span', { style: { marginLeft: 'auto' } },
+          `快照代 ${page.generation} · 覆盖 ${coverageLabel ?? '未知'}`),
+      ),
+    ),
+    // Every tool row is on the page; the box above scrolls instead of the page
+    // growing. A cursor still feeds it in the background — no button to find.
+    page?.nextCursor !== undefined && loadingMore === true
+      ? createElement('p', { className: 'v3-hint', 'data-call-index-note': 'loading-more', style: { marginTop: 8 } },
+          '正在加载其余工具…')
+      : null,
+    moreFailure === undefined ? null : createElement('p', {
+      className: 'v3-hint',
+      'data-call-index-note': 'more-failure',
+      role: 'status',
+      style: { marginTop: 8 },
+    }, `加载失败：${callIndexFailureText(moreFailure)}`),
   )
 }
 
@@ -1725,11 +2023,20 @@ export interface CallIndexOverviewPanelViewProps {
   readonly loading?: boolean
   readonly failure?: CallIndexPanelFailure
   readonly onRefresh?: () => void
+  /**
+   * Per-tool rows. The overview reply (getSummary) carries only summary +
+   * aggregates — no per-tool counts — so the ranking and fault panels need a
+   * `listCalls` read the container performs. `undefined` means "not read yet":
+   * an honest empty state is rendered, never zeros.
+   */
+  readonly tools?: readonly CallIndexToolRow[]
+  readonly toolsLoading?: boolean
+  readonly toolsFailure?: CallIndexPanelFailure
 }
 
-/** Pure view for 总览. */
+/** Pure view for 总览 (v3 看板). */
 export function CallIndexOverviewPanelView(props: CallIndexOverviewPanelViewProps): ReactElement {
-  const { status, overview, loading, failure, onRefresh } = props
+  const { status, overview, loading, failure, onRefresh, tools, toolsLoading, toolsFailure } = props
   const metrics = callIndexOverviewMetrics(overview, status)
   const rangeLabel = callIndexRangeLabel(CALL_INDEX_OVERVIEW_RANGE)
   const exact = metrics.callsTotalExact
@@ -1742,16 +2049,73 @@ export function CallIndexOverviewPanelView(props: CallIndexOverviewPanelViewProp
       ? `与 Host 断连：${callIndexFailureText(failure)}${failure.hostCode === undefined ? '' : `（${failure.hostCode}）`}`
       : callIndexFailureText(failure)
 
-  return createElement('section', { className: 'mc-section', 'aria-label': '调用统计总览', 'aria-busy': loading === true },
+  const coverageLabel = status === undefined ? '未知' : COVERAGE_LABELS[status.coverage]
+  const scanning = status !== undefined
+    && (status.phase === 'running' || (status.sessions?.pending ?? 0) > 0 || (status.sessions?.pendingLive ?? 0) > 0)
+  const sessionsText = metrics.sessionsListed === undefined
+    ? 'Session 未读取'
+    : `${metrics.sessionsListed} 列出 / ${metrics.sessionsVisible ?? '—'} 可见`
+  const coverageHint = exact === true
+    ? createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 5 } },
+        createElement('span', { className: 'v3-dot', 'data-tone': 'ok', 'aria-hidden': 'true' }), '覆盖完整，计数精确')
+    : createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 5 } },
+        createElement('span', { className: 'v3-dot', 'data-tone': 'warn', 'aria-hidden': 'true' }), '覆盖部分，实际更多')
+  const failHint = createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 5 } },
+    createElement('span', { className: 'v3-dot', 'data-tone': 'bad', 'aria-hidden': 'true' }),
+    `另有 ${formatCallIndexCount(mix?.unresolved, exact)} 次未配对`)
+
+  const rates = callIndexRates(overview?.summary)
+  const rateHint = (stats: CallIndexRate | undefined): string => stats === undefined
+    ? '没有已知结果的调用'
+    : `${stats.numerator} / ${stats.denominator} 次已知结果`
+
+  const trend = callIndexTrend(aggregates?.byDay)
+  const callSpark = aggregates?.byDay === undefined ? undefined : aggregates.byDay.map(bucket => bucket.calls)
+  const successSpark = aggregates?.byDay === undefined ? undefined : aggregates.byDay.map(bucket => bucket.calls > 0 ? bucket.success / bucket.calls : 0)
+  const errorSpark = aggregates?.byDay === undefined ? undefined : aggregates.byDay.map(bucket => bucket.error)
+
+  // Per-tool panels (from the listCalls read the container supplies).
+  const totalToolCalls = tools === undefined ? 0 : tools.reduce((sum, row) => sum + row.calls, 0)
+  const totalToolErrors = tools === undefined ? 0 : tools.reduce((sum, row) => sum + row.error, 0)
+  const topRows = tools === undefined ? undefined : tools.slice(0, 12)
+  const rankMax = topRows !== undefined && topRows.length > 0 ? topRows[0]!.calls : 1
+  const topCoverage = topRows === undefined || totalToolCalls === 0
+    ? undefined
+    : Math.round(topRows.reduce((sum, row) => sum + row.calls, 0) / totalToolCalls * 100)
+  const failingRows = tools === undefined ? undefined : tools.filter(row => row.error > 0).slice().sort((a, b) => b.error - a.error)
+  const failingTop = failingRows === undefined ? [] : failingRows.slice(0, 3)
+  const failingRest = failingRows === undefined ? [] : failingRows.slice(3)
+  const failingRestErrors = failingRest.reduce((sum, row) => sum + row.error, 0)
+  const worstRateTool = failingRows === undefined || failingRows.length === 0
+    ? undefined
+    : failingRows.slice().sort((a, b) => (b.error / b.calls) - (a.error / a.calls))[0]
+
+  const toolsNotice = tools === undefined
+    ? createElement('p', { className: 'v3-hint', 'data-call-index-note': 'tools' },
+        toolsFailure !== undefined
+          ? `逐工具明细读取失败：${callIndexFailureText(toolsFailure)}`
+          : toolsLoading === true ? '正在读取逐工具明细…' : '尚未读取逐工具明细；上方调用总量与趋势来自总览快照，排行需要逐工具数据。')
+    : tools.length === 0
+      ? createElement('p', { className: 'v3-hint', 'data-call-index-note': 'tools' }, '该范围没有逐工具调用记录。')
+      : null
+
+  const sessionInfo = status?.sessions
+  const taskNote = metrics.tasks === undefined
+    ? null
+    : createElement('p', { className: 'v3-hint', 'data-call-index-note': 'task', style: { marginTop: 9 } },
+        `最近一次扫描：${metrics.tasks.mode} / ${metrics.tasks.phase}（开始 ${formatCallIndexTime(metrics.tasks.startedAt)}）`)
+
+  return createElement('section', { className: 'v3-root mc-section', 'aria-label': '调用统计总览', 'aria-busy': loading === true },
     CallIndexStyles(),
+    V3Styles(),
     createElement('header', { className: 'mc-heading-row' },
       createElement('div', { className: 'mc-heading-meta' },
         createElement('h2', { className: 'mc-heading' }, '总览'),
         createElement('span', { className: 'mc-version' }, loading === true
-      ? '正在读取…'
-      // 总览 no longer filters by time, so "最近 N 天" would describe a window
-      // that does not exist. It states the scope it actually covers instead.
-      : (rangeLabel === '全部' ? '范围：全部已索引会话' : `范围：最近 ${rangeLabel}`)),
+          ? '正在读取…'
+          // 总览 no longer filters by time, so "最近 N 天" would describe a window
+          // that does not exist. It states the scope it actually covers instead.
+          : (rangeLabel === '全部' ? '范围：全部已索引会话' : `范围：最近 ${rangeLabel}`)),
       ),
       createElement('div', { className: 'mc-heading-actions' },
         createElement(Button, {
@@ -1771,39 +2135,164 @@ export function CallIndexOverviewPanelView(props: CallIndexOverviewPanelViewProp
           role: failure?.disconnected === true ? 'alert' : 'status',
           'data-call-index-state': failure?.disconnected === true ? 'disconnected' : 'failure',
         }, notice),
-    // The big coverage/scan block was removed at the operator's request: it
-    // explained the index's own bookkeeping in ten lines above the numbers, and
-    // read as noise rather than information. Problems now surface in the shared
-    // red diagnostic box instead (see CallIndexDiagnostics).
-    createElement('div', { className: 'mc-ci-metrics', 'data-call-index-metrics': 'overview' },
-      Metric('总调用', formatCallIndexCount(metrics.calls, exact),
-        mix === undefined ? undefined : `成功 ${formatCallIndexCount(mix.succeeded, exact)}`),
-      Metric('失败 / 未完成',
-        metrics.failed === undefined
-          ? '—'
-          : `${formatCallIndexCount(metrics.failed, exact)} / ${formatCallIndexCount(metrics.unfinished, exact)}`,
-        '未完成 = 未配对结果 + 进行中'),
-      Metric('已索引 / 可见 Session',
-        metrics.sessionsListed === undefined
-          ? '—'
-          : `${formatCallIndexCount(metrics.sessionsVisible)} / ${formatCallIndexCount(metrics.sessionsListed)}`,
-        '可见 = 当前 Scope 仍可读，已索引 = 扫描覆盖到的'),
-      Metric('不同工具数', formatCallIndexCount(metrics.distinctTools, exact),
-        aggregates === undefined ? 'Host 未返回聚合' : '按 toolName 去重'),
+    // three status pills: coverage / scan / corpus — quiet, never competing with
+    // the numbers below.
+    createElement('div', { className: 'v3-status-pills' },
+      createElement('span', { className: 'v3-statusline' },
+        createElement('span', { className: 'v3-dot', 'data-tone': coverageLabel === '完整' ? 'ok' : 'warn', 'aria-hidden': 'true' }),
+        createElement('span', null,
+          '覆盖 ', createElement('b', null, coverageLabel),
+          `　·　${sessionsText}${exact === true ? '' : '　·　所有总量为下界'}`),
+      ),
+      createElement('span', { className: 'v3-statusline' },
+        createElement('span', { className: 'v3-dot', 'data-tone': scanning ? 'run' : 'ok', 'aria-hidden': 'true' }),
+        scanning ? '正在扫描' : '扫描已结束',
+        `　·　${formatCallIndexCount(sessionInfo?.pending, true)} 个待处理`),
+      createElement('span', { className: 'v3-statusline v3-status-dash' },
+        `口径：${overview?.corpus === 'persisted-plus-observed-live' ? '已持久化 + 挂载后实时观测' : 'Host 未声明 corpus'}`),
+    ),
+    // four headline stats, each with a sparkline where a daily series exists
+    createElement('div', { className: 'v3-stats', 'data-call-index-metrics': 'overview' },
+      V3Stat({
+        label: '调用次数', value: formatCallIndexCount(metrics.calls, exact), hint: coverageHint,
+        ...(callSpark === undefined ? {} : { spark: Sparkline({ values: callSpark, tone: 'info' }) }),
+      }),
+      V3Stat({
+        label: '成功率', value: formatCallIndexRate(rates.success?.rate), hint: rateHint(rates.success),
+        ...(successSpark === undefined ? {} : { spark: Sparkline({ values: successSpark, tone: 'ok' }) }),
+      }),
+      V3Stat({
+        label: '失败', value: formatCallIndexCount(metrics.failed, exact), hint: failHint,
+        ...(errorSpark === undefined ? {} : { spark: Sparkline({ values: errorSpark, tone: 'bad' }) }),
+      }),
+      V3Stat({ label: '不同工具', value: formatCallIndexCount(metrics.distinctTools, exact), hint: '按 toolName 去重' }),
     ),
     callIndexHasUnexplainedSources(aggregates)
-      ? createElement('p', { className: 'mc-desc', 'data-call-index-note': 'unexplained-sources' },
+      ? createElement('p', { className: 'v3-hint', 'data-call-index-note': 'unexplained-sources', style: { marginTop: 10 } },
           '插件工具与技能执行入口的归属目前都解析为 0：Host 无法证明插件 owner，技能执行归属也未验证，所以这两个 0 表示「未解析出」，不表示「未使用」。')
       : null,
-    createElement(CallIndexTrendChart, { aggregates }),
-    createElement(CallIndexSourceBars, {
-      bySource: aggregates?.bySource,
-      ...(exact === undefined ? {} : { totalExact: exact }),
-    }),
-    metrics.tasks === undefined
-      ? null
-      : createElement('p', { className: 'mc-desc', 'data-call-index-note': 'task' },
-          `最近一次扫描：${metrics.tasks.mode} / ${metrics.tasks.phase}（开始 ${formatCallIndexTime(metrics.tasks.startedAt)}）`),
+    // board: daily trend (2.15fr) + source composition (1fr)
+    createElement('div', { className: 'v3-board', style: { marginTop: 12 } },
+      createElement('div', { className: 'v3-panel' },
+        createElement('div', { className: 'v3-ph' },
+          createElement('span', { className: 'v3-pt' }, '按日调用趋势'),
+          createElement('span', { className: 'v3-pn' }, aggregates === undefined
+            ? '趋势不可用'
+            : `合计 ${trend.totalCalls} 次 · 峰值 ${trend.maxCalls} 次`),
+        ),
+        aggregates === undefined
+          ? createElement('p', { className: 'v3-hint', 'data-call-index-missing': 'aggregates' }, 'Host 未返回按日聚合（aggregates）；这不是「没有调用」，趋势不可用。')
+          : !trend.available
+            ? createElement('p', { className: 'v3-hint', 'data-call-index-missing': 'by-day' }, '该筛选在所选范围内没有任何按日桶，趋势为空；单个日粒度为 0 不参与绘制。')
+            : createElement(OverviewTrendSvg, { chart: trend }),
+        aggregates === undefined || !trend.available
+          ? null
+          : createElement('div', { className: 'v3-legend' },
+              createElement('span', null, createElement('i', { style: { background: 'var(--v3-info)' } }), '每日调用量（折线 + 面积）'),
+              createElement('span', null, createElement('i', { 'data-mark': 'square', style: { background: 'var(--v3-bad)' } }), '每日失败数（底柱）'),
+              createElement('span', null, createElement('i', { style: { background: 'var(--v3-info)', opacity: 0.3, height: 8, borderRadius: 2 } }), '最近一周'),
+            ),
+      ),
+      OverviewSourcePanel({
+        ...(aggregates?.bySource === undefined ? {} : { bySource: aggregates.bySource }),
+        ...(exact === undefined ? {} : { totalExact: exact }),
+      }),
+    ),
+    // board: tool ranking (top 12) + fault concentration
+    createElement('div', { className: 'v3-board', style: { marginTop: 12 } },
+      createElement('div', { className: 'v3-panel' },
+        createElement('div', { className: 'v3-ph' },
+          createElement('span', { className: 'v3-pt' }, '工具调用排行'),
+          createElement('span', { className: 'v3-pn' }, topRows === undefined
+            ? '前 12 名'
+            : `前 12 名${topCoverage === undefined ? '' : ` · 覆盖 ${topCoverage}% 的调用`}`),
+        ),
+        toolsNotice !== null
+          ? toolsNotice
+          : createElement('div', { className: 'v3-rank' },
+              ...topRows!.map(row => {
+                const bad = row.error > 0 && row.error / row.calls >= 0.2
+                return createElement('div', { key: 'rank-' + row.toolName + '::' + row.sourceKind, className: 'v3-rank-row', title: row.toolName },
+                  createElement('span', { className: 'v3-nm' }, toolDisplayLabel(row.toolName)),
+                  createElement('span', { className: 'v3-bar' }, createElement('span', {
+                    ...(bad ? { 'data-bad': 'true' } : {}),
+                    style: { width: `${Math.max(3, Math.round((row.calls / rankMax) * 100))}%` },
+                  })),
+                  createElement('span', { className: 'v3-n' }, String(row.calls)),
+                  createElement('span', {
+                    className: 'v3-e',
+                    ...(bad ? { 'data-bad': 'true' } : {}),
+                    ...(row.error === 0 ? { 'data-zero': 'true' } : {}),
+                  }, `失败 ${row.error}`),
+                )
+              })),
+      ),
+      createElement('div', { className: 'v3-panel' },
+        createElement('div', { className: 'v3-ph' },
+          createElement('span', { className: 'v3-pt' }, '异常集中度'),
+          createElement('span', { className: 'v3-pn' }, tools === undefined ? '按失败数排序' : `${formatCallIndexCount(metrics.failed, exact)} 次失败`),
+        ),
+        toolsNotice !== null
+          ? toolsNotice
+          : failingRows === undefined || failingRows.length === 0
+            ? createElement('p', { className: 'v3-hint' }, '当前范围没有失败调用。')
+            : createElement('div', null,
+                createElement('div', { className: 'v3-rank' },
+                  ...failingTop.map(row => createElement('div', { key: 'fc-' + row.toolName + '::' + row.sourceKind, className: 'v3-rank-row' },
+                    createElement('span', { className: 'v3-nm', style: { width: 'auto', flex: '1 1 auto' } }, toolDisplayLabel(row.toolName)),
+                    createElement('span', { className: 'v3-n', style: { color: 'var(--v3-bad)', fontWeight: 600 } }, String(row.error)),
+                  )),
+                  ...(failingRest.length === 0 ? [] : [createElement('div', { key: 'fc-rest', className: 'v3-rank-row' },
+                    createElement('span', { className: 'v3-nm', style: { width: 'auto', flex: '1 1 auto' } }, `其余 ${failingRest.length} 个工具合计`),
+                    createElement('span', { className: 'v3-n', style: { color: 'var(--v3-t2)' } }, String(failingRestErrors)),
+                  )]),
+                ),
+                totalToolErrors > 0
+                  ? createElement('p', { className: 'v3-hint', style: { marginTop: 9 } },
+                      `这些失败合计占全部失败的 ${Math.round((failingTop.reduce((sum, row) => sum + row.error, 0) / totalToolErrors) * 100)}%（占全部失败，不是占单个工具）。`)
+                  : null,
+                worstRateTool === undefined ? null : createElement('div', { style: { marginTop: 11, paddingTop: 11, borderTop: '1px solid var(--v3-line)' } },
+                  createElement('div', { className: 'v3-src', style: { fontSize: 11.5 } },
+                    createElement('span', { className: 'v3-nm', style: { color: 'var(--v3-t4)', flex: '1 1 auto' } }, '失败率最高的工具'),
+                    createElement('b', { style: { color: 'var(--v3-bad)' } }, `${Math.round((worstRateTool.error / worstRateTool.calls) * 100)}%`),
+                  ),
+                  createElement('p', { className: 'v3-hint', style: { marginTop: 4 } },
+                    `${worstRateTool.toolName} ${worstRateTool.error} / ${worstRateTool.calls}（占该工具失败率，不是占全部失败）。`),
+                ),
+                createElement('div', { style: { marginTop: 11, paddingTop: 11, borderTop: '1px solid var(--v3-line)' } },
+                  createElement('div', { className: 'v3-src', style: { fontSize: 11.5 } },
+                    createElement('span', { className: 'v3-nm', style: { color: 'var(--v3-t4)', flex: '1 1 auto' } }, '未配对结果'),
+                    createElement('b', { style: { color: 'var(--v3-warn)' } }, formatCallIndexCount(mix?.unresolved, exact)),
+                  ),
+                  createElement('p', { className: 'v3-hint', style: { marginTop: 4 } }, '没有捕获到结果，不计入成功率分母，也不等于失败。'),
+                ),
+              ),
+      ),
+    ),
+    // index status: a four-column key/value grid
+    createElement('div', { className: 'v3-panel', style: { marginTop: 12 } },
+      createElement('div', { className: 'v3-ph' },
+        createElement('span', { className: 'v3-pt' }, '索引状态'),
+        createElement('span', { className: 'v3-pn' }, metrics.tasks === undefined ? '最近扫描未记录' : `最近扫描 ${metrics.tasks.mode} · ${metrics.tasks.phase}`),
+      ),
+      createElement('div', { className: 'v3-kv' },
+        createElement('div', null,
+          createElement('div', { className: 'v3-kv-l' }, '数据范围'),
+          createElement('div', { className: 'v3-kv-v' }, overview?.corpus === 'persisted-plus-observed-live' ? '已持久化 + 挂载后实时观测' : 'Host 未声明')),
+        createElement('div', null,
+          createElement('div', { className: 'v3-kv-l' }, 'Session 列出 / 可见'),
+          createElement('div', { className: 'v3-kv-v v3-num' }, sessionInfo === undefined ? '—' : `${sessionInfo.listed} / ${sessionInfo.visible}`)),
+        createElement('div', null,
+          createElement('div', { className: 'v3-kv-l' }, '待处理 / 失败'),
+          createElement('div', { className: 'v3-kv-v v3-num' }, sessionInfo === undefined ? '—' : `${sessionInfo.pending} / ${sessionInfo.failed}`)),
+        createElement('div', null,
+          createElement('div', { className: 'v3-kv-l' }, '覆盖（事件 / 枚举 / 语义）'),
+          createElement('div', { className: 'v3-kv-v' }, status === undefined
+            ? '—'
+            : `${COVERAGE_LABELS[status.eventCoverage]} / ${COVERAGE_LABELS[status.enumerationCoverage]} / ${COVERAGE_LABELS[status.coverage]}`)),
+      ),
+      taskNote,
+    ),
   )
 }
 
@@ -1920,6 +2409,10 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
   const [query, setQuery] = useState<CallIndexQuery>(() => normalizeCallIndexQuery(initialQuery))
   const [state, setState] = useState<DetailState>({ loading: true, loadingMore: false, loadingDetail: false })
   const [refreshToken, setRefreshToken] = useState(0)
+  // Local tool-name filter for the detail card. Client-only: it never narrows the
+  // wire query, so the Host keeps returning the same snapshot while the operator
+  // types. Resets only on a full remount, matching the tab's lifetime.
+  const [search, setSearch] = useState('')
   const generation = useRef(0)
   // The `now` the current page was fetched with. Paging must reuse it, or the
   // cursor's filter no longer matches and the Host answers invalid-request.
@@ -2143,6 +2636,8 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
     loadingMore: state.loadingMore,
     loadingDetail: state.loadingDetail,
     narrow,
+    search,
+    onSearchChange: setSearch,
     onQueryChange: setQuery,
     onRefresh: () => setRefreshToken(value => value + 1),
     onStartIndex: startIndex,
@@ -2158,13 +2653,19 @@ export interface CallIndexOverviewPanelProps {
 }
 
 /**
- * Container for 总览. Reads the status once and one 30-day summary; the window
- * is stated in the header so no metric is silently scoped.
+ * Container for 总览. Reads the status once, one all-time summary, AND one
+ * `listCalls` snapshot — because the overview reply carries no per-tool counts,
+ * and the v3 ranking / fault panels need them. The per-tool read fills up to
+ * `MAX_AUTO_PAGES` pages (same bound the detail page uses) then aggregates with
+ * the shared pure `callIndexToolRows`. Failing to read rows never blocks the
+ * headline numbers; it only shows an honest empty state in the two panels.
  */
 export function CallIndexOverviewPanel({ api }: CallIndexOverviewPanelProps): ReactElement {
   const [state, setState] = useState<{
     readonly status?: CallIndexStatusView
     readonly overview?: CallIndexOverviewView
+    readonly tools?: readonly CallIndexToolRow[]
+    readonly toolsFailure?: CallIndexPanelFailure
     readonly loading: boolean
     readonly failure?: CallIndexPanelFailure
   }>({ loading: true })
@@ -2174,18 +2675,42 @@ export function CallIndexOverviewPanel({ api }: CallIndexOverviewPanelProps): Re
     let active = true
     setState(previous => ({ ...previous, loading: true }))
     const query: CallIndexQuery = { range: CALL_INDEX_OVERVIEW_RANGE }
+    // Pin one clock reading so every paginated page shares the first page's
+    // filter (a cursor only matches the window it was issued for).
+    const anchor = Date.now()
     void (async () => {
-      const [statusResult, overviewResult] = await Promise.all([
+      const [statusResult, overviewResult, callsResult] = await Promise.all([
         api.getStatus(),
         api.getOverview(query),
+        api.listCalls(query, undefined, anchor),
       ])
       if (!active) return
       const failure = overviewResult.ok ? (statusResult.ok ? undefined : statusResult) : overviewResult
+      let tools: readonly CallIndexToolRow[] | undefined
+      let toolsFailure: CallIndexPanelFailure | undefined
+      if (callsResult.ok) {
+        const items = [...callsResult.value.items]
+        let cursor = callsResult.value.nextCursor
+        let pages = 0
+        while (cursor !== undefined && pages < MAX_AUTO_PAGES) {
+          const next = await api.listCalls(query, cursor, anchor)
+          if (!next.ok) { toolsFailure = next; break }
+          items.push(...next.value.items)
+          cursor = next.value.nextCursor
+          pages += 1
+        }
+        tools = callIndexToolRows({ ...callsResult.value, items })
+      } else {
+        toolsFailure = callsResult
+      }
+      if (!active) return
       setState({
         loading: false,
         ...(statusResult.ok ? { status: statusResult.value } : {}),
         ...(overviewResult.ok ? { overview: overviewResult.value } : {}),
         ...(failure === undefined ? {} : { failure }),
+        ...(tools === undefined ? {} : { tools }),
+        ...(toolsFailure === undefined ? {} : { toolsFailure }),
       })
     })()
     return () => { active = false }
@@ -2194,8 +2719,11 @@ export function CallIndexOverviewPanel({ api }: CallIndexOverviewPanelProps): Re
   return createElement(CallIndexOverviewPanelView, {
     ...(state.status === undefined ? {} : { status: state.status }),
     ...(state.overview === undefined ? {} : { overview: state.overview }),
+    ...(state.tools === undefined ? {} : { tools: state.tools }),
+    ...(state.toolsFailure === undefined ? {} : { toolsFailure: state.toolsFailure }),
     ...(state.failure === undefined ? {} : { failure: state.failure }),
     loading: state.loading,
+    toolsLoading: state.loading,
     onRefresh: () => setRefreshToken(value => value + 1),
   })
 }

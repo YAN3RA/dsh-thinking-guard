@@ -65,7 +65,6 @@ import {
   callIndexSessionName,
   scopeQuery,
   scopeHint,
-  CALL_INDEX_TREND_GEOMETRY,
 } from '../src/client/call-index.tsx'
 import {
   CALL_INDEX_ERROR_MESSAGE_KEYS,
@@ -676,18 +675,21 @@ describe('aggregates and trend', () => {
     expect(chart.bars[0]?.ratio).toBe(0)
   })
 
-  it('draws one rect per day inside the declared viewBox', () => {
+  it('draws the v3 line + area + failure bars inside a 720×212 viewBox', () => {
+    // v3 replaces the old one-rect-per-day bar chart with a line+area chart
+    // (calls) plus a failure底柱 for each nonzero-error day, a dashed recent-week
+    // band and a peak label. The old assertion pinned the removed bar-per-day, so
+    // it now pins the new structure — same intent (a real, bounded trend drawing).
     const view = CallIndexOverviewPanelView({ status: statusView(), overview: overviewView() })
-    const rects = nodesWith(view, element => element.type === 'rect')
-    expect(rects).toHaveLength(AGGREGATES.byDay?.length ?? 0)
-    for (const rect of rects) {
-      expect(Number(rect.props.x)).toBeGreaterThanOrEqual(0)
-      expect(Number(rect.props.y)).toBeGreaterThanOrEqual(0)
-      expect(Number(rect.props.width)).toBeGreaterThan(0)
-      expect(Number(rect.props.height)).toBeGreaterThan(0)
-      expect(Number(rect.props.y) + Number(rect.props.height))
-        .toBeLessThanOrEqual(CALL_INDEX_TREND_GEOMETRY.height)
-    }
+    const svg = nodesWith(view, element => element.props['data-call-index-svg'] === 'trend')
+    expect(svg).toHaveLength(1)
+    expect(svg[0]?.props.viewBox).toBe('0 0 720 212')
+    const lines = nodesWith(view, element => element.props.className === 'v3-line')
+    expect(lines).toHaveLength(1)
+    expect(String(lines[0]?.props.points).split(' ')).toHaveLength(AGGREGATES.byDay?.length ?? 0)
+    const errBars = nodesWith(view, element => element.props.className === 'v3-bar-er')
+    expect(errBars).toHaveLength((AGGREGATES.byDay ?? []).filter(day => day.error > 0).length)
+    expect(nodesWith(view, element => element.props.className === 'v3-hlbox')).toHaveLength(1)
   })
 
   it('no longer prints the day-boundary line', () => {
@@ -735,9 +737,12 @@ describe('overview metrics', () => {
   })
 
   it('renders em dashes for unread metrics, not zeros', () => {
+    // v3 re-laid the metric strip as `.v3-stats` / `.v3-stat-v`. The honesty
+    // contract is unchanged — with nothing read, every big number is an em dash,
+    // never a fabricated 0 — so only the class selector was retargeted.
     const view = CallIndexOverviewPanelView({})
-    const values = nodesWith(view, element => element.props.className === 'mc-ci-metric-value mc-ci-num')
-    expect(values.length).toBeGreaterThan(0)
+    const values = nodesWith(view, element => element.props.className === 'v3-stat-v v3-num')
+    expect(values).toHaveLength(4)
     for (const node of values) expect(node.props.children).toBe('—')
   })
 
@@ -775,12 +780,14 @@ describe('overview metrics', () => {
 
 describe('table and detail', () => {
   it('renders one row per tool with the six requested columns', () => {
-    // The table is per TOOL now: time, tool, source, success, failure, latency.
-    // Session and turn/step are gone — they identify a call, not a tool's health.
+    // v3 demotes the table to an appendix and adopts the design's columns
+    // (tool / calls / failures / success-rate / latency / last-call). Session and
+    // turn/step were already gone; 来源 is folded into a small marker in the tool
+    // cell, so the header set changes while "one row per tool" is preserved.
     const view = CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), page: callPage() })
     const headers = nodesWith(view, element => element.type === 'th')
     expect(headers.map(node => node.props.children))
-      .toEqual(['时间', '工具', '来源', '成功', '失败', '平均耗时'])
+      .toEqual(['工具', '调用', '失败', '成功率', '平均耗时', '最近调用'])
   })
 
   it('formats turn and step compactly', () => {
@@ -1242,6 +1249,104 @@ describe('formatters', () => {
     expect(formatCallIndexTime(undefined)).toBe('—')
     expect(formatCallIndexTime(Number.NaN)).toBe('—')
     expect(formatCallIndexTime(Date.UTC(2026, 10, 10, 2, 30))).toMatch(/^2026-11-10 \d{2}:\d{2}$/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 12. v3 structure — V3-a 总览 + V3-d 调用明细
+// ---------------------------------------------------------------------------
+//
+// These pin the v3 redesign itself: four-cell stat strips with sparklines, a
+// one-segment source donut, a bounded tool ranking, an honest per-tool empty
+// state, and the detail page's two chart columns + `.v3-ts` appendix table.
+// They are additive — no original behaviour assertion was removed to earn them.
+
+describe('v3 structure', () => {
+  const withTool = (name: string, outcome: CallIndexCallRow['outcome'], seq: number): CallIndexCallRow =>
+    ({ ...ROW, callSeq: seq, callId: 'c' + seq, toolName: name, outcome })
+
+  it('lays the overview out as four .v3-stats cells with sparklines', () => {
+    const tools = callIndexToolRows(callPage({ items: [ROW] }))
+    const view = CallIndexOverviewPanelView({ status: statusView(), overview: overviewView(), tools })
+    expect(nodesWith(view, element => element.props.className === 'v3-stats').length).toBeGreaterThanOrEqual(1)
+    expect(nodesWith(view, element => element.props.className === 'v3-stat')).toHaveLength(4)
+    // Every stat cell keeps the data-call-index-metric marker.
+    expect(nodesWith(view, element => element.props['data-call-index-metric'] !== undefined)).toHaveLength(4)
+    expect(nodesWith(view, element => element.props['data-call-index-metrics'] === 'overview')).toHaveLength(1)
+    // A sparkline for each daily series we actually have (calls / success / error).
+    expect(nodesWith(view, element => element.props['data-call-index-spark'] !== undefined).length).toBeGreaterThanOrEqual(3)
+  })
+
+  it('draws the source donut as exactly one segment and lists all five kinds', () => {
+    // Real data has unknown = 100%. The donut must draw ONE segment and never
+    // fabricate a coloured slice for a zero source (D-028).
+    const allUnknown: CallIndexAggregates = {
+      distinctTools: 1,
+      bySource: { mcp: 0, native: 0, 'plugin-tool': 0, skill: 0, unknown: 745 },
+      byDay: AGGREGATES.byDay,
+      dayOffsetMinutes: 480,
+    }
+    const view = CallIndexOverviewPanelView({ status: statusView(), overview: overviewView({ aggregates: allUnknown }) })
+    expect(nodesWith(view, element => element.props.className === 'v3-seg')).toHaveLength(1)
+    expect(visible(view)).toContain('100%')
+    expect(visible(view)).toContain('未解析')
+    expect(nodesWith(view, element => element.props['data-source-row'] !== undefined).map(r => r.props['data-source-row']))
+      .toEqual(['mcp', 'native', 'plugin-tool', 'skill', 'unknown'])
+  })
+
+  it('caps the tool ranking at 12 rows', () => {
+    const many = Array.from({ length: 20 }, (_, i) => withTool('tool-' + i, 'success', 100 + i))
+    const tools = callIndexToolRows(callPage({ items: many }))
+    expect(tools).toHaveLength(20)
+    const view = CallIndexOverviewPanelView({ status: statusView(), overview: overviewView(), tools })
+    // No failures here, so the only rank rows are the ranking panel's — capped at 12.
+    expect(nodesWith(view, element => element.props.className === 'v3-rank-row')).toHaveLength(12)
+  })
+
+  it('shows an honest empty state, not zeros, when per-tool data was not read', () => {
+    const view = CallIndexOverviewPanelView({ status: statusView(), overview: overviewView() }) // tools undefined
+    expect(visible(view)).toContain('尚未读取逐工具明细')
+  })
+
+  it('renders the detail page as two chart columns plus a .v3-ts table', () => {
+    const view = CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), page: callPage(), status: statusView() })
+    expect(nodesWith(view, element => element.props.className === 'v3-board').length).toBeGreaterThanOrEqual(1)
+    expect(visible(view)).toMatch(/个工具 · .*次调用/)
+    expect(nodesWith(view, element => element.props.className === 'v3-stat')).toHaveLength(4)
+    expect(nodesWith(view, element => element.props['data-call-index-summary'] === 'rates')).toHaveLength(1)
+    expect(nodesWith(view, element => element.props['data-call-index-table'] === 'tools')).toHaveLength(1)
+    expect(nodesWith(view, element => typeof element.props.className === 'string' && element.props.className.includes('v3-ts')).length)
+      .toBeGreaterThanOrEqual(1)
+  })
+
+  it('keeps the scan-progress marker on the detail page', () => {
+    const view = CallIndexDetailPanelView({
+      query: normalizeCallIndexQuery(),
+      page: callPage(),
+      status: statusView({ phase: 'running', sessions: { listed: 4, visible: 4, completed: 2, pending: 2, failed: 0, pendingLive: 0 } }),
+    })
+    expect(nodesWith(view, element => element.props['data-call-index-progress'] !== undefined).length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('filters the detail tool rows by the client-side search term', () => {
+    const page = callPage({ items: [withTool('bash', 'success', 1), withTool('grep', 'success', 2)] })
+    const all = visible(CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), page, status: statusView() }))
+    expect(all).toContain('bash')
+    expect(all).toContain('grep')
+    const filtered = visible(CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), page, status: statusView(), search: 'grep' }))
+    expect(filtered).toContain('grep')
+    expect(filtered).not.toContain('bash')
+    expect(nodesWith(CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), page }), el => el.props['data-call-index-search'] === 'true'))
+      .toHaveLength(1)
+  })
+
+  it('keeps "占该工具 %" (detail) and "占全部失败 %" (overview) as distinct denominators', () => {
+    const items = [withTool('bash', 'success', 1), withTool('grep', 'error', 2)]
+    const page = callPage({ items })
+    const detail = visible(CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), page, status: statusView() }))
+    expect(detail).toContain('占该工具')
+    const overview = visible(CallIndexOverviewPanelView({ status: statusView(), overview: overviewView(), tools: callIndexToolRows(page) }))
+    expect(overview).toContain('占全部失败')
   })
 })
 

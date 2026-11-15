@@ -450,6 +450,72 @@ export function callIndexSessionName(sessionId: string, catalog?: CallIndexSessi
   return shortCallIndexSessionId(sessionId)
 }
 
+/** State the self-drawn session dropdown needs, owned by the container. */
+export interface CallIndexSessionMenu {
+  readonly open: boolean
+  readonly highlight: number
+  readonly onToggle: () => void
+  readonly onClose: () => void
+  readonly onHighlight: (index: number) => void
+  readonly onSelect: (index: number) => void
+  readonly onKey: (key: string) => void
+  /** Element that wraps trigger + list, so the container can close on outside clicks. */
+  readonly rootRef?: { current: HTMLDivElement | null }
+}
+
+/** A no-op menu used by the pure view when no container wired interactivity. */
+export const CALL_INDEX_EMPTY_SESSION_MENU: CallIndexSessionMenu = Object.freeze({
+  open: false,
+  highlight: 0,
+  onToggle: () => {},
+  onClose: () => {},
+  onHighlight: () => {},
+  onSelect: () => {},
+  onKey: () => {},
+})
+
+export interface CallIndexSessionMenuKeyResult {
+  readonly action: 'close' | 'open' | 'move' | 'select' | 'none'
+  readonly highlight: number
+}
+
+/**
+ * Keyboard behaviour for the session dropdown, as a pure decision.
+ *
+ * Extracting it keeps the Esc / Arrow / Enter contract testable without a DOM:
+ * Escape closes, ArrowDown/Up open-then-move and wrap around, Enter selects the
+ * highlighted row. It is the same function the component feeds every keydown to.
+ */
+export function callIndexSessionMenuKey(
+  key: string,
+  state: { readonly open: boolean; readonly highlight: number; readonly count: number },
+): CallIndexSessionMenuKeyResult {
+  const count = Math.max(0, Math.floor(state.count))
+  const wrap = (index: number): number => (count === 0 ? 0 : ((index % count) + count) % count)
+  switch (key) {
+    case 'Escape':
+      return { action: state.open ? 'close' : 'none', highlight: state.highlight }
+    case 'ArrowDown':
+      return state.open
+        ? { action: 'move', highlight: wrap(state.highlight + 1) }
+        : { action: 'open', highlight: wrap(state.highlight) }
+    case 'ArrowUp':
+      return state.open
+        ? { action: 'move', highlight: wrap(state.highlight - 1) }
+        : { action: 'open', highlight: wrap(state.highlight) }
+    case 'Home':
+      return state.open ? { action: 'move', highlight: 0 } : { action: 'none', highlight: state.highlight }
+    case 'End':
+      return state.open ? { action: 'move', highlight: Math.max(0, count - 1) } : { action: 'none', highlight: state.highlight }
+    case 'Enter':
+    case ' ':
+      if (state.open && count > 0) return { action: 'select', highlight: wrap(state.highlight) }
+      return { action: state.open ? 'none' : 'open', highlight: wrap(state.highlight) }
+    default:
+      return { action: 'none', highlight: state.highlight }
+  }
+}
+
 /** True when any dimension narrows the set, including a non-`'all'` scope. */
 export function hasCallIndexFilters(query: CallIndexQuery): boolean {
   if (query.scope !== undefined && query.scope !== 'all') return true
@@ -549,6 +615,38 @@ export function callIndexScopeFailureReason(failure: CallIndexPanelFailure): str
     default:
       return undefined
   }
+}
+
+/**
+ * True when a failure is the benign "cursor expired after the page was re-read"
+ * answer.
+ *
+ * A completed scan re-reads the whole page, which invalidates any pagination
+ * cursor issued before it. The Host answers `cursor-stale`; that is expected
+ * churn, not a fault, so the page must not paint it as a red error or repeat it
+ * at the bottom as 「加载失败…」.
+ */
+export function callIndexIsCursorStale(failure: CallIndexPanelFailure): boolean {
+  return failure.code === 'cursor-stale' || failure.messageKey === 'callIndex.error.cursorStale'
+}
+
+/** How one failed next-page read is handled. */
+export type CallIndexMoreFailureAction = 'none' | 'retry' | 'silent' | 'show'
+
+/**
+ * Decide what to do with a failed next-page read.
+ *
+ * `cursor-stale` is retried ONCE by silently re-reading the first page; a second
+ * stale answer is swallowed (`silent`) so a pathological snapshot cannot spin
+ * forever. Every other reason stays visible (`show`). Pure and testable.
+ */
+export function callIndexMoreFailureAction(
+  failure: CallIndexPanelFailure | undefined,
+  cursorStaleRetried: boolean,
+): CallIndexMoreFailureAction {
+  if (failure === undefined) return 'none'
+  if (!callIndexIsCursorStale(failure)) return 'show'
+  return cursorStaleRetried ? 'silent' : 'retry'
 }
 
 /**
@@ -753,6 +851,266 @@ export function callIndexTrend(buckets: readonly CallIndexDayBucket[] | undefine
     }
   })
   return { width: geometry.width, height: geometry.height, bars, maxCalls, available: true, totalCalls }
+}
+
+// ---------------------------------------------------------------------------
+// Smooth daily trend (v3.1) — aggregated day/week/month series + monotone curve
+// ---------------------------------------------------------------------------
+//
+// The bar-per-day chart was too thin to read and its date labels crowded the
+// axis (reported: 「柱子太细、日期挤在一起」). The trend is now a smooth area
+// chart whose granularity adapts to the span, whose x-axis label count adapts to
+// the container width, and whose failure data is a low-key baseline band rather
+// than tall error bars. Every geometric decision lives in a pure function so the
+// suite can prove it without a DOM.
+
+/** X-axis granularity for the overview trend. */
+export type CallIndexTrendMode = 'day' | 'week' | 'month'
+
+/** One aggregated point in the trend series (day / week / month bucket). */
+export interface CallIndexTrendPoint {
+  /** Stable bucket key: `YYYY-MM-DD` (day), week-start date (week), `YYYY-MM` (month). */
+  readonly key: string
+  /** Axis label: `MM-DD` (day/week) or `M 月` / `YYYY-MM` (month). */
+  readonly label: string
+  readonly calls: number
+  readonly success: number
+  readonly error: number
+  /** How many daily buckets were folded into this point. */
+  readonly days: number
+}
+
+/** Aggregated series plus the totals the header and scales need. */
+export interface CallIndexTrendSeries {
+  readonly mode: CallIndexTrendMode
+  /** Calendar span covered by the raw daily buckets, in days (0 when none). */
+  readonly spanDays: number
+  /** True when the Host sent `byDay` at all (an empty array is still "available"). */
+  readonly available: boolean
+  readonly points: readonly CallIndexTrendPoint[]
+  readonly maxCalls: number
+  readonly totalCalls: number
+  readonly totalError: number
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, '0')
+}
+
+/** Parse a strict `YYYY-MM-DD` day into a UTC midnight instant. */
+function parseTrendDay(day: string): number | undefined {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day)
+  if (match === null) return undefined
+  const ms = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]))
+  return Number.isFinite(ms) ? ms : undefined
+}
+
+/** Calendar span in days covered by the buckets (>=1); 0 when no usable day. */
+export function callIndexTrendSpanDays(buckets: readonly CallIndexDayBucket[] | undefined): number {
+  if (buckets === undefined || buckets.length === 0) return 0
+  let min: number | undefined
+  let max: number | undefined
+  for (const bucket of buckets) {
+    const ms = parseTrendDay(bucket.day)
+    if (ms === undefined) continue
+    if (min === undefined || ms < min) min = ms
+    if (max === undefined || ms > max) max = ms
+  }
+  if (min === undefined || max === undefined) return 0
+  return Math.round((max - min) / MS_PER_DAY) + 1
+}
+
+/**
+ * Pick the aggregation granularity for a span: <=14 days keep per-day detail,
+ * 15–60 days roll up to weeks, anything longer rolls up to months. This is the
+ * "自动聚合" the operator asked for — the axis never squeezes a whole quarter of
+ * day labels into one card.
+ */
+export function callIndexTrendMode(spanDays: number): CallIndexTrendMode {
+  if (spanDays > 60) return 'month'
+  if (spanDays > 14) return 'week'
+  return 'day'
+}
+
+/** Short Chinese name for a trend granularity, used in the header and legend. */
+export function trendModeName(mode: CallIndexTrendMode): string {
+  return mode === 'month' ? '按月' : mode === 'week' ? '按周' : '按日'
+}
+
+/** Monday (UTC) of the week containing `ms`. */
+function trendWeekStart(ms: number): number {
+  const dow = new Date(ms).getUTCDay() // 0=Sun … 6=Sat
+  const sinceMonday = (dow + 6) % 7
+  return ms - sinceMonday * MS_PER_DAY
+}
+
+/**
+ * Fold daily buckets into a `day` / `week` / `month` series.
+ *
+ * Days the Host never emitted are simply absent: the function never fabricates a
+ * zero bucket, so a sparse history still reads honestly. Points are returned
+ * oldest-first, which is what both the curve and the axis assume.
+ */
+export function callIndexTrendSeries(
+  buckets: readonly CallIndexDayBucket[] | undefined,
+  mode: CallIndexTrendMode,
+): CallIndexTrendSeries {
+  const spanDays = callIndexTrendSpanDays(buckets)
+  if (buckets === undefined) {
+    return { mode, spanDays, available: false, points: [], maxCalls: 0, totalCalls: 0, totalError: 0 }
+  }
+  if (buckets.length === 0) {
+    return { mode, spanDays, available: true, points: [], maxCalls: 0, totalCalls: 0, totalError: 0 }
+  }
+  interface Acc {
+    readonly key: string
+    readonly sortMs: number
+    readonly baseLabel: string
+    calls: number
+    success: number
+    error: number
+    days: number
+  }
+  const byKey = new Map<string, Acc>()
+  let firstYear: number | undefined
+  let multiYear = false
+  for (const bucket of buckets) {
+    const ms = parseTrendDay(bucket.day)
+    if (ms === undefined) continue
+    const date = new Date(ms)
+    let key: string
+    let sortMs: number
+    let baseLabel: string
+    if (mode === 'month') {
+      const year = date.getUTCFullYear()
+      const month = date.getUTCMonth() + 1
+      key = `${year}-${pad2(month)}`
+      sortMs = Date.UTC(year, month - 1, 1)
+      baseLabel = `${month} 月`
+      if (firstYear === undefined) firstYear = year
+      else if (firstYear !== year) multiYear = true
+    } else if (mode === 'week') {
+      const weekStart = trendWeekStart(ms)
+      const wd = new Date(weekStart)
+      key = `${wd.getUTCFullYear()}-${pad2(wd.getUTCMonth() + 1)}-${pad2(wd.getUTCDate())}`
+      sortMs = weekStart
+      baseLabel = `${pad2(wd.getUTCMonth() + 1)}-${pad2(wd.getUTCDate())}`
+    } else {
+      key = bucket.day
+      sortMs = ms
+      baseLabel = `${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())}`
+    }
+    let acc = byKey.get(key)
+    if (acc === undefined) {
+      acc = { key, sortMs, baseLabel, calls: 0, success: 0, error: 0, days: 0 }
+      byKey.set(key, acc)
+    }
+    acc.calls += bucket.calls
+    acc.success += bucket.success
+    acc.error += bucket.error
+    acc.days += 1
+  }
+  const ordered = [...byKey.values()].sort((a, b) => a.sortMs - b.sortMs)
+  const points: CallIndexTrendPoint[] = ordered.map(acc => ({
+    key: acc.key,
+    // A month label drops the year only when the series stays inside one year;
+    // a year-crossing span keeps `YYYY-MM` so two Novembers cannot collide.
+    label: mode === 'month' && multiYear ? acc.key : acc.baseLabel,
+    calls: acc.calls,
+    success: acc.success,
+    error: acc.error,
+    days: acc.days,
+  }))
+  let maxCalls = 0
+  let totalCalls = 0
+  let totalError = 0
+  for (const point of points) {
+    if (point.calls > maxCalls) maxCalls = point.calls
+    totalCalls += point.calls
+    totalError += point.error
+  }
+  return { mode, spanDays, available: true, points, maxCalls, totalCalls, totalError }
+}
+
+/**
+ * Choose which point indices get an x-axis label so labels never overlap.
+ *
+ * The budget is roughly one label per 70px of plotting width (short labels such
+ * as `11-05` occupy far less than that at 9.5px), and the chosen indices are
+ * evenly spaced, so the pixel gap between neighbours is always ≥ plotWidth ÷
+ * budget — never a pile-up. First and last points are always labelled.
+ */
+export function callIndexTrendTicks(pointCount: number, width: number): readonly number[] {
+  const n = Number.isFinite(pointCount) ? Math.max(0, Math.floor(pointCount)) : 0
+  if (n === 0) return []
+  if (n === 1) return [0]
+  const safeWidth = Number.isFinite(width) && width > 0 ? width : 0
+  const budget = Math.max(2, Math.floor(safeWidth / 70))
+  const count = Math.min(n, budget)
+  const out: number[] = []
+  for (let k = 0; k < count; k++) {
+    const index = Math.round((k * (n - 1)) / (count - 1))
+    if (out[out.length - 1] !== index) out.push(index)
+  }
+  return out
+}
+
+/** A point on the trend curve, in SVG user space. */
+export interface CallIndexTrendAnchor {
+  readonly x: number
+  readonly y: number
+}
+
+function fmtCoord(value: number): string {
+  return (Math.round(value * 10) / 10).toString()
+}
+
+/**
+ * A smooth path through `anchors` using monotone cubic interpolation
+ * (Catmull-Rom shaped, Fritsch–Carlson limited → cubic Béziers).
+ *
+ * Why monotone: a plain Catmull-Rom spline overshoots local extrema, so a spike
+ * would dip below the baseline or above the peak. The limited tangents keep every
+ * segment inside the [y_i, y_{i+1}] envelope, so the curve is smooth but never
+ * leaves the data range — "单调不越界". Output uses `C` commands (三次贝塞尔).
+ */
+export function callIndexSmoothPath(anchors: readonly CallIndexTrendAnchor[]): string {
+  const n = anchors.length
+  if (n === 0) return ''
+  if (n === 1) return `M${fmtCoord(anchors[0]!.x)},${fmtCoord(anchors[0]!.y)}`
+  const h: number[] = []
+  const delta: number[] = []
+  for (let i = 0; i < n - 1; i++) {
+    const dx = anchors[i + 1]!.x - anchors[i]!.x
+    h.push(dx)
+    delta.push(dx === 0 ? 0 : (anchors[i + 1]!.y - anchors[i]!.y) / dx)
+  }
+  const tangent: number[] = new Array(n)
+  tangent[0] = delta[0]!
+  tangent[n - 1] = delta[n - 2]!
+  for (let i = 1; i < n - 1; i++) {
+    const d0 = delta[i - 1]!
+    const d1 = delta[i]!
+    if (d0 === 0 || d1 === 0 || d0 * d1 <= 0) {
+      tangent[i] = 0
+      continue
+    }
+    const h0 = h[i - 1]!
+    const h1 = h[i]!
+    const w1 = 2 * h1 + h0
+    const w2 = h1 + 2 * h0
+    tangent[i] = (w1 + w2) / (w1 / d0 + w2 / d1)
+  }
+  let d = `M${fmtCoord(anchors[0]!.x)},${fmtCoord(anchors[0]!.y)}`
+  for (let i = 0; i < n - 1; i++) {
+    const dx = h[i]!
+    const c1x = anchors[i]!.x + dx / 3
+    const c1y = anchors[i]!.y + (tangent[i]! * dx) / 3
+    const c2x = anchors[i + 1]!.x - dx / 3
+    const c2y = anchors[i + 1]!.y - (tangent[i + 1]! * dx) / 3
+    d += ` C${fmtCoord(c1x)},${fmtCoord(c1y)} ${fmtCoord(c2x)},${fmtCoord(c2y)} ${fmtCoord(anchors[i + 1]!.x)},${fmtCoord(anchors[i + 1]!.y)}`
+  }
+  return d
 }
 
 /**
@@ -1036,7 +1394,27 @@ function CallIndexStyles(): ReactElement {
     + '.v3-chartview{overflow-x:auto;cursor:grab;overscroll-behavior-x:contain;scrollbar-width:thin;user-select:none;-webkit-user-select:none}'
     + '.v3-chartview:active{cursor:grabbing}'
     + '.v3-chartview svg{display:block}'
-    + '.v3-src i[data-zero="true"]{background:var(--v3-panel-2)}',
+    + '.v3-src i[data-zero="true"]{background:var(--v3-panel-2)}'
+    // ---- self-drawn session dropdown (all --v3-* tokens) ----
+    + '.v3-dd{position:relative;display:inline-flex;align-items:center;gap:6px;font-size:12px}'
+    + '.v3-dd-l{color:var(--v3-t4)}'
+    + '.v3-dd-btn{display:inline-flex;align-items:center;gap:6px;min-width:150px;max-width:280px;height:26px;padding:0 8px;'
+    + 'border:1px solid var(--v3-line);border-radius:var(--v3-r-sm);background:var(--v3-panel);color:var(--v3-t1);'
+    + 'font:inherit;font-size:12px;cursor:pointer}'
+    + '.v3-dd-btn:hover{background:var(--v3-panel-2)}'
+    + '.v3-dd-btn:disabled{opacity:.55;cursor:default}'
+    + '.v3-dd-btn:focus-visible{outline:2px solid var(--v3-info);outline-offset:1px}'
+    + '.v3-dd-nm{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}'
+    + '.v3-dd-chev{width:9px;height:9px;color:var(--v3-t4);flex:none}'
+    + '.v3-dd-list{position:absolute;z-index:30;top:calc(100% + 4px);left:0;min-width:180px;max-width:330px;max-height:264px;'
+    + 'overflow:auto;margin:0;padding:4px;list-style:none;background:var(--v3-panel);border:1px solid var(--v3-line);'
+    + 'border-radius:var(--v3-r-md);box-shadow:0 8px 24px rgba(0,0,0,.2)}'
+    + '.v3-dd-item{display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:var(--v3-r-sm);color:var(--v3-t2);'
+    + 'font-size:12px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'
+    + '.v3-dd-item[data-hl="true"]{background:var(--v3-panel-2)}'
+    + '.v3-dd-item[data-sel="true"]{background:var(--v3-info-dim);color:var(--v3-t1)}'
+    + '.v3-chart .v3-area-band{opacity:1}'
+    + '.v3-chart .v3-line-smooth{stroke-linejoin:round;stroke-linecap:round}',
   )
 }
 
@@ -1111,81 +1489,92 @@ interface CallIndexChartDragEvent {
 }
 
 /**
- * The v3 overview trend: a line + area (calls), failure底柱 (error), a dashed
- * "recent week" band and a peak label, drawn inside a horizontally scrollable
- * strip so a long series can be panned instead of squeezed.
+ * The v3 overview trend: a smooth call curve with a gradient area fill, a
+ * low-key baseline band for failures, and only the peak and last points marked.
  *
- * Geometry comes from `callIndexTrend`'s bars (one data path). The SVG is
- * days x min-column wide (never narrower than the card), so day labels stay
- * legible; the wrapper scrolls and supports pointer drag-to-pan. The last day
- * label is right-anchored at the padding edge so it cannot overlap the one
- * before it.
+ * The series passed in is already aggregated to day/week/month, so the drawing
+ * never squeezes a hundred day columns into one card. The SVG keeps the
+ * min-column width and the wrapper stays a drag-to-pan strip; the x-axis label
+ * count is chosen by `callIndexTrendTicks` from the plotting width, and the last
+ * label is right-anchored so it cannot collide with its neighbour.
  */
-function OverviewTrendSvg(props: { readonly chart: CallIndexTrendChart }): ReactElement {
-  const { chart } = props
-  const bars = chart.bars
-  const n = bars.length
+function OverviewTrendSvg(props: { readonly series: CallIndexTrendSeries }): ReactElement {
+  const { series } = props
+  const points = series.points
+  const n = points.length
   const W = callIndexTrendWidth(n)
   const H = 212, padL = 34, padR = 22, padT = 12, padB = 26
   const plotW = W - padL - padR
   const plotH = H - padT - padB
-  const maxV = chart.maxCalls > 0 ? Math.ceil(chart.maxCalls / 10) * 10 : 1
+  const maxV = series.maxCalls > 0 ? Math.ceil(series.maxCalls / 10) * 10 : 1
+  const baseY = padT + plotH
   const xAt = (i: number): number => padL + (n <= 1 ? plotW / 2 : (i * plotW) / (n - 1))
-  const yAt = (v: number): number => padT + plotH - (v / maxV) * plotH
-  const points = bars.map((bar, i) => xAt(i).toFixed(1) + ',' + yAt(bar.calls).toFixed(1))
+  const yAt = (v: number): number => baseY - (v / maxV) * plotH
+  const anchors: CallIndexTrendAnchor[] = points.map((point, i) => ({ x: xAt(i), y: yAt(point.calls) }))
+  const linePath = callIndexSmoothPath(anchors)
+  const areaPath = n === 0
+    ? ''
+    : `${linePath} L${fmtCoord(anchors[n - 1]!.x)},${fmtCoord(baseY)} L${fmtCoord(anchors[0]!.x)},${fmtCoord(baseY)} Z`
+  const errorAnchors: CallIndexTrendAnchor[] = points.map((point, i) => ({ x: xAt(i), y: yAt(point.error) }))
+  const errorPath = series.totalError > 0 && n > 0
+    ? `${callIndexSmoothPath(errorAnchors)} L${fmtCoord(anchors[n - 1]!.x)},${fmtCoord(baseY)} L${fmtCoord(anchors[0]!.x)},${fmtCoord(baseY)} Z`
+    : ''
   let peak = 0
-  for (let i = 1; i < n; i++) if (bars[i]!.calls > bars[peak]!.calls) peak = i
+  for (let i = 1; i < n; i++) if (points[i]!.calls > points[peak]!.calls) peak = i
+  const modeText = series.mode === 'week' ? '按周' : series.mode === 'month' ? '按月' : '按日'
   const children: ReactNode[] = []
-  if (n > 0) {
-    const start = Math.max(0, n - 7)
-    const slot = n > 1 ? plotW / (n - 1) : plotW
-    const left = Math.max(padL, xAt(start) - slot / 2)
-    const right = Math.min(W - padR, xAt(n - 1) + slot / 2)
-    children.push(createElement('rect', {
-      key: 'hl', className: 'v3-hlbox', x: left.toFixed(1), y: padT,
-      width: Math.max(0, right - left).toFixed(1), height: plotH.toFixed(1), rx: 4,
-    }))
-  }
+  children.push(createElement('defs', { key: 'defs' },
+    createElement('linearGradient', { id: 'v3-trend-grad', x1: '0', y1: '0', x2: '0', y2: '1' },
+      createElement('stop', { offset: '0%', stopColor: 'var(--v3-info)', stopOpacity: '0.30' }),
+      createElement('stop', { offset: '100%', stopColor: 'var(--v3-info)', stopOpacity: '0.02' }),
+    )))
   for (let g = 0; g <= 4; g++) {
     const value = (maxV * g) / 4
     const y = yAt(value)
-    children.push(createElement('line', { key: 'grid-' + g, className: 'v3-grid', x1: padL, y1: y.toFixed(1), x2: W - padR, y2: y.toFixed(1) }))
-    children.push(createElement('text', { key: 'tick-' + g, className: 'v3-axis', x: padL - 7, y: (y + 3.5).toFixed(1), 'text-anchor': 'end' }, String(Math.round(value))))
+    children.push(createElement('line', { key: 'grid-' + g, className: 'v3-grid', x1: padL, y1: fmtCoord(y), x2: W - padR, y2: fmtCoord(y) }))
+    children.push(createElement('text', { key: 'tick-' + g, className: 'v3-axis', x: padL - 7, y: fmtCoord(y + 3.5), 'text-anchor': 'end' }, String(Math.round(value))))
   }
-  const barWidth = Math.max(4, plotW / Math.max(1, n) - 8)
-  bars.forEach((bar, i) => {
-    if (bar.error <= 0) return
-    const errH = Math.max(2.5, (bar.error / maxV) * plotH)
-    children.push(createElement('rect', {
-      key: 'err-' + bar.day, className: 'v3-bar-er', x: (xAt(i) - barWidth / 2).toFixed(1),
-      y: (padT + plotH - errH).toFixed(1), width: barWidth.toFixed(1), height: errH.toFixed(1), rx: 1.5,
-    }, createElement('title', null, bar.day + '：失败 ' + bar.error + ' 次')))
-  })
-  children.push(createElement('polygon', { key: 'area', className: 'v3-area', points: padL + ',' + (padT + plotH) + ' ' + points.join(' ') + ' ' + (W - padR) + ',' + (padT + plotH) }))
-  children.push(createElement('polyline', { key: 'line', className: 'v3-line', points: points.join(' ') }))
-  bars.forEach((bar, i) => {
-    if (i % 4 !== 0 && i !== n - 1 && i !== peak) return
+  // Failure data is a low-key baseline band, not a row of thin columns.
+  if (errorPath !== '') {
+    children.push(createElement('path', { key: 'failband', className: 'v3-failband', d: errorPath, style: { fill: 'var(--v3-bad)', opacity: 0.14 } }))
+  }
+  children.push(createElement('path', { key: 'area', className: 'v3-area-band', d: areaPath, style: { fill: 'url(#v3-trend-grad)' } }))
+  children.push(createElement('path', {
+    key: 'line', className: 'v3-line v3-line-smooth', d: linePath, style: { fill: 'none', strokeWidth: 2.2 },
+  }))
+  // Only the peak and the last point carry a dot; every point would be noise.
+  const dotIndices = n === 0 ? [] : [...new Set<number>([peak, n - 1])].sort((a, b) => a - b)
+  for (const i of dotIndices) {
     children.push(createElement('circle', {
-      key: 'pt-' + bar.day, className: 'v3-pt', cx: xAt(i).toFixed(1), cy: yAt(bar.calls).toFixed(1), r: 2.6,
-    }, createElement('title', null, bar.day + '：' + bar.calls + ' 次调用，失败 ' + bar.error + ' 次')))
-  })
+      key: 'pt-' + i, className: 'v3-pt v3-trend-dot', cx: fmtCoord(xAt(i)), cy: fmtCoord(yAt(points[i]!.calls)), r: 3,
+    }, createElement('title', null, points[i]!.label + '：' + points[i]!.calls + ' 次调用，失败 ' + points[i]!.error + ' 次')))
+  }
   if (n > 0) {
-    children.push(createElement('text', { key: 'peak', className: 'v3-lbl-b', x: (xAt(peak) - 8).toFixed(1), y: (yAt(bars[peak]!.calls) - 9).toFixed(1), 'text-anchor': 'end' }, '峰值 ' + bars[peak]!.calls))
-    // Evenly spaced day labels, kept clear of the final right-anchored one.
-    const step = Math.max(1, Math.ceil(n / 6))
-    for (let m = 0; m < n - 1; m += step) {
-      children.push(createElement('text', { key: 'xl-' + m, className: 'v3-axis', x: xAt(m).toFixed(1), y: H - 8, 'text-anchor': 'middle' }, bars[m]!.day.slice(5)))
-    }
     children.push(createElement('text', {
-      key: 'xl-last', className: 'v3-axis', x: (W - padR).toFixed(1), y: H - 8, 'text-anchor': 'end', 'data-call-index-lasttick': 'true',
-    }, bars[n - 1]!.day.slice(5)))
+      key: 'peak', className: 'v3-lbl-b', x: fmtCoord(xAt(peak) - 8),
+          // Keep the annotation inside the plot: a peak at the top edge would
+          // otherwise draw its label above the SVG and be clipped by the card.
+          y: fmtCoord(yAt(points[peak]!.calls) < 24
+            ? yAt(points[peak]!.calls) + 16
+            : yAt(points[peak]!.calls) - 9),
+          'text-anchor': 'end',
+    }, '峰值 ' + points[peak]!.calls))
+    const ticks = callIndexTrendTicks(n, plotW)
+    for (const index of ticks) {
+      const isLast = index === n - 1
+      children.push(createElement('text', {
+        key: 'xl-' + index, className: 'v3-axis', x: fmtCoord(isLast ? W - padR : xAt(index)), y: H - 8,
+        'text-anchor': isLast ? 'end' : 'middle',
+        ...(isLast ? { 'data-call-index-lasttick': 'true' } : {}),
+      }, points[index]!.label))
+    }
   }
   const svg = createElement('svg', {
     className: 'v3-chart', viewBox: '0 0 ' + W + ' ' + H, preserveAspectRatio: 'none', role: 'img',
     width: W, height: H,
     style: { width: W + 'px', minWidth: '100%', height: H + 'px' },
-    'aria-label': '每日调用与失败数：' + n + ' 天，峰值 ' + chart.maxCalls + ' 次',
-    'data-call-index-svg': 'trend', 'data-call-index-width': String(W),
+    'aria-label': `${modeText}调用趋势（已索引部分）：${n} 个点，峰值 ${series.maxCalls} 次`,
+    'data-call-index-svg': 'trend', 'data-call-index-width': String(W), 'data-call-index-trend-mode': series.mode,
   }, ...children)
   // Drag-to-pan: pointer movement scrolls the strip horizontally.
   let dragging = false
@@ -1586,14 +1975,80 @@ function CallIndexScanBar({ status }: { readonly status?: CallIndexStatusView })
   ))
 }
 
+/**
+ * Self-drawn session dropdown: a trigger button plus a listbox, themed entirely
+ * with `--v3-*` tokens. The native `<select>` it replaces ignored the dark
+ * palette (white panel, blue native selection). The trigger keeps the
+ * `data-call-index-session-select` contract attribute. State is owned by the
+ * container and passed through `menu`, so this view stays hook-free/testable.
+ */
+function CallIndexSessionSelectView(props: {
+  readonly query: CallIndexQuery
+  readonly catalog: CallIndexSessionCatalog
+  readonly disabled: boolean
+  readonly menu: CallIndexSessionMenu
+}): ReactElement {
+  const { query, catalog, disabled, menu } = props
+  const items = catalog.items
+  const current = query.sessionId === undefined ? undefined : items.find(item => item.id === query.sessionId)
+  // An id the catalog cannot name is still a real selection; show the raw id.
+  const triggerLabel = current !== undefined ? current.name : (query.sessionId ?? '选择会话')
+  return createElement('div', {
+    className: 'v3-dd',
+    ...(menu.rootRef === undefined ? {} : { ref: menu.rootRef }),
+  },
+    createElement('span', { className: 'v3-dd-l' }, '会话'),
+    createElement('button', {
+      type: 'button',
+      className: 'v3-dd-btn',
+      'data-call-index-session-select': 'true',
+      'aria-haspopup': 'listbox',
+      'aria-expanded': menu.open,
+      'aria-label': '选择会话',
+      disabled,
+      onClick: () => { if (!disabled) menu.onToggle() },
+      onKeyDown: (event: { key: string; preventDefault?: () => void }) => {
+        if (disabled) return
+        const result = callIndexSessionMenuKey(event.key, { open: menu.open, highlight: menu.highlight, count: items.length })
+        if (result.action === 'none') return
+        if (typeof event.preventDefault === 'function') event.preventDefault()
+        menu.onKey(event.key)
+      },
+    },
+      createElement('span', { className: 'v3-dd-nm' }, triggerLabel),
+      createElement('svg', { className: 'v3-dd-chev', viewBox: '0 0 10 6', 'aria-hidden': 'true' },
+        createElement('path', {
+          d: 'M1 1l4 4 4-4', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.4,
+          'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+        })),
+    ),
+    menu.open
+      ? createElement('ul', { className: 'v3-dd-list', role: 'listbox', 'aria-label': '会话列表' },
+          ...items.map((item, index) => createElement('li', {
+            key: item.id,
+            className: 'v3-dd-item',
+            role: 'option',
+            'aria-selected': item.id === query.sessionId,
+            'data-hl': index === menu.highlight,
+            'data-sel': item.id === query.sessionId,
+            onMouseEnter: () => menu.onHighlight(index),
+            onClick: () => { if (!disabled) menu.onSelect(index) },
+          }, item.name)))
+      : null,
+  )
+}
+
 function CallIndexFilters(props: {
   readonly query: CallIndexQuery
   readonly onChange?: (query: CallIndexQuery) => void
   /** Resolves the live selection when 按会话 / 按工作区 is chosen. */
   readonly onResolveScope?: (() => CallIndexScopeTarget) | undefined
   readonly catalog?: CallIndexSessionCatalog | undefined
+  /** Interactivity for the session dropdown; defaults to a closed no-op menu. */
+  readonly sessionMenu?: CallIndexSessionMenu | undefined
 }): ReactElement {
   const { query, onChange, onResolveScope, catalog } = props
+  const sessionMenu = props.sessionMenu ?? CALL_INDEX_EMPTY_SESSION_MENU
   const canChange = onChange !== undefined
   const change = (patch: Partial<CallIndexQuery>): void => {
     if (onChange !== undefined) onChange({ ...query, ...patch })
@@ -1619,50 +2074,34 @@ function CallIndexFilters(props: {
     }, CALL_INDEX_SCOPE_LABELS[scope])
   })
   // The session picker only exists while 按会话 is active: it is the control
-  // that turns 「只看当前会话」 into 「看任意会话」. A native <select> is used
-  // deliberately — it is keyboard- and screen-reader-complete for free, and the
-  // list can be long enough that a pill row would not scale.
+  // that turns 「只看当前会话」 into 「看任意会话」. It is self-drawn (not a native
+  // `<select>`) so it follows the dark theme; the trigger keeps the
+  // `data-call-index-session-select` contract attribute.
   const sessionPicker = query.scope === 'session' && catalog !== undefined && catalog.items.length > 0
-    ? createElement('label', { className: 'mc-ci-session-picker' },
-        createElement('span', { className: 'mc-ci-session-picker-label' }, '会话'),
-        createElement('select', {
-          className: 'mc-ci-session-select',
-          'data-call-index-session-select': 'true',
-          'aria-label': '选择会话',
-          disabled: !canChange,
-          value: query.sessionId ?? '',
-          onChange: (event: { target: { value: string } }) => {
-            const next = event.target.value
-            if (next === '') return
-            change({ scope: 'session', range: 'all', sessionId: next, cwd: undefined })
-          },
-        },
-        // An unbound selection is a real state (the Host had no current Session
-        // when the scope was chosen), so it gets a real option instead of
-        // silently displaying the first Session's name.
-        ...(query.sessionId === undefined || catalog.items.some(item => item.id === query.sessionId)
-          ? []
-          : [createElement('option', { key: '__stale', value: query.sessionId }, query.sessionId)]),
-        ...catalog.items.map(item => createElement('option', {
-          key: item.id,
-          value: item.id,
-        }, item.name)),
-        ),
-      )
+    ? createElement(CallIndexSessionSelectView, {
+        query,
+        catalog,
+        disabled: !canChange,
+        menu: sessionMenu,
+      })
     : null
 
+  // The hint is redundant while the session picker is on screen: the trigger
+  // already names the selected session. Keep it (on its own line) for the other
+  // scopes, where nothing else states what the numbers are bound to.
+  const hintText = sessionPicker === null ? scopeHint(query, catalog) : undefined
   return createElement('div', { className: 'mc-ci-filter', role: 'group', 'aria-label': '调用明细筛选' },
-    createElement('div', { className: 'mc-tab-group', role: 'group', 'aria-label': '统计范围' }, scopes),
-    sessionPicker,
-    // 工作区 / 会话 are no longer separate selects: each scope binds one of them
-    // to the live context and reports it in the hint below, so nothing narrows
-    // the set without saying so.
-    scopeHint(query, catalog) === undefined
+    createElement('div', { className: 'v3-filter-row' },
+      createElement('div', { className: 'mc-tab-group', role: 'group', 'aria-label': '统计范围' }, scopes),
+      sessionPicker,
+    ),
+    hintText === undefined
       ? null
-      : createElement('span', {
+      : createElement('p', {
           className: 'mc-desc',
           'data-call-index-note': 'scope-hint',
-        }, scopeHint(query, catalog)),
+          style: { flexBasis: '100%', margin: '6px 0 0' },
+        }, hintText),
   )
 }
 
@@ -1846,6 +2285,8 @@ export interface CallIndexDetailPanelViewProps {
   readonly onResolveScope?: (() => CallIndexScopeTarget) | undefined
   /** Session names + the switchable list for 按会话. */
   readonly catalog?: CallIndexSessionCatalog | undefined
+  /** Interactivity for the self-drawn session dropdown (owned by the container). */
+  readonly sessionMenu?: CallIndexSessionMenu | undefined
   /**
    * Tool-name search inside the detail card. A local client-side filter over the
    * already-fetched per-tool rows — NOT a wire field, so it never narrows the
@@ -1880,11 +2321,16 @@ export interface CallIndexDetailPanelViewProps {
 export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): ReactElement {
   const {
     query, status, page,
-    loading, loadingMore, failure, onQueryChange, onResolveScope, catalog,
+    loading, loadingMore, failure, onQueryChange, onResolveScope, catalog, sessionMenu,
     moreFailure,
     startFailure, startTask,
     search, onSearchChange,
   } = props
+  // A stale paging cursor is benign churn (the snapshot was re-read); it must
+  // never reach the red diagnostic box or the duplicate bottom line.
+  const moreFailureVisible = moreFailure !== undefined && !callIndexIsCursorStale(moreFailure)
+    ? moreFailure
+    : undefined
   const state = callIndexDetailState({
     status,
     page,
@@ -1938,6 +2384,12 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
   const readCalls = rows.reduce((sum, row) => sum + row.calls, 0)
   const totalCalls = page === undefined ? undefined : (page.total ?? page.summary.total)
   const readIsPartial = totalCalls !== undefined && readCalls < totalCalls
+  // The failure card must judge "no failures" against what was actually READ,
+  // never against the full range: on a partial read a confident "0 failures" is
+  // exactly the false zero this page exists to avoid.
+  const loadedCallCount = allRows.reduce((sum, row) => sum + row.calls, 0)
+  const loadedPartial = totalCalls !== undefined && loadedCallCount < totalCalls
+  const fullFailureCount = page === undefined ? undefined : page.summary.error
 
   const rankRows = rows.slice(0, 12)
   const rankMax = rankRows.length > 0 ? rankRows[0]!.calls : 1
@@ -1984,6 +2436,7 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
           ...(onQueryChange === undefined ? {} : { onChange: onQueryChange }),
           ...(onResolveScope === undefined ? {} : { onResolveScope }),
           ...(catalog === undefined ? {} : { catalog }),
+          ...(sessionMenu === undefined ? {} : { sessionMenu }),
         }),
         searchInput,
       ),
@@ -2013,7 +2466,7 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
       ...(page === undefined ? {} : { page }),
       ...(failure === undefined ? {} : { failure }),
       ...(startFailure === undefined ? {} : { startFailure }),
-      ...(moreFailure === undefined ? {} : { moreFailure }),
+      ...(moreFailureVisible === undefined ? {} : { moreFailure: moreFailureVisible }),
     }),
     // Four stats (v3 adds 平均耗时 as the fourth). Counts sit under the rates so a
     // percentage never floats without its denominator.
@@ -2061,7 +2514,10 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
           createElement('span', { className: 'v3-pn' }, '按失败数排序'),
         ),
         failingRows.length === 0
-          ? createElement('p', { className: 'v3-hint' }, '当前范围没有失败调用。')
+          ? createElement('p', { className: 'v3-hint', 'data-call-index-note': 'fail-empty' },
+              loadedPartial && (fullFailureCount ?? 0) > 0
+                ? `已读取的 ${formatCallIndexCount(loadedCallCount, page?.totalExact)} 次调用里没有失败；全范围失败共 ${formatCallIndexCount(fullFailureCount, page?.totalExact)} 次，未读取部分不参与排行。`
+                : '当前范围没有失败调用。')
           : createElement('div', { className: 'v3-rank' },
               ...failingRows.slice(0, 8).map(row => {
                 const perTool = Math.round((row.error / row.calls) * 100)
@@ -2075,8 +2531,10 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
                   createElement('span', { className: 'v3-e', 'data-bad': 'true' }, `占该工具 ${perTool}%`),
                 )
               })),
-        createElement('p', { className: 'v3-hint', style: { marginTop: 9 } },
-          `条长 = 失败次数（不是失败率）。共 ${failingRows.length} 个工具出现过失败。`),
+        failingRows.length === 0
+          ? null
+          : createElement('p', { className: 'v3-hint', style: { marginTop: 9 } },
+              `条长 = 失败次数（不是失败率）。共 ${failingRows.length} 个工具出现过失败。`),
       ),
     ),
     // full tool table, demoted to an appendix: bounded 330px scroller, sticky head
@@ -2096,12 +2554,12 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
       ? createElement('p', { className: 'v3-hint', 'data-call-index-note': 'loading-more', style: { marginTop: 8 } },
           '正在加载其余工具…')
       : null,
-    moreFailure === undefined ? null : createElement('p', {
+    moreFailureVisible === undefined ? null : createElement('p', {
       className: 'v3-hint',
       'data-call-index-note': 'more-failure',
       role: 'status',
       style: { marginTop: 8 },
-    }, `加载失败：${callIndexFailureText(moreFailure)}`),
+    }, `加载失败：${callIndexFailureText(moreFailureVisible)}`),
   )
 }
 
@@ -2160,7 +2618,10 @@ export function CallIndexOverviewPanelView(props: CallIndexOverviewPanelViewProp
     ? '没有已知结果的调用'
     : `${stats.numerator} / ${stats.denominator} 次已知结果`
 
-  const trend = callIndexTrend(aggregates?.byDay)
+  const trendBuckets = aggregates?.byDay
+  const trendSpan = callIndexTrendSpanDays(trendBuckets)
+  const trendMode = callIndexTrendMode(trendSpan)
+  const trend = callIndexTrendSeries(trendBuckets, trendMode)
   const callSpark = aggregates?.byDay === undefined ? undefined : aggregates.byDay.map(bucket => bucket.calls)
   const successSpark = aggregates?.byDay === undefined ? undefined : aggregates.byDay.map(bucket => bucket.calls > 0 ? bucket.success / bucket.calls : 0)
   const errorSpark = aggregates?.byDay === undefined ? undefined : aggregates.byDay.map(bucket => bucket.error)
@@ -2235,22 +2696,23 @@ export function CallIndexOverviewPanelView(props: CallIndexOverviewPanelViewProp
     createElement('div', { className: 'v3-board', style: { marginTop: 12 } },
       createElement('div', { className: 'v3-panel' },
         createElement('div', { className: 'v3-ph' },
-          createElement('span', { className: 'v3-pt' }, '按日调用趋势'),
+          createElement('span', { className: 'v3-pt' }, '调用趋势'),
           createElement('span', { className: 'v3-pn' }, aggregates === undefined
             ? '趋势不可用'
-            : `合计 ${trend.totalCalls} 次 · 峰值 ${trend.maxCalls} 次`),
+            : `${trendModeName(trend.mode)} · 合计 ${trend.totalCalls} 次 · 峰值 ${trend.maxCalls} 次`),
         ),
         aggregates === undefined
           ? createElement('p', { className: 'v3-hint', 'data-call-index-missing': 'aggregates' }, 'Host 未返回按日聚合（aggregates）；这不是「没有调用」，趋势不可用。')
           : !trend.available
             ? createElement('p', { className: 'v3-hint', 'data-call-index-missing': 'by-day' }, '该筛选在所选范围内没有任何按日桶，趋势为空；单个日粒度为 0 不参与绘制。')
-            : createElement(OverviewTrendSvg, { chart: trend }),
-        aggregates === undefined || !trend.available
+            : trend.points.length === 0
+              ? createElement('p', { className: 'v3-hint', 'data-call-index-missing': 'by-day' }, '该筛选在所选范围内没有任何按日桶，趋势为空；单个日粒度为 0 不参与绘制。')
+              : createElement(OverviewTrendSvg, { series: trend }),
+        aggregates === undefined || !trend.available || trend.points.length === 0
           ? null
           : createElement('div', { className: 'v3-legend' },
-              createElement('span', null, createElement('i', { style: { background: 'var(--v3-info)' } }), '每日调用量（折线 + 面积）'),
-              createElement('span', null, createElement('i', { 'data-mark': 'square', style: { background: 'var(--v3-bad)' } }), '每日失败数（底柱）'),
-              createElement('span', null, createElement('i', { style: { background: 'var(--v3-info)', opacity: 0.3, height: 8, borderRadius: 2 } }), '最近一周'),
+              createElement('span', null, createElement('i', { style: { background: 'var(--v3-info)' } }), `${trendModeName(trend.mode)}调用量（平滑曲线 + 面积）`),
+              createElement('span', null, createElement('i', { 'data-mark': 'square', style: { background: 'var(--v3-bad)' } }), `${trendModeName(trend.mode)}失败（底层面积带）`),
             ),
       ),
       OverviewSourcePanel({
@@ -2477,20 +2939,31 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
   // wire query, so the Host keeps returning the same snapshot while the operator
   // types. Resets only on a full remount, matching the tab's lifetime.
   const [search, setSearch] = useState('')
+  // Self-drawn session dropdown state. Lives here (not in the pure view) so the
+  // view stays hook-free and the suite can walk it without a DOM.
+  const [sessionOpen, setSessionOpen] = useState(false)
+  const [sessionHighlight, setSessionHighlight] = useState(0)
+  const sessionMenuRef = useRef<HTMLDivElement | null>(null)
   const generation = useRef(0)
   // The `now` the current page was fetched with. Paging must reuse it, or the
   // cursor's filter no longer matches and the Host answers invalid-request.
   const pageAnchor = useRef<number | undefined>(undefined)
   /** How many extra pages 加载更多 has appended; 0 means only the first page. */
   const appendedPages = useRef(0)
+  /** A stale cursor is allowed exactly ONE silent re-read per query lifetime. */
+  const cursorStaleRetried = useRef(false)
+  /** Set once paging has to stop (benign stale with no retry left) to halt auto-fill. */
+  const pagingStopped = useRef(false)
   // A different query invalidates paging: the rows are a different set. This is
-  // the ONLY place the counter resets — the refresh effect must not touch it,
+  // the ONLY place these counters reset — the refresh effect must not touch them,
   // because that effect also runs for the 2s background poll.
   const queryKey = JSON.stringify(query)
   const lastQueryKey = useRef(queryKey)
   if (lastQueryKey.current !== queryKey) {
     lastQueryKey.current = queryKey
     appendedPages.current = 0
+    cursorStaleRetried.current = false
+    pagingStopped.current = false
   }
   const narrow = useNarrowViewport()
   // Read the Host Session catalog on every render: names must not go stale, and
@@ -2501,12 +2974,56 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
     try { return resolveSessionCatalog() } catch { return undefined }
   })()
 
+  // Session dropdown wiring: outside-click closes it, and every callback folds
+  // back into the same query so picking a Session is one atomic change.
+  const sessionItems = catalog?.items ?? []
+  useEffect(() => {
+    if (!sessionOpen) return
+    const onDoc = (event: Event): void => {
+      const target = event.target
+      if (sessionMenuRef.current !== null && target instanceof Node && !sessionMenuRef.current.contains(target)) {
+        setSessionOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [sessionOpen])
+  const selectSessionAt = (index: number): void => {
+    const item = sessionItems[index]
+    if (item === undefined) { setSessionOpen(false); return }
+    setQuery(current => ({ ...current, scope: 'session', range: 'all', sessionId: item.id, cwd: undefined }))
+    setSessionOpen(false)
+  }
+  const openMenu = (): void => {
+    setSessionOpen(true)
+    setSessionHighlight(Math.max(0, sessionItems.findIndex(item => item.id === query.sessionId)))
+  }
+  const sessionMenu: CallIndexSessionMenu = {
+    open: sessionOpen,
+    highlight: sessionHighlight,
+    onToggle: () => { if (sessionOpen) setSessionOpen(false); else openMenu() },
+    onClose: () => setSessionOpen(false),
+    onHighlight: index => setSessionHighlight(index),
+    onSelect: index => selectSessionAt(index),
+    onKey: key => {
+      const result = callIndexSessionMenuKey(key, { open: sessionOpen, highlight: sessionHighlight, count: sessionItems.length })
+      if (result.action === 'none') return
+      if (result.action === 'close') setSessionOpen(false)
+      else if (result.action === 'open') openMenu()
+      else if (result.action === 'move') { setSessionOpen(true); setSessionHighlight(result.highlight) }
+      else if (result.action === 'select') selectSessionAt(result.highlight)
+    },
+    rootRef: sessionMenuRef,
+  }
+
   useEffect(() => {
     const requestGeneration = ++generation.current
     let active = true
     // Pin one clock reading for this page set; every later page reuses it.
     const anchor = Date.now()
     pageAnchor.current = anchor
+    // A full first-page read is a clean paging start: let auto-fill run again.
+    pagingStopped.current = false
     // NOTE: do NOT reset `appendedPages` here. This effect also runs for the
     // 2s background refresh (it depends on `refreshToken`), so resetting here
     // cleared the counter on every tick — the merge then always saw 0 and
@@ -2595,11 +3112,36 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
     setState(previous => ({ ...previous, loadingMore: true, moreFailure: undefined }))
     void (async () => {
       const result = await api.listCalls(query, cursor, pinnedAt)
+      if (generation.current !== requestGeneration) {
+        setState(previous => ({ ...previous, loadingMore: false }))
+        return
+      }
+      if (!result.ok) {
+        const action = callIndexMoreFailureAction(result, cursorStaleRetried.current)
+        if (action === 'retry') {
+          // A completed re-read invalidated the old cursor: restart silently from
+          // page one. No red block, no duplicate 「加载失败…」 line, and at most one
+          // retry per query so a pathological snapshot cannot spin forever.
+          cursorStaleRetried.current = true
+          pagingStopped.current = true
+          appendedPages.current = 0
+          setState(previous => ({ ...previous, loadingMore: false, moreFailure: undefined }))
+          setRefreshToken(value => value + 1)
+          return
+        }
+        if (action === 'silent') {
+          // Already retried once; stop paging quietly rather than loop or shout.
+          pagingStopped.current = true
+          setState(previous => ({ ...previous, loadingMore: false, moreFailure: undefined }))
+          return
+        }
+        // Every other reason stays visible: a silent no-op is indistinguishable
+        // from a broken button, which is exactly how this was reported.
+        setState(previous => ({ ...previous, loadingMore: false, moreFailure: result }))
+        return
+      }
       setState(previous => {
         if (generation.current !== requestGeneration) return { ...previous, loadingMore: false }
-        // A failed page must be visible: a silent no-op is indistinguishable from
-        // a broken button, which is exactly how this was reported.
-        if (!result.ok) return { ...previous, loadingMore: false, moreFailure: result }
         appendedPages.current += 1
         return {
           ...previous,
@@ -2615,7 +3157,7 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
         }
       })
     })()
-  }, [api, query, state.page?.nextCursor])
+  }, [api, query, state.page?.nextCursor, setRefreshToken])
 
   /**
    * Fill the table to the end of the snapshot without a button.
@@ -2630,6 +3172,7 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
    * snapshot from turning the panel into a thousand round-trips.
    */
   useEffect(() => {
+    if (pagingStopped.current) return
     if (state.page?.nextCursor === undefined || state.loadingMore || state.loading) return
     if (appendedPages.current >= MAX_AUTO_PAGES) return
     if (state.moreFailure !== undefined) return
@@ -2716,6 +3259,7 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
     onStartIndex: startIndex,
     ...(resolveScopeTarget === undefined ? {} : { onResolveScope: resolveScopeTarget }),
     ...(catalog === undefined ? {} : { catalog }),
+    sessionMenu,
     onSelect: select,
     onCloseDetail: closeDetail,
   })
@@ -2767,7 +3311,9 @@ export function CallIndexOverviewPanel({ api }: CallIndexOverviewPanelProps): Re
         let pages = 0
         while (cursor !== undefined && pages < MAX_AUTO_PAGES) {
           const next = await api.listCalls(query, cursor, anchor)
-          if (!next.ok) { toolsFailure = next; break }
+          // A stale cursor here just means the snapshot was re-read; stop filling
+          // without turning expected churn into a visible failure.
+          if (!next.ok) { if (!callIndexIsCursorStale(next)) toolsFailure = next; break }
           items.push(...next.value.items)
           cursor = next.value.nextCursor
           pages += 1

@@ -44,6 +44,15 @@ import {
   detailAfterRefresh,
   showsCoverageNotice,
   callIndexTrend,
+  callIndexTrendSeries,
+  callIndexTrendMode,
+  callIndexTrendTicks,
+  callIndexTrendSpanDays,
+  callIndexSmoothPath,
+  trendModeName,
+  callIndexIsCursorStale,
+  callIndexMoreFailureAction,
+  callIndexSessionMenuKey,
   buildCallIndexListRequest,
   buildCallIndexQueryFilter,
   buildCallIndexSummaryRequest,
@@ -675,21 +684,30 @@ describe('aggregates and trend', () => {
     expect(chart.bars[0]?.ratio).toBe(0)
   })
 
-  it('draws the v3 line + area + failure bars inside a 720×212 viewBox', () => {
-    // v3 replaces the old one-rect-per-day bar chart with a line+area chart
-    // (calls) plus a failure底柱 for each nonzero-error day, a dashed recent-week
-    // band and a peak label. The old assertion pinned the removed bar-per-day, so
-    // it now pins the new structure — same intent (a real, bounded trend drawing).
+  it('draws a smooth cubic-bezier area trend with a failure band, not thin bars', () => {
+    // Reported: 「柱子太细、日期挤在一起」. The one-rect-per-day chart is gone; the
+    // main series is a smooth curve (cubic Béziers, `C` commands) with an area
+    // fill, only the peak and last points are dotted, and failures are a baseline
+    // band rather than a row of thin error columns.
     const view = CallIndexOverviewPanelView({ status: statusView(), overview: overviewView() })
     const svg = nodesWith(view, element => element.props['data-call-index-svg'] === 'trend')
     expect(svg).toHaveLength(1)
-    expect(svg[0]?.props.viewBox).toBe('0 0 ' + callIndexTrendWidth((AGGREGATES.byDay ?? []).length) + ' 212')
-    const lines = nodesWith(view, element => element.props.className === 'v3-line')
-    expect(lines).toHaveLength(1)
-    expect(String(lines[0]?.props.points).split(' ')).toHaveLength(AGGREGATES.byDay?.length ?? 0)
-    const errBars = nodesWith(view, element => element.props.className === 'v3-bar-er')
-    expect(errBars).toHaveLength((AGGREGATES.byDay ?? []).filter(day => day.error > 0).length)
-    expect(nodesWith(view, element => element.props.className === 'v3-hlbox')).toHaveLength(1)
+    expect(svg[0]?.props.viewBox).toBe('0 0 ' + callIndexTrendWidth(AGGREGATES.byDay?.length ?? 0) + ' 212')
+    const line = nodesWith(view, element => typeof element.props.className === 'string' && element.props.className.includes('v3-line'))
+    expect(line).toHaveLength(1)
+    const d = String(line[0]?.props.d)
+    expect(d.startsWith('M')).toBe(true)
+    expect(d).toContain('C')
+    // No dotted circle on every point: at most the peak + last.
+    const dots = nodesWith(view, element => typeof element.props.className === 'string' && element.props.className.includes('v3-trend-dot'))
+    expect(dots.length).toBeGreaterThanOrEqual(1)
+    expect(dots.length).toBeLessThanOrEqual(2)
+    // Failure data is a low-key band; the old per-day error rectangles are gone.
+    expect(nodesWith(view, element => element.props.className === 'v3-bar-er')).toHaveLength(0)
+    const band = nodesWith(view, element => element.props.className === 'v3-failband')
+    expect(band).toHaveLength((AGGREGATES.byDay ?? []).some(day => day.error > 0) ? 1 : 0)
+    // A gradient area fill is present.
+    expect(nodesWith(view, element => element.props.className === 'v3-area-band')).toHaveLength(1)
   })
 
   it('no longer prints the day-boundary line', () => {
@@ -998,13 +1016,13 @@ describe('filters and requests', () => {
       page: callPage(),
       catalog,
     })
-    // The attribute is the string 'true' (JSX/React renders data-* attributes as
-    // strings), so comparing with the boolean `true` would silently match
-    // nothing — verified the hard way while writing this test.
-    const select = nodesWith(bound, el => el.props['data-call-index-session-select'] === 'true')
-    expect(select).toHaveLength(1)
-    const options = nodesWith(bound, el => el.type === 'option')
-    expect(options.map(o => o.props.children)).toEqual(['修复索引扫描', '重构调用明细'])
+    // Self-drawn dropdown: the contract attribute lives on the trigger BUTTON now,
+    // and the native <select>/<option> pair is gone (it ignored the dark theme).
+    const trigger = nodesWith(bound, el => el.props['data-call-index-session-select'] === 'true')
+    expect(trigger).toHaveLength(1)
+    expect(trigger[0]?.type).toBe('button')
+    expect(nodesWith(bound, el => el.type === 'select')).toHaveLength(0)
+    expect(nodesWith(bound, el => el.type === 'option')).toHaveLength(0)
     // Not shown on the other scopes: there is nothing to pick.
     const allScope = CallIndexDetailPanelView({ query: { range: 'all', scope: 'all' }, page: callPage(), catalog })
     expect(nodesWith(allScope, el => el.props['data-call-index-session-select'] === 'true')).toHaveLength(0)
@@ -1687,9 +1705,12 @@ describe('v3 polish', () => {
     }
   })
 
-  it('pans the trend: a scroll strip whose svg width grows with the day count', () => {
-    const manyDays = Array.from({ length: 30 }, (_, i) => ({
-      day: '2026-10-' + String((i % 28) + 1).padStart(2, '0'),
+  it('pans the trend: a scroll strip whose svg width grows with the point count', () => {
+    // 14 distinct days stay per-day (span <= 14), so the SVG grows with the point
+    // count; a wider series keeps the drag-to-pan strip and a right-anchored last
+    // label so it cannot overlap the tick before it.
+    const manyDays = Array.from({ length: 14 }, (_, i) => ({
+      day: '2026-10-' + String(i + 1).padStart(2, '0'),
       calls: i + 1, success: 0, error: 0, cancelled: 0, unresolved: 0, unknown: 0, running: 0,
     }))
     const few = CallIndexOverviewPanelView({ status: statusView(), overview: overviewView() })
@@ -1701,6 +1722,7 @@ describe('v3 polish', () => {
     const wFew = Number(nodesWith(few, el => el.props['data-call-index-width'] !== undefined)[0]?.props['data-call-index-width'])
     const wMany = Number(nodesWith(many, el => el.props['data-call-index-width'] !== undefined)[0]?.props['data-call-index-width'])
     expect(wMany).toBeGreaterThan(wFew)
+    expect(nodesWith(many, el => el.props['data-call-index-trend-mode'] === 'day').length).toBeGreaterThanOrEqual(1)
     // The last day label is right-anchored so it cannot overlap the previous one.
     const lastTick = nodesWith(many, el => el.props['data-call-index-lasttick'] === 'true')[0]
     expect(lastTick?.props['text-anchor']).toBe('end')
@@ -1722,6 +1744,237 @@ describe('v3 polish', () => {
     expect(running).toContain('仍在扫描')
     const done = visible(CallIndexOverviewPanelView({ status: statusView(), overview: overviewView() }))
     expect(done).toContain('扫描已完成')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 14. v3.1 trend rework — smooth curve, day/week/month aggregation, fitting ticks
+// ---------------------------------------------------------------------------
+
+describe('v3.1 trend rework', () => {
+  interface DayBucket {
+    day: string; calls: number; success: number; error: number
+    cancelled: number; unresolved: number; unknown: number; running: number
+  }
+  const day = (iso: string, calls: number, error = 0): DayBucket => ({
+    day: iso, calls, success: calls - error, error, cancelled: 0, unresolved: 0, unknown: 0, running: 0,
+  })
+
+  function rangeDays(count: number, startUtc: number): Array<ReturnType<typeof day>> {
+    return Array.from({ length: count }, (_, i) => {
+      const d = new Date(startUtc + i * 86_400_000)
+      const iso = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`
+      return day(iso, 1, i % 10 === 0 ? 1 : 0)
+    })
+  }
+
+  it('builds a smooth path with cubic Béziers and never overshoots the data range', () => {
+    const anchors = [
+      { x: 0, y: 100 }, { x: 50, y: 20 }, { x: 100, y: 80 }, { x: 150, y: 10 },
+    ]
+    const d = callIndexSmoothPath(anchors)
+    expect(d.startsWith('M')).toBe(true)
+    // One `C` segment per gap between anchors.
+    expect((d.match(/C/g) ?? []).length).toBe(anchors.length - 1)
+    // Every coordinate pair's y stays inside the [min,max] envelope (单调不越界).
+    const ys = [...d.matchAll(/(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/g)].map(m => Number(m[2]))
+    expect(Math.min(...ys)).toBeGreaterThanOrEqual(10)
+    expect(Math.max(...ys)).toBeLessThanOrEqual(100)
+    // A single anchor is just a moveto; empty input is empty.
+    expect(callIndexSmoothPath([{ x: 5, y: 5 }])).toBe('M5,5')
+    expect(callIndexSmoothPath([])).toBe('')
+  })
+
+  it('picks day / week / month by span', () => {
+    expect(callIndexTrendMode(1)).toBe('day')
+    expect(callIndexTrendMode(14)).toBe('day')
+    expect(callIndexTrendMode(15)).toBe('week')
+    expect(callIndexTrendMode(60)).toBe('week')
+    expect(callIndexTrendMode(61)).toBe('month')
+    expect(callIndexTrendMode(90)).toBe('month')
+    expect(callIndexTrendSpanDays(undefined)).toBe(0)
+    expect(callIndexTrendSpanDays(rangeDays(90, Date.UTC(2026, 7, 1)))).toBe(90)
+    expect(trendModeName('day')).toBe('按日')
+    expect(trendModeName('week')).toBe('按周')
+    expect(trendModeName('month')).toBe('按月')
+  })
+
+  it('aggregates 90 days into months (single-year labels) and preserves totals', () => {
+    const buckets = rangeDays(90, Date.UTC(2026, 7, 1)) // Aug 1 .. Oct 29 2026
+    expect(callIndexTrendMode(callIndexTrendSpanDays(buckets))).toBe('month')
+    const series = callIndexTrendSeries(buckets, 'month')
+    // Aug / Sep / Oct — three monthly points, no fabricated empty month.
+    expect(series.points.map(p => p.key)).toEqual(['2026-08', '2026-09', '2026-10'])
+    expect(series.points.map(p => p.label)).toEqual(['8 月', '9 月', '10 月'])
+    expect(series.points.reduce((sum, p) => sum + p.calls, 0)).toBe(90)
+    expect(series.totalCalls).toBe(90)
+    // Weekly and daily aggregations of the same raw data stay consistent.
+    const weekly = callIndexTrendSeries(buckets, 'week')
+    expect(weekly.points.length).toBeGreaterThan(3)
+    expect(weekly.totalCalls).toBe(90)
+    expect(weekly.points[0]!.label).toMatch(/^\d{2}-\d{2}$/)
+    const daily = callIndexTrendSeries(buckets, 'day')
+    expect(daily.points).toHaveLength(90)
+  })
+
+  it('keeps the year in month labels when the span crosses a year boundary', () => {
+    const buckets = [
+      day('2025-12-30', 2), day('2025-12-31', 1), day('2026-01-01', 4), day('2026-01-02', 1),
+    ]
+    const series = callIndexTrendSeries(buckets, 'month')
+    expect(series.points.map(p => p.label)).toEqual(['2025-12', '2026-01'])
+  })
+
+  it('chooses ticks that fit the width and never overlap (90-day data)', () => {
+    const buckets = rangeDays(90, Date.UTC(2026, 7, 1))
+    const monthly = callIndexTrendSeries(buckets, 'month')
+    const weekly = callIndexTrendSeries(buckets, 'week')
+    const plotWidth = 420 // a typical narrow card
+    for (const series of [monthly, weekly]) {
+      const n = series.points.length
+      const ticks = callIndexTrendTicks(n, plotWidth)
+      // Ascending, inside bounds, first + last always present.
+      expect(ticks[0]).toBe(0)
+      expect(ticks[ticks.length - 1]).toBe(n - 1)
+      for (let i = 1; i < ticks.length; i++) expect(ticks[i]!).toBeGreaterThan(ticks[i - 1]!)
+      // The pixel gap between neighbouring labels must clear a short label.
+      const perGap = plotWidth / (n - 1)
+      for (let i = 1; i < ticks.length; i++) {
+        expect((ticks[i]! - ticks[i - 1]!) * perGap).toBeGreaterThanOrEqual(60)
+      }
+      // Budget is ~one label per 70px, never more.
+      expect(ticks.length).toBeLessThanOrEqual(Math.max(2, Math.floor(plotWidth / 70)))
+    }
+    // Narrow cards collapse to just the endpoints; a wide card labels them all.
+    expect(callIndexTrendTicks(20, 140)).toEqual([0, 19])
+    expect(callIndexTrendTicks(3, 700)).toEqual([0, 1, 2])
+    expect(callIndexTrendTicks(0, 700)).toEqual([])
+    expect(callIndexTrendTicks(1, 700)).toEqual([0])
+  })
+
+  it('renders the aggregated mode marker and a plain-language legend', () => {
+    const buckets = rangeDays(90, Date.UTC(2026, 7, 1))
+    const view = CallIndexOverviewPanelView({
+      status: statusView(), overview: overviewView({ aggregates: { ...AGGREGATES, byDay: buckets } }),
+    })
+    expect(nodesWith(view, el => el.props['data-call-index-trend-mode'] === 'month')).toHaveLength(1)
+    // The legend renders an icon + a label in one span, so match the label text
+    // through the element's children array (the shared `visible` helper only
+    // collects string children that are not wrapped in an array).
+    const hasLabel = (needle: string): boolean => nodesWith(view, el =>
+      Array.isArray(el.props.children)
+      && el.props.children.some(child => typeof child === 'string' && child.includes(needle)),
+    ).length > 0
+    expect(hasLabel('按月调用量（平滑曲线 + 面积）')).toBe(true)
+    expect(hasLabel('按月失败（底层面积带）')).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 15. cursor-stale — benign after a full re-read, retried at most once
+// ---------------------------------------------------------------------------
+
+describe('cursor-stale paging', () => {
+  const stale = { ok: false as const, code: 'cursor-stale' as const, messageKey: 'callIndex.error.cursorStale' as const, retryable: true, disconnected: false }
+  const genuine = { ok: false as const, code: 'invalid-request' as const, messageKey: 'callIndex.error.invalidRequest' as const, retryable: false, disconnected: false }
+
+  it('classifies cursor-stale and retries it exactly once', () => {
+    expect(callIndexIsCursorStale(stale)).toBe(true)
+    expect(callIndexIsCursorStale(genuine)).toBe(false)
+    expect(callIndexMoreFailureAction(undefined, false)).toBe('none')
+    expect(callIndexMoreFailureAction(stale, false)).toBe('retry')
+    expect(callIndexMoreFailureAction(stale, true)).toBe('silent')
+    expect(callIndexMoreFailureAction(genuine, false)).toBe('show')
+    expect(callIndexMoreFailureAction(genuine, true)).toBe('show')
+  })
+
+  it('never paints a stale cue as a red block or a repeated 加载失败 line', () => {
+    const view = CallIndexDetailPanelView({
+      query: normalizeCallIndexQuery(), page: callPage({ nextCursor: 'c1' }), moreFailure: stale,
+    })
+    const text = visible(view)
+    expect(text).not.toContain('加载失败')
+    expect(text).not.toContain('加载更多失败')
+    expect(nodesWith(view, el => el.props['data-call-index-diagnostics'] !== undefined)).toHaveLength(0)
+  })
+
+  it('still shows every other paging failure', () => {
+    const view = CallIndexDetailPanelView({
+      query: normalizeCallIndexQuery(), page: callPage({ nextCursor: 'c1' }), moreFailure: genuine,
+    })
+    const text = visible(view)
+    expect(text).toContain('加载失败')
+    expect(text).toContain('加载更多失败')
+    expect(nodesWith(view, el => el.props['data-call-index-diagnostics'] !== undefined)).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 16. Session dropdown — self-drawn, themed, contract attribute on the button
+// ---------------------------------------------------------------------------
+
+describe('session dropdown', () => {
+  const catalog = {
+    current: { id: 'session-aaa', name: '修复索引扫描' },
+    items: [
+      { id: 'session-aaa', name: '修复索引扫描' },
+      { id: 'session-bbb', name: '重构调用明细' },
+    ],
+  }
+  const query = { range: 'all' as const, scope: 'session' as const, sessionId: 'session-aaa' }
+
+  it('renders a button trigger (not a native select) that keeps the contract attribute', () => {
+    const view = CallIndexDetailPanelView({ query, page: callPage(), catalog })
+    const triggers = nodesWith(view, el => el.props['data-call-index-session-select'] === 'true')
+    expect(triggers).toHaveLength(1)
+    expect(triggers[0]?.type).toBe('button')
+    expect(nodesWith(view, el => el.type === 'select' || el.type === 'option')).toHaveLength(0)
+  })
+
+  it('draws its own listbox of Session names when open', () => {
+    const menu = { open: true, highlight: 0, onToggle: () => {}, onClose: () => {}, onHighlight: () => {}, onSelect: () => {}, onKey: () => {} }
+    const view = CallIndexDetailPanelView({ query, page: callPage(), catalog, sessionMenu: menu } as never)
+    const options = nodesWith(view, el => el.props.role === 'option')
+    expect(options.map(o => o.props.children)).toEqual(['修复索引扫描', '重构调用明细'])
+    // Still no native select anywhere.
+    expect(nodesWith(view, el => el.type === 'select' || el.type === 'option')).toHaveLength(0)
+  })
+
+  it('handles Esc / arrows / Enter via the pure key mapper', () => {
+    expect(callIndexSessionMenuKey('Escape', { open: true, highlight: 1, count: 3 })).toEqual({ action: 'close', highlight: 1 })
+    expect(callIndexSessionMenuKey('Escape', { open: false, highlight: 1, count: 3 })).toEqual({ action: 'none', highlight: 1 })
+    expect(callIndexSessionMenuKey('ArrowDown', { open: true, highlight: 2, count: 3 })).toEqual({ action: 'move', highlight: 0 })
+    expect(callIndexSessionMenuKey('ArrowUp', { open: true, highlight: 0, count: 3 })).toEqual({ action: 'move', highlight: 2 })
+    expect(callIndexSessionMenuKey('ArrowDown', { open: false, highlight: 1, count: 3 })).toEqual({ action: 'open', highlight: 1 })
+    expect(callIndexSessionMenuKey('Enter', { open: true, highlight: 1, count: 3 })).toEqual({ action: 'select', highlight: 1 })
+    expect(callIndexSessionMenuKey('a', { open: true, highlight: 1, count: 3 })).toEqual({ action: 'none', highlight: 1 })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 17. Partial read — never claims "0 failures" for a range it did not fully read
+// ---------------------------------------------------------------------------
+
+describe('partial failure copy', () => {
+  const BIG = { total: 500, success: 495, error: 5, cancelled: 0, unresolved: 0, unknown: 0, running: 0, inherited: 0 }
+
+  it('says "read N, no failure here; range total M" instead of "0 tools failed"', () => {
+    const page = callPage({ total: 500, summary: BIG, items: [ROW] })
+    const text = visible(CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), page }))
+    expect(text).toContain('已读取的')
+    expect(text).toContain('全范围失败共')
+    expect(text).toContain('未读取部分不参与排行')
+    expect(text).not.toContain('共 0 个工具出现过失败')
+  })
+
+  it('still says plainly there are no failures when the whole range was read', () => {
+    const page = callPage({
+      total: 1,
+      summary: { total: 1, success: 1, error: 0, cancelled: 0, unresolved: 0, unknown: 0, running: 0, inherited: 0 },
+      items: [ROW],
+    })
+    const text = visible(CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), page }))
+    expect(text).toContain('当前范围没有失败调用')
   })
 })
 

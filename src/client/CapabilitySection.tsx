@@ -15,10 +15,10 @@
  *                       chip plus a directory tree / file preview
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
-import type { KeyboardEvent, ReactElement } from 'react'
+import type { KeyboardEvent, ReactElement, ReactNode } from 'react'
 import { MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
 import * as ClientUiPrimitives from '@deepseek-ai/dsh-client-ui-primitives'
-import { Button, Input, Modal, SegmentedTabs, Tag, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Input, Modal, SegmentedTabs, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
 import type {
   CapabilityPolicyRemote,
   CapabilitySnapshot,
@@ -39,6 +39,7 @@ const chevronIcons = ClientUiPrimitives as unknown as {
 }
 const IconTriangleRightFill: ChevronIcon = (chevronIcons.IconTriangleRightFillMedium ?? chevronIcons.IconTriangleRightFill14)!
 import { LocationModal } from './LocationModal.tsx'
+import { V3Styles } from './v3-ui.ts'
 import { ADOPTABLE_SKILL_SOURCES, BUILT_IN_SERVER, PROJECT_SKILL_SOURCES } from '../constants.ts'
 import {
   compileNameFilter,
@@ -70,6 +71,13 @@ export interface CapabilitySectionInjected {
    * disposer.
    */
   subscribeSignals: (listener: () => void) => () => void
+  /**
+   * Per-capability call counts from the call index, keyed by `CapabilityRow.id`.
+   *
+   * Absent means "this caller has no corpus" — the page then shows `—` for the
+   * zero-call cell and no per-row count. Never fabricate a zero (D-028).
+   */
+  usage?: ReadonlyMap<string, CatalogUsage> | undefined
 }
 
 export type CapabilitySectionProps = CapabilitySectionInjected
@@ -102,6 +110,8 @@ export type CapabilityKey =
   | 'residentShort'
   | 'onDemandShort'
   | 'disabledShort'
+  | 'catalogZeroCall'
+  | 'catalogZeroCallHint'
   | 'cycleHint'
   | 'notPreviewable'
   | 'previewClose'
@@ -257,6 +267,12 @@ export type CapabilityKey =
   | 'guardDesc'
   | 'guardBoundary'
   | 'guardReset'
+  | 'guardScopeTitle'
+  | 'guardScopeBody'
+  | 'guardScopeFoot'
+  | 'guardBoundaryLabel'
+  | 'guardFootCycle'
+  | 'guardFootNoProgress'
   | 'guardSectionA'
   | 'guardSectionB'
   | 'guardSectionC'
@@ -524,6 +540,18 @@ body[data-ds-dark-theme] .mc-count--disabled{color:#b8abad}
 .mc-guard-switch--on{background:var(--dsw-alias-state-business-primary)}
 .mc-guard-switch--on::after{transform:translateX(14px)}
 .mc-guard-switch:disabled{opacity:.5;cursor:not-allowed}
+/* ---- v3 工具与技能（V3-c）：仅新增，不改动上面任何 .mc-* / .mc-guard-* ---- */
+.v3-dot[data-tone='info']{background:var(--v3-info)}
+.v3-trow{cursor:pointer}
+.v3-trow:focus-visible{outline:2px solid var(--v3-info);outline-offset:-2px}
+.v3-racts{display:flex;align-items:center;gap:4px;margin-left:auto;flex:none}
+.v3-uses-bad{color:var(--v3-bad)}
+button.v3-tag.v3-tag--act{color:var(--v3-t3);background:transparent}
+button.v3-tag.v3-tag--act:hover{color:var(--v3-t1);background:var(--v3-panel-2)}
+button.v3-tag{border:0;cursor:pointer;font-family:inherit}
+button.v3-tag:disabled{opacity:.55;cursor:default}
+.v3-group>summary:focus-visible{outline:2px solid var(--v3-info);outline-offset:-2px}
+.v3-tools{display:flex;flex-direction:column}
 `
 if (typeof document !== 'undefined' && document.querySelector(`style[data-css-id="${CSS_ID}"]`) === null) {
   const tag = document.createElement('style')
@@ -620,7 +648,10 @@ function MarkdownFilePreview(props: {
  * `node_modules`, because the panel said nothing about itself. The value is
  * inlined by `tsdown` (see `src/client/env.d.ts`).
  */
-const PLUGIN_VERSION = __CAPABILITY_MENU_VERSION__
+// `typeof` guard: the identifier is inlined by `tsdown` (see env.d.ts) in the
+// shipped bundle, but the vitest process loads this module without that define.
+// `typeof` on an undeclared name is safe and keeps the module importable in tests.
+const PLUGIN_VERSION = typeof __CAPABILITY_MENU_VERSION__ !== 'undefined' ? __CAPABILITY_MENU_VERSION__ : '0.0.0'
 const PLUGIN_TITLE = `capability-menu v${PLUGIN_VERSION}`
 
 /**
@@ -654,6 +685,207 @@ function sourceLabel(
   return key === undefined ? source : t(key)
 }
 
+// ── v3 catalog presentation (V3-c) ────────────────────────────────
+//
+// These two components are the v3 skin over the catalog data. They are pure and
+// prop-driven (no hooks), deliberately mirroring `GuardPanel` / `PluginSectionView`
+// so the settings suite — which has no DOM harness — can call them directly and
+// walk the returned tree.
+
+/** Tone of a class chip / state dot, mapped to the v3 `data-tone` palette. */
+const CLASS_TONE: Record<CapabilityClass, 'info' | 'warn' | 'bad'> = {
+  resident: 'info',
+  'on-demand': 'warn',
+  disabled: 'bad',
+}
+/** State-dot tone inside a row: resident=info, on-demand=warn, disabled=neutral. */
+const CLASS_DOT_TONE: Record<CapabilityClass, string> = {
+  resident: 'info',
+  'on-demand': 'warn',
+  disabled: '',
+}
+
+export interface CatalogStatCell {
+  readonly label: ReactNode
+  readonly value: ReactNode
+  readonly hint?: ReactNode
+}
+
+/** The four-cell `.v3-catstat` strip at the top of the catalog page. */
+export function CatalogStatStrip(props: { readonly cells: readonly CatalogStatCell[] }): ReactElement {
+  return (
+    <div className="v3-catstat" data-v3-catstat="true">
+      {props.cells.map((cell, index) => (
+        <div key={index}>
+          <div className="v3-l">{cell.label}</div>
+          <div className="v3-v">{cell.value}{cell.hint !== undefined ? <small>{cell.hint}</small> : null}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/** Per-capability usage, when the caller has it (it lives in the call index). */
+export interface CatalogUsage {
+  readonly uses: number
+  readonly failures?: number
+}
+
+/** Zero-call capability count when a usage map exists, else an honest dash. */
+function zeroCallCount(
+  usage: ReadonlyMap<string, CatalogUsage> | undefined,
+  rows: readonly CapabilityRow[],
+): number | string {
+  if (usage === undefined) return '—'
+  // A row absent from the aggregate simply had no calls inside the indexed corpus.
+  // This is "zero observed", which is why the cell carries the 已索引 hint.
+  return rows.filter(row => {
+    const entry = usage.get(row.id)
+    return entry === undefined || entry.uses === 0
+  }).length
+}
+
+/** One MCP-server group as the Tools tab shows it. */
+export interface CatalogToolGroup {
+  readonly server: string
+  readonly tools: readonly CapabilityRow[]
+}
+
+export interface ToolGroupsViewProps {
+  readonly t: CapabilitySectionInjected['t']
+  readonly groups: readonly CatalogToolGroup[]
+  readonly openServers: ReadonlySet<string>
+  readonly busy: boolean
+  /** Row-level call counts, when available. Absent = the row shows no count. */
+  readonly usage?: ReadonlyMap<string, CatalogUsage> | undefined
+  readonly onToggle: (server: string) => void
+  readonly onCycle: (ids: readonly string[], kind: 'tool') => void
+  readonly onOpenDetail: (id: string) => void
+  readonly onEditServer: (server: string) => void
+  readonly onEditSearch: (id: string) => void
+}
+
+/** Strip a tool’s mcp__<server>__ prefix for display, like the old row did. */
+function displayToolName(server: string, name: string): string {
+  const prefix = 'mcp__' + server + '__'
+  return server !== BUILT_IN_SERVER && name.startsWith(prefix) ? name.slice(prefix.length) : name
+}
+
+/**
+ * Two-column `.v3-catgrid` of native `<details>` server groups, each summary
+ * carrying the chevron and the class-count tags, each row a 30px `.v3-trow`.
+ * Pure: every interaction is a callback.
+ */
+export function ToolGroupsView(props: ToolGroupsViewProps): ReactElement {
+  const { t, groups, openServers, busy, usage } = props
+  return (
+    <div className="v3-catgrid" data-v3-catgrid="true">
+      {groups.map(({ server, tools }) => {
+        const open = openServers.has(server)
+        const counts = CLASS_KEYS.map(cls => ({ cls, count: countByClass(tools, cls) }))
+        return (
+          <details key={server} className="v3-group" open={open} data-v3-group={server}>
+            <summary onClick={(e: { preventDefault(): void }) => { e.preventDefault(); props.onToggle(server) }}>
+              <svg className="v3-chev" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+                <path d="M4.5 2.5 8 6l-3.5 3.5" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              <span className="v3-gnm">{server === BUILT_IN_SERVER ? t('builtInGroup') : server}</span>
+              <span className="v3-cnt">{tools.length}</span>
+              <span className="v3-right">
+                {counts.filter(({ count }) => count > 0).map(({ cls, count }) => (
+                  <button
+                    key={cls}
+                    type="button"
+                    className="v3-tag"
+                    data-tone={CLASS_TONE[cls]}
+                    disabled={busy}
+                    title={t('cycleHint')}
+                    onClick={(e: { stopPropagation(): void }) => {
+                      e.stopPropagation()
+                      props.onCycle(tools.filter(tool => tool.class === cls).map(tool => tool.id), 'tool')
+                    }}
+                  >
+                    {t(CLASS_SHORT_KEYS[cls])} {count}
+                  </button>
+                ))}
+                {server !== BUILT_IN_SERVER && (
+                  <button
+                    type="button"
+                    className="v3-tag v3-tag--act"
+                    disabled={busy}
+                    onClick={(e: { stopPropagation(): void }) => { e.stopPropagation(); props.onEditServer(server) }}
+                  >
+                    {t('edit')}
+                  </button>
+                )}
+              </span>
+            </summary>
+            {open && (
+              <div className="v3-tools">
+                {tools.map(tool => {
+                  const rowUsage = usage === undefined ? undefined : usage.get(tool.id)
+                  return (
+                    <div
+                      key={tool.id}
+                      className="v3-trow"
+                      title={tool.classLabel}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={tool.name}
+                      onClick={() => props.onOpenDetail(tool.id)}
+                      onKeyDown={(e: KeyboardEvent<HTMLElement>) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault()
+                          props.onOpenDetail(tool.id)
+                        }
+                      }}
+                    >
+                      <span className="v3-dot" data-tone={CLASS_DOT_TONE[tool.class]} aria-hidden="true" />
+                      <span className="v3-nm" title={tool.name}>{displayToolName(server, tool.name)}</span>
+                      {rowUsage !== undefined && (
+                        <span className="v3-uses">
+                          {rowUsage.uses} 次
+                          {rowUsage.failures !== undefined && rowUsage.failures > 0
+                            ? <span className="v3-uses-bad"> · 失败 {rowUsage.failures}</span>
+                            : null}
+                        </span>
+                      )}
+                      <span className="v3-racts">
+                        {tool.mandatory && <span className="v3-tag">{t('mandatory')}</span>}
+                        {tool.class === 'on-demand' && (
+                          <button
+                            type="button"
+                            className="v3-tag v3-tag--act"
+                            title={t('editSearchMetadata')}
+                            onClick={(e: { stopPropagation(): void }) => { e.stopPropagation(); props.onEditSearch(tool.id) }}
+                          >
+                            {t('searchMetadataButton')}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="v3-tag"
+                          data-tone={CLASS_TONE[tool.class]}
+                          disabled={busy || tool.mandatory}
+                          title={tool.classLabel}
+                          aria-label={tool.classLabel}
+                          onClick={(e: { stopPropagation(): void }) => { e.stopPropagation(); props.onCycle([tool.id], 'tool') }}
+                        >
+                          {t(CLASS_SHORT_KEYS[tool.class])}
+                        </button>
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </details>
+        )
+      })}
+    </div>
+  )
+}
+
 /**
  * Whether the document is visible. A hidden settings tab does no polling and
  * takes no re-reads; coming back is itself a revalidation trigger.
@@ -670,7 +902,7 @@ function useDocumentVisible(): boolean {
 }
 
 export function CapabilitySection(props: CapabilitySectionProps): JSX.Element {
-  const { remote, t, mountError, subscribeSignals } = props
+  const { remote, t, mountError, subscribeSignals, usage } = props
   // Paint a previous snapshot immediately when this page session has one; the
   // mount effect below still revalidates.
   const [state, setState] = useState<ViewState>(() => {
@@ -992,6 +1224,7 @@ export function CapabilitySection(props: CapabilitySectionProps): JSX.Element {
         onRefresh={() => void refreshCatalog()}
         onRefreshMcp={serverName => void refreshRegisteredMcp(serverName)}
         onNotice={setNotice}
+        {...(usage === undefined ? {} : { usage })}
       />}
     </section>
   )
@@ -1014,8 +1247,10 @@ function ReadyBody(props: {
   onRefreshMcp: (serverName: string) => void
   /** Surface a one-line message in the section header. */
   onNotice: (message: string | null) => void
+  /** Per-capability call counts, when the shell could read the call index. */
+  usage?: ReadonlyMap<string, CatalogUsage> | undefined
 }): JSX.Element {
-  const { remote, snapshot, diagnostics, openServers, busy, activeTab, t, onTabChange, onToggleServer, onCycle, onRefresh, onRefreshMcp, onNotice } = props
+  const { remote, snapshot, diagnostics, openServers, busy, activeTab, t, onTabChange, onToggleServer, onCycle, onRefresh, onRefreshMcp, onNotice, usage } = props
   const [updateStatus, setUpdateStatus] = useState<import('./store.ts').SelfUpdateStatus | null>(null)
   const [updatePhase, setUpdatePhase] = useState<'idle' | 'installing' | 'done' | 'error'>('idle')
   const [updateError, setUpdateError] = useState('')
@@ -1285,8 +1520,22 @@ function ReadyBody(props: {
   const skillDiagnosticCount = diagnostics === null ? 0
     : diagnostics.unavailableSkills.length + diagnostics.shadowedSkills.length + diagnostics.brokenPresets.length + diagnostics.unbrowseableSkills.length + diagnostics.undocumentedSkills.length
 
+  // Per-capability call counts live in the call-index corpus. The settings shell
+  // reads one page of calls and hands the aggregate down (see PluginSection), so
+  // a row can show its real 调用次数 next to its policy. Absent = this caller has
+  // no corpus: show `—` / no count rather than a fabricated zero (D-028).
+  const catalogUsage = usage
+  const classCount = (cls: CapabilityClass): number => summary.find(entry => entry.cls === cls)?.count ?? 0
+  const statCells: CatalogStatCell[] = [
+    { label: t('tierResident'), value: classCount('resident') },
+    { label: t('tierOnDemand'), value: classCount('on-demand') },
+    { label: t('tierDisabled'), value: classCount('disabled') },
+    { label: t('catalogZeroCall'), value: zeroCallCount(catalogUsage, statRows), hint: t('catalogZeroCallHint') },
+  ]
+
   return (
-    <>
+    <div className="v3-root">
+      <V3Styles />
       <div className="mc-heading-row">
         <div className="mc-heading-meta">
           <h2 className="mc-heading">{t('title')}</h2>
@@ -1350,15 +1599,8 @@ function ReadyBody(props: {
           onChange={onTabChange}
           label={t('title')}
         />
-        <div className="mc-summary">
-          {summary.map(({ cls, count }) => (
-            <span key={cls} className={`mc-chip mc-chip--${cls}`}>
-              <span className={`mc-dot mc-dot--${cls}`} aria-hidden="true" />
-              {t(CLASS_SHORT_KEYS[cls])} · {count}
-            </span>
-          ))}
-        </div>
       </div>
+      <CatalogStatStrip cells={statCells} />
 
       {/* Name filter. A long list is the actual problem behind "why can't I find
           this capability" — grouping only helps when you already know where to
@@ -1385,114 +1627,18 @@ function ReadyBody(props: {
           {servers.length === 0 ? (
             <p className="mc-empty">{needle === '' ? t('emptyTools') : t('filterNoMatch')}</p>
           ) : (
-            <>
-              {servers.map(({ server, tools }) => {
-                const open = openServers.has(server)
-                const counts = CLASS_KEYS.map(cls => ({ cls, count: countByClass(tools, cls) }))
-                return (
-                  <div key={server} className="mc-group">
-                    <div
-                      className="mc-group-header"
-                      role="button"
-                      tabIndex={0}
-                      aria-expanded={open}
-                      onClick={() => onToggleServer(server)}
-                      onKeyDown={(e: KeyboardEvent<HTMLElement>) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault()
-                          onToggleServer(server)
-                        }
-                      }}
-                    >
-                      <IconTriangleRightFill size={12} className={`mc-chevron${open ? ' mc-chevron--open' : ''}`} />
-                      <span className="mc-server-name">{server === BUILT_IN_SERVER ? t('builtInGroup') : server}</span>
-                      <span className="mc-server-count">{t('toolCount', { count: tools.length })}</span>
-                      <span className="mc-server-meta">
-                        <span className="mc-counts">
-                          {counts.filter(({ count }) => count > 0).map(({ cls, count }) => (
-                            <button
-                              key={cls}
-                              type="button"
-                              className={`mc-count mc-count--${cls}`}
-                              disabled={busy}
-                              title={t('cycleHint')}
-                              onClick={(e: { stopPropagation(): void }) => {
-                                e.stopPropagation()
-                                onCycle(tools.filter(t => t.class === cls).map(t => t.id), 'tool')
-                              }}
-                            >
-                              <span className={`mc-dot mc-dot--${cls}`} aria-hidden="true" />
-                              {t(CLASS_SHORT_KEYS[cls])} {count}
-                            </button>
-                          ))}
-                        </span>
-                        {/* The built-in group is not a real MCP server: there is
-                            no row to edit, so it gets no button. */}
-                        {server !== BUILT_IN_SERVER && (
-                          <button
-                            type="button"
-                            className="mc-count mc-count--action"
-                            disabled={busy}
-                            onClick={(e: { stopPropagation(): void }) => {
-                              e.stopPropagation()
-                              void openMcpEdit(server)
-                            }}
-                          >
-                            {t('edit')}
-                          </button>
-                        )}
-                      </span>
-                    </div>
-                    {open && (
-                      <div className="mc-tools">
-                        {tools.map(tool => (
-                          <div
-                            key={tool.id}
-                            className="mc-tool"
-                            title={tool.classLabel}
-                            role="button"
-                            tabIndex={0}
-                            aria-label={tool.name}
-                            onClick={() => void openToolDetail(tool.id)}
-                            onKeyDown={(e: KeyboardEvent<HTMLElement>) => {
-                              if (e.key === 'Enter' || e.key === ' ') {
-                                e.preventDefault()
-                                void openToolDetail(tool.id)
-                              }
-                            }}
-                          >
-                            <span className="mc-tool-name" title={tool.name}>
-                              {server !== BUILT_IN_SERVER && tool.name.startsWith(`mcp__${server}__`)
-                                ? tool.name.slice(`mcp__${server}__`.length)
-                                : tool.name}
-                            </span>
-                            <span className="mc-tool-meta">
-                              {tool.mandatory && <Tag>{t('mandatory')}</Tag>}
-                              {tool.class === 'on-demand' && (
-                                <Button size="sm" variant="ghost" className="mc-count--action" title={t('editSearchMetadata')} onClick={(e: { stopPropagation(): void }) => { e.stopPropagation(); void openSearchEdit(tool.id, 'tool') }}>{t('searchMetadataButton')}</Button>
-                              )}
-                              <button
-                                type="button"
-                                className={`mc-dot-btn mc-count--${tool.class}`}
-                                disabled={busy || tool.mandatory}
-                                title={tool.classLabel}
-                                aria-label={tool.classLabel}
-                                onClick={(e: { stopPropagation(): void }) => {
-                                  e.stopPropagation()
-                                  onCycle([tool.id], 'tool')
-                                }}
-                              >
-                                <span className={`mc-dot mc-dot--${tool.class}`} aria-hidden="true" />
-                              </button>
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
-            </>
+            <ToolGroupsView
+              t={t}
+              groups={servers}
+              openServers={openServers}
+              busy={busy}
+              usage={catalogUsage}
+              onToggle={onToggleServer}
+              onCycle={onCycle}
+              onOpenDetail={id => void openToolDetail(id)}
+              onEditServer={server => void openMcpEdit(server)}
+              onEditSearch={id => void openSearchEdit(id, 'tool')}
+            />
           )}
         </div>
       </div>
@@ -1764,7 +1910,7 @@ function ReadyBody(props: {
             )}
         </Modal>
       )}
-    </>
+    </div>
   )
 }
 
@@ -1919,111 +2065,64 @@ function SkillList(props: {
 
   return (
     <>
-      {skills.map(skill => {
-        const open = openSkill === skill.id
-        return (
-          <div key={skill.id} className="mc-skill">
-            <div
-              className="mc-skill-row"
-              role="button"
-              tabIndex={0}
-              aria-expanded={open}
-              onClick={() => void toggleSkill(skill.id)}
-              onKeyDown={(e: KeyboardEvent<HTMLElement>) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault()
-                  void toggleSkill(skill.id)
-                }
-              }}
-            >
-              <IconTriangleRightFill size={12} className={`mc-chevron${open ? ' mc-chevron--open' : ''}`} />
-              <span className="mc-skill-name">{skill.name}</span>
-              {PROJECT_SKILL_SOURCES.has(skill.source ?? '') && skill.path !== undefined && (
-                <span className="mc-source" title={skill.path}>{t('projectRootLabel', { path: projectRootForSkill(skill.path) })}</span>
-              )}
-              <span className="mc-skill-meta">
-                {skill.mandatory && <Tag>{t('mandatory')}</Tag>}
-                {skill.class === 'on-demand' && (
-                  <Button size="sm" variant="ghost" className="mc-count--action" title={t('editSearchMetadata')} onClick={(e: { stopPropagation(): void }) => { e.stopPropagation(); onEditSearch(skill.id) }}>{t('searchMetadataButton')}</Button>
+      <div className="v3-catgrid">
+        {skills.map(skill => {
+          const open = openSkill === skill.id
+          return (
+            <details key={skill.id} className="v3-group" open={open} data-v3-skill={skill.id}>
+              <summary onClick={(e: { preventDefault(): void }) => { e.preventDefault(); void toggleSkill(skill.id) }}>
+                <svg className="v3-chev" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+                  <path d="M4.5 2.5 8 6l-3.5 3.5" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                <span className="v3-gnm">{skill.name}</span>
+                {PROJECT_SKILL_SOURCES.has(skill.source ?? '') && skill.path !== undefined && (
+                  <span className="v3-cnt" title={skill.path}>{t('projectRootLabel', { path: projectRootForSkill(skill.path) })}</span>
                 )}
-                <button
-                  type="button"
-                  className={`mc-count mc-count--${skill.class}`}
-                  disabled={busy || skill.mandatory}
-                  title={skill.classLabel}
-                  onClick={(e: { stopPropagation(): void }) => {
-                    e.stopPropagation()
-                    onCycle([skill.id], 'skill')
-                  }}
-                >
-                  <span className={`mc-dot mc-dot--${skill.class}`} aria-hidden="true" />
-                  {t(CLASS_SHORT_KEYS[skill.class as CapabilityClass])}
-                </button>
-                {/* A skill with no manageable entry cannot be repointed, so it
-                    gets no 编辑 button. Each such row shows either the action it
-                    can take (adopt) or the reason it has none (where it came
-                    from) — never both, which would say the same thing twice.
-                    A skill shipped by an agent preset is never adoptable: 纳入管理
-                    links it into the user root, i.e. makes it global for every
-                    session, which is the opposite of what a preset skill is for
-                    (it is visible only to sessions that mount that preset). */}
-                {!editableSkills.has(skill.id) && (skill.preset !== undefined
-                  ? (
-                    <span className="mc-source" title={t('skillFromPresetHint')}>
-                      {t('skillFromPreset', { preset: skill.preset })}
-                    </span>
-                  )
-                  : ADOPTABLE_SKILL_SOURCES.has(skill.source ?? '')
-                    ? (
-                      /* The confirmation is a dialog, not an inline strip: a row
-                         has no room for a sentence, and pushing one in there
-                         pushed the buttons themselves out of view. */
-                      <button
-                        type="button"
-                        className="mc-count mc-count--action"
-                        disabled={busy}
-                        title={t('adoptSkillHint')}
-                        onClick={(e: { stopPropagation(): void }) => {
-                          e.stopPropagation()
-                          setConfirmAdopt(skill.id)
-                        }}
-                      >
-                        {t('adoptSkill')}
-                      </button>
-                    )
-                    : (
-                      <span className="mc-source" title={t('skillSourceHint')}>
-                        {t('skillSource', { source: sourceLabel(skill.source, t) })}
-                      </span>
-                    ))}
-                {editableSkills.has(skill.id) && (
+                <span className="v3-right">
+                  {skill.mandatory && <span className="v3-tag">{t('mandatory')}</span>}
+                  {skill.class === 'on-demand' && (
+                    <button type="button" className="v3-tag v3-tag--act" title={t('editSearchMetadata')} onClick={(e: { stopPropagation(): void }) => { e.stopPropagation(); onEditSearch(skill.id) }}>{t('searchMetadataButton')}</button>
+                  )}
                   <button
                     type="button"
-                    className="mc-count mc-count--action"
-                    disabled={busy}
-                    onClick={(e: { stopPropagation(): void }) => {
-                      e.stopPropagation()
-                      onEditSkill(skill.id, skill.source)
-                    }}
+                    className="v3-tag"
+                    data-tone={CLASS_TONE[skill.class as CapabilityClass]}
+                    disabled={busy || skill.mandatory}
+                    title={skill.classLabel}
+                    onClick={(e: { stopPropagation(): void }) => { e.stopPropagation(); onCycle([skill.id], 'skill') }}
                   >
-                    {t('edit')}
+                    {t(CLASS_SHORT_KEYS[skill.class as CapabilityClass])}
                   </button>
-                )}
-              </span>
-            </div>
-            {open && (
-              <div className="mc-skill-body">
-                <div className="mc-tree">
-                  {browseErrors[`${skill.id}:`] !== undefined && <div className="mc-preview-hint">{browseErrors[`${skill.id}:`]}</div>}
-                  {renderEntries(tree.dirs[`${skill.id}:`], skill.id, '') ?? (
-                    <div className="mc-tree-row">…</div>
+                  {!editableSkills.has(skill.id) && (skill.preset !== undefined
+                    ? (
+                      <span className="v3-tag" title={t('skillFromPresetHint')}>{t('skillFromPreset', { preset: skill.preset })}</span>
+                    )
+                    : ADOPTABLE_SKILL_SOURCES.has(skill.source ?? '')
+                      ? (
+                        <button type="button" className="v3-tag v3-tag--act" disabled={busy} title={t('adoptSkillHint')} onClick={(e: { stopPropagation(): void }) => { e.stopPropagation(); setConfirmAdopt(skill.id) }}>{t('adoptSkill')}</button>
+                      )
+                      : (
+                        <span className="v3-tag" title={t('skillSourceHint')}>{t('skillSource', { source: sourceLabel(skill.source, t) })}</span>
+                      ))}
+                  {editableSkills.has(skill.id) && (
+                    <button type="button" className="v3-tag v3-tag--act" disabled={busy} onClick={(e: { stopPropagation(): void }) => { e.stopPropagation(); onEditSkill(skill.id, skill.source) }}>{t('edit')}</button>
                   )}
+                </span>
+              </summary>
+              {open && (
+                <div className="mc-skill-body">
+                  <div className="mc-tree">
+                    {browseErrors[`${skill.id}:`] !== undefined && <div className="mc-preview-hint">{browseErrors[`${skill.id}:`]}</div>}
+                    {renderEntries(tree.dirs[`${skill.id}:`], skill.id, '') ?? (
+                      <div className="mc-tree-row">…</div>
+                    )}
+                  </div>
                 </div>
-              </div>
-            )}
-          </div>
-        )
-      })}
+              )}
+            </details>
+          )
+        })}
+      </div>
       {confirmAdopt !== null && (
         <Modal
           open

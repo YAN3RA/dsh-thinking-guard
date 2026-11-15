@@ -12,13 +12,15 @@ import { isValidElement } from 'react'
 import * as React from 'react'
 import type { ReactElement, ReactNode } from 'react'
 
-// `CapabilitySection.tsx` pulls in `@deepseek-ai/dsh-client-ui-primitives`, whose
-// runtime dependency on `clsx` is not installed in this package's test
-// environment. This test is about the SHELL (tabs + which views stay mounted),
-// so the heavy view is stubbed; `client-usage.spec.tsx` already covers usage.
-vi.mock('../src/client/CapabilitySection.tsx', () => ({
-  CapabilitySection: function CapabilitySection() { return null },
-}))
+// The shell tests are about the tab bar and which views stay mounted, so the
+// heavy catalog view is stubbed out. The pure v3 catalog pieces (CatalogStatStrip
+// / ToolGroupsView) are NOT stubbed — the mock spreads the real module and only
+// replaces `CapabilitySection`, so the catalog assertions below can call them
+// directly (same hook-free pattern as `GuardPanel`).
+vi.mock('../src/client/CapabilitySection.tsx', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/client/CapabilitySection.tsx')>()
+  return { ...actual, CapabilitySection: function CapabilitySection() { return null } }
+})
 
 import {
   PluginSection,
@@ -30,7 +32,13 @@ import { UsagePanel, type UsagePanelApi } from '../src/client/usage.tsx'
 import { OverviewContainer } from '../src/client/OverviewContainer.tsx'
 import { GuardPanel, parseGuardThresholds } from '../src/client/GuardPanel.tsx'
 import { GuardContainer } from '../src/client/GuardContainer.tsx'
-import type { CapabilitySectionInjected } from '../src/client/CapabilitySection.tsx'
+import {
+  CatalogStatStrip,
+  ToolGroupsView,
+  type CapabilitySectionInjected,
+  type CatalogUsage,
+} from '../src/client/CapabilitySection.tsx'
+import type { CapabilityRow } from '../src/client/remote.ts'
 
 const capability = {
   remote: {} as CapabilitySectionInjected['remote'],
@@ -535,5 +543,156 @@ describe('callIndex wiring', () => {
     })
     expect(names).toContain('CallIndexDetailPanel')
     expect(names).not.toContain('UsagePanel')
+  })
+})
+
+// ── v3 工具与技能（V3-c）─────────────────────────────────────
+//
+// These cases target the pure, hook-free presentation components that ReadyBody
+// now composes. They assert the v3 structure the design specifies — the 4-cell
+// `.v3-catstat`, the two-column `.v3-catgrid`, native `<details>` folding in
+// `.v3-group`, the 10px `.v3-tag` tones, and the inline `.v3-uses` call count.
+describe('工具与技能 v3 版式', () => {
+  function tool(partial: Partial<CapabilityRow> & Pick<CapabilityRow, 'id' | 'name' | 'class'>): CapabilityRow {
+    return { kind: 'tool', mandatory: false, ...partial } as CapabilityRow
+  }
+
+  /** Every element whose className contains the given token. */
+  function byClass(root: ReactNode, token: string): TreeNode[] {
+    const out: TreeNode[] = []
+    walk(root, node => {
+      const className = node.props.className
+      if (typeof className === 'string' && className.split(/\s+/).includes(token)) out.push(node)
+    })
+    return out
+  }
+
+  /** Concatenate every string/number descendant, the way the DOM would read it. */
+  function textOf(root: ReactNode): string {
+    const parts: string[] = []
+    const visit = (cur: ReactNode): void => {
+      if (cur === null || cur === undefined || typeof cur === 'boolean') return
+      if (typeof cur === 'string' || typeof cur === 'number') { parts.push(String(cur)); return }
+      if (Array.isArray(cur)) { for (const child of cur) visit(child); return }
+      if (!isElement(cur)) return
+      visit((cur as unknown as TreeNode).props.children as ReactNode)
+    }
+    visit(root)
+    return parts.join('')
+  }
+
+  it('renders the four-cell .v3-catstat strip (常驻 / 按需 / 禁用 / 零调用)', () => {
+    const strip = CatalogStatStrip({
+      cells: [
+        { label: '常驻', value: 12 },
+        { label: '按需', value: 13 },
+        { label: '禁用', value: 4 },
+        { label: '零调用', value: '—' },
+      ],
+    }) as ReactElement
+    const [stat] = byClass(strip, 'v3-catstat')
+    expect(stat).toBeDefined()
+    const labelsCells = byClass(strip, 'v3-l')
+    expect(labelsCells).toHaveLength(4)
+    expect(labelsCells.map(node => node.props.children)).toEqual(['常驻', '按需', '禁用', '零调用'])
+    const values = byClass(strip, 'v3-v')
+    expect(values).toHaveLength(4)
+    // A missing usage source stays an honest dash, never a fabricated 0.
+    expect(textOf(values[3]!.props.children as ReactNode)).toBe('—')
+  })
+
+  const groups = [{
+    server: 'github',
+    tools: [
+      tool({ id: 'github.list_issues', name: 'mcp__github__list_issues', class: 'resident' }),
+      tool({ id: 'github.create_issue', name: 'mcp__github__create_issue', class: 'on-demand', classLabel: 'On-demand' }),
+      tool({ id: 'github.search_code', name: 'mcp__github__search_code', class: 'disabled' }),
+    ],
+  }]
+
+  function renderTools(open: boolean, usage?: ReadonlyMap<string, CatalogUsage>): ReactElement {
+    return ToolGroupsView({
+      t: (key: string) => labels[key] ?? key,
+      groups,
+      openServers: open ? new Set(['github']) : new Set<string>(),
+      busy: false,
+      usage,
+      onToggle: () => undefined,
+      onCycle: () => undefined,
+      onOpenDetail: () => undefined,
+      onEditServer: () => undefined,
+      onEditSearch: () => undefined,
+    }) as ReactElement
+  }
+
+  it('lays the server groups out in a two-column .v3-catgrid', () => {
+    const tree = renderTools(false)
+    expect(byClass(tree, 'v3-catgrid')).toHaveLength(1)
+    expect(byClass(tree, 'v3-group')).toHaveLength(1)
+  })
+
+  it('folds each group with a native <details>/<summary> and a .v3-chev', () => {
+    const collapsed = renderTools(false)
+    const [groupClosed] = byClass(collapsed, 'v3-group')
+    expect(groupClosed?.type).toBe('details')
+    expect(groupClosed?.props.open).toBe(false)
+    // Nothing renders while folded.
+    expect(byClass(collapsed, 'v3-trow')).toHaveLength(0)
+
+    const expanded = renderTools(true)
+    const [groupOpen] = byClass(expanded, 'v3-group')
+    expect(groupOpen?.type).toBe('details')
+    expect(groupOpen?.props.open).toBe(true)
+    expect(byClass(expanded, 'v3-chev')).toHaveLength(1)
+    expect(byClass(expanded, 'v3-trow')).toHaveLength(3)
+  })
+
+  it('labels class chips as 10px .v3-tag with data-tone info|warn|bad', () => {
+    const tree = renderTools(true)
+    const tones = byClass(tree, 'v3-tag')
+      .map(node => node.props['data-tone'])
+      .filter(tone => tone !== undefined)
+    expect(tones).toContain('info')  // resident
+    expect(tones).toContain('warn')  // on-demand
+    expect(tones).toContain('bad')   // disabled
+  })
+
+  it('shows each tool inline call count in .v3-uses when usage is present', () => {
+    const usage = new Map<string, CatalogUsage>([
+      ['github.list_issues', { uses: 132 }],
+      ['github.create_issue', { uses: 7, failures: 4 }],
+    ])
+    const tree = renderTools(true, usage)
+    const uses = byClass(tree, 'v3-uses')
+    expect(uses).toHaveLength(2)
+    expect(textOf(uses[0]!.props.children as ReactNode)).toContain('132')
+    expect(textOf(uses[1]!.props.children as ReactNode)).toContain('7')
+    expect(textOf(uses[1]!.props.children as ReactNode)).toContain('失败 4')
+    // Without a usage source no count element is fabricated.
+    expect(byClass(renderTools(true), 'v3-uses')).toHaveLength(0)
+  })
+})
+describe('工具与技能 · 调用次数接线', () => {
+  const catalogPanel = (view: ReactElement): { props: { id?: string; children: unknown } } | undefined =>
+    (view.props.children as Array<{ props: { id?: string; children: unknown } } | null | undefined>)
+      .filter((child): child is { props: { id?: string; children: unknown } } => child !== null && child !== undefined)
+      .find(child => child.props.id === 'mc-category-panel-catalog')
+
+  it('passes the call-index usage map down to the catalog', () => {
+    const usage = new Map([['read', { uses: 12, failures: 1 }]])
+    const view = PluginSectionView({ ...props(), catalogUsage: usage, active: 'catalog', onSelect: () => undefined }) as ReactElement
+    const panel = catalogPanel(view)
+    expect(panel).toBeDefined()
+    const catalog = find(panel!.props.children as ReactNode, node => (node.type as { name?: string })?.name === 'CapabilitySection')
+    expect(catalog).toBeDefined()
+    expect(catalog!.props.usage).toBe(usage)
+  })
+
+  it('omits usage when no corpus was read, so the page shows an honest dash', () => {
+    const view = PluginSectionView({ ...props(), active: 'catalog', onSelect: () => undefined }) as ReactElement
+    const panel = catalogPanel(view)
+    const catalog = find(panel!.props.children as ReactNode, node => (node.type as { name?: string })?.name === 'CapabilitySection')
+    expect(catalog).toBeDefined()
+    expect(catalog!.props.usage).toBeUndefined()
   })
 })

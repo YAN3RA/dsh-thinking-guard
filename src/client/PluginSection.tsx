@@ -19,11 +19,12 @@
  */
 import { createElement, useEffect, useState, type ReactElement } from 'react'
 import { SegmentedTabs, type SegmentedTab } from '@deepseek-ai/dsh-client-ui-primitives'
-import { CapabilitySection, type CapabilitySectionInjected } from './CapabilitySection.tsx'
+import { CapabilitySection, type CapabilitySectionInjected, type CatalogUsage } from './CapabilitySection.tsx'
 import {
   CallIndexDetailPanel,
   CallIndexDiagnostics,
   CallIndexOverviewPanel,
+  callIndexToolRows,
   createCallIndexPanelApi,
   type CallIndexPanelApi,
   type CallIndexPanelFailure,
@@ -142,6 +143,12 @@ export type PluginSectionKey =
   | 'guardDesc'
   | 'guardBoundary'
   | 'guardReset'
+  | 'guardScopeTitle'
+  | 'guardScopeBody'
+  | 'guardScopeFoot'
+  | 'guardBoundaryLabel'
+  | 'guardFootCycle'
+  | 'guardFootNoProgress'
   | 'guardSectionA'
   | 'guardSectionB'
   | 'guardSectionC'
@@ -209,12 +216,30 @@ export function PluginSection(props: PluginSectionProps): ReactElement {
     readonly status?: CallIndexStatusView
     readonly failure?: CallIndexPanelFailure
   } | undefined>(undefined)
+  // Per-tool call counts for 工具与技能. Read once per mount here (the page itself
+  // is hook-free and receives no corpus): the catalog can then show real usage
+  // beside each policy instead of an empty column. A failed read leaves it
+  // undefined, which the catalog renders as `—`, never as zero.
+  const [catalogUsage, setCatalogUsage] = useState<ReadonlyMap<string, CatalogUsage> | undefined>(undefined)
   useEffect(() => {
     let live = true
     void (async () => {
       const result = await callIndexApi.getStatus()
       if (!live) return
       setDiagnostics(result.ok ? { status: result.value } : { failure: result })
+    })()
+    return () => { live = false }
+  }, [callIndexApi])
+  useEffect(() => {
+    let live = true
+    void (async () => {
+      const result = await callIndexApi.listCalls({ range: 'all' })
+      if (!live || !result.ok) return
+      const map = new Map<string, CatalogUsage>()
+      for (const row of callIndexToolRows(result.value)) {
+        map.set(row.toolName, { uses: row.calls, failures: row.error })
+      }
+      setCatalogUsage(map)
     })()
     return () => { live = false }
   }, [callIndexApi])
@@ -234,6 +259,7 @@ export function PluginSection(props: PluginSectionProps): ReactElement {
     active,
     onSelect: setActive,
     ...(diagnostics === undefined ? {} : { diagnostics }),
+    ...(catalogUsage === undefined ? {} : { catalogUsage }),
   })
 }
 
@@ -242,6 +268,8 @@ export interface PluginSectionViewProps extends PluginSectionProps {
   readonly active: PluginCategory
   /** React to a tab click. */
   readonly onSelect: (category: PluginCategory) => void
+  /** Per-capability call counts, read once by the container (see PluginSection). */
+  readonly catalogUsage?: ReadonlyMap<string, CatalogUsage> | undefined
 }
 
 /**
@@ -250,7 +278,7 @@ export interface PluginSectionViewProps extends PluginSectionProps {
  * `UsagePanelView`.
  */
 export function PluginSectionView(props: PluginSectionViewProps): ReactElement {
-  const { capability, usageApi, callIndexRemote, scopeTarget, sessionCatalog, guardRemote, t, active, onSelect, diagnostics } = props
+  const { capability, usageApi, callIndexRemote, scopeTarget, sessionCatalog, guardRemote, t, active, onSelect, diagnostics, catalogUsage } = props
 
   // One stable API object per provider identity. A `useState` initializer would
   // be the idiomatic way to hold it, but this view is deliberately hook-free so
@@ -304,7 +332,10 @@ export function PluginSectionView(props: PluginSectionViewProps): ReactElement {
       ? createElement(OverviewContainer, { t, usageApi, guardRemote, policyRemote: guardRemote })
       : createElement(CallIndexOverviewPanel, { api: callIndexApi })),
     panel('guard', createElement(GuardContainer, { t, remote: guardRemote, duplicateThresholds: [3, 5, 8] })),
-    panel('catalog', createElement(CapabilitySection, capability)),
+    panel('catalog', createElement(CapabilitySection, {
+      ...capability,
+      ...(catalogUsage === undefined ? {} : { usage: catalogUsage }),
+    })),
     panel('usage', callIndexRemote === undefined && usageApi !== undefined
       ? createElement(UsagePanel, { api: usageApi })
       : createElement(CallIndexDetailPanel, {

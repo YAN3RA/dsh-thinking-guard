@@ -2083,7 +2083,6 @@ export function CallIndexOverviewPanelView(props: CallIndexOverviewPanelViewProp
 
   // Per-tool panels (from the listCalls read the container supplies).
   const totalToolCalls = tools === undefined ? 0 : tools.reduce((sum, row) => sum + row.calls, 0)
-  const totalToolErrors = tools === undefined ? 0 : tools.reduce((sum, row) => sum + row.error, 0)
   const topRows = tools === undefined ? undefined : tools.slice(0, 12)
   const rankMax = topRows !== undefined && topRows.length > 0 ? topRows[0]!.calls : 1
   const topCoverage = topRows === undefined || totalToolCalls === 0
@@ -2093,6 +2092,10 @@ export function CallIndexOverviewPanelView(props: CallIndexOverviewPanelViewProp
   const failingTop = failingRows === undefined ? [] : failingRows.slice(0, 3)
   const failingRest = failingRows === undefined ? [] : failingRows.slice(3)
   const failingRestErrors = failingRest.reduce((sum, row) => sum + row.error, 0)
+  const failingReadErrors = failingRows === undefined ? 0 : failingRows.reduce((sum, row) => sum + row.error, 0)
+  const failDenominator = metrics.failed !== undefined && metrics.failed > 0 ? metrics.failed : failingReadErrors
+  const readCalls = tools === undefined ? 0 : totalToolCalls
+  const readIsPartial = metrics.calls !== undefined && readCalls < metrics.calls
   const worstRateTool = failingRows === undefined || failingRows.length === 0
     ? undefined
     : failingRows.slice().sort((a, b) => (b.error / b.calls) - (a.error / a.calls))[0]
@@ -2257,9 +2260,12 @@ export function CallIndexOverviewPanelView(props: CallIndexOverviewPanelViewProp
                     createElement('span', { className: 'v3-n', style: { color: 'var(--v3-t2)' } }, String(failingRestErrors)),
                   )]),
                 ),
-                totalToolErrors > 0
+                // Denominator must be the OVERALL failure count, not the sum over
+                // the rows we happened to read: the page appends a bounded number
+                // of pages, so a partial read would otherwise inflate this share.
+                (failDenominator > 0)
                   ? createElement('p', { className: 'v3-hint', style: { marginTop: 9 } },
-                      `这些失败合计占全部失败的 ${Math.round((failingTop.reduce((sum, row) => sum + row.error, 0) / totalToolErrors) * 100)}%（占全部失败，不是占单个工具）。`)
+                      `这些失败合计占全部失败的 ${Math.round((failingTop.reduce((sum, row) => sum + row.error, 0) / failDenominator) * 100)}%（占全部失败，不是占单个工具）${readIsPartial ? '；分母是全部失败数，分子只含已读取的逐工具行' : ''}。`)
                   : null,
                 worstRateTool === undefined ? null : createElement('div', { style: { marginTop: 11, paddingTop: 11, borderTop: '1px solid var(--v3-line)' } },
                   createElement('div', { className: 'v3-src', style: { fontSize: 11.5 } },

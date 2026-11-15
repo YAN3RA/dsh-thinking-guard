@@ -1638,6 +1638,17 @@ describe('read coverage of the tool rows', () => {
     expect(text).toContain('全部 500 次')
   })
 
+it('computes the failure concentration share against the overall failure count', () => {
+    const overview = overviewView({
+      total: 500,
+      summary: { total: 500, success: 390, error: 100, cancelled: 0, unresolved: 0, unknown: 0, running: 0, inherited: 0 },
+    })
+    const tools = [{ toolName: 'read', sourceKind: 'native' as const, lastAt: 1, success: 5, error: 5, calls: 10 }]
+    const text = visible(CallIndexOverviewPanelView({ overview, tools }))
+    // 5 failures out of the 100 the overview reports, not out of the 5 read here.
+    expect(text).toContain('占全部失败的 5%')
+  })
+
   it('does not claim full coverage on the overview when only part was read', () => {
     const overview = overviewView({ total: 500, summary: BIG_SUMMARY })
     const tools = [{ toolName: 'read', sourceKind: 'native' as const, lastAt: 1, success: 4, error: 0, calls: 5 }]

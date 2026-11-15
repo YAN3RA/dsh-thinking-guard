@@ -1,12 +1,12 @@
 /**
  * v3 执行保护（D-044 / README 5.3 ②）— the Guard switches become a two-column
- * grid of .v3-gitem cards.
+ * grid of .v3-gitem cards, with the counters at the very top.
  *
  * Same constraint as the other client specs: this package has no DOM harness, so
  * the component is inspected as an element tree rather than mounted. This file
- * only asserts the v3 SHAPE; the published DOM contract (nine mc-guard-point,
- * data-guard-section order, the single threshold input, the counters) is still
- * covered by client-plugin-section.spec.tsx, which this change must not break.
+ * asserts the v3 SHAPE; the published DOM contract (nine mc-guard-point,
+ * data-guard-section order, the counters) is also exercised by
+ * client-plugin-section.spec.tsx, which this change must not touch.
  */
 import { describe, expect, it } from 'vitest'
 import { isValidElement } from 'react'
@@ -91,6 +91,22 @@ function guardGrid(el: ReactElement): TreeNode[] {
   return children.map((child) => child as unknown as TreeNode)
 }
 
+interface Stats {
+  observations: number
+  outcomes: { success: number; error: number; cancelled: number }
+  reminders: { repeat: number; cycle: number }
+  denials: number
+  since: number
+}
+
+const sampleStats: Stats = {
+  observations: 128,
+  outcomes: { success: 120, error: 8, cancelled: 0 },
+  reminders: { repeat: 4, cycle: 1 },
+  denials: 2,
+  since: Date.UTC(2026, 10, 15, 1, 0),
+}
+
 describe('v3 执行保护卡片', () => {
   it('lays the switches out as a .v3-gpanel of four .v3-gitem cells', () => {
     const grid = guardGrid(render())
@@ -106,38 +122,113 @@ describe('v3 执行保护卡片', () => {
     expect(ids).toEqual(['duplicate_call', 'alternating_cycle', 'no_progress'])
   })
 
-  it('renders the thresholds as .v3-kbd chips', () => {
-    const kbds = nodesWhere(render(), (node) => classHas(node, 'v3-kbd'))
-    expect(kbds).toHaveLength(3)
-    expect(kbds.map((node) => node.props.children)).toEqual(['3', '5', '8'])
+  it('keeps nine mc-guard-point bullets across the three cards', () => {
+    const bullets = nodesWhere(render(), (node) => classHas(node, 'mc-guard-point'))
+    expect(bullets).toHaveLength(9)
   })
 
-  it('keeps the four-cell guard counter board (and its since line)', () => {
+  it('renders the thresholds as three number inputs, in section A only', () => {
+    const wrap = nodesWhere(render(), (node) => node.props['data-guard-thresholds'] === 'true')
+    expect(wrap).toHaveLength(1)
+
+    const inputs = nodesWhere(render(), (node) => node.type === 'input')
+    expect(inputs).toHaveLength(3)
+    for (const input of inputs) {
+      expect(input.props.type).toBe('number')
+      expect(input.props.min).toBe(2)
+      expect(input.props.max).toBe(50)
+    }
+    expect(inputs.map((input) => input.props.value)).toEqual(['3', '5', '8'])
+  })
+
+  it('assembles a fresh array when a threshold input changes', () => {
+    const calls: Array<readonly number[]> = []
+    const el = render({ onThresholdsChange: (next) => { calls.push(next) } })
+    const inputs = nodesWhere(el, (node) => node.type === 'input')
+    ;(inputs[1].props.onChange as (event: { target: { value: string } }) => void)({ target: { value: '6' } })
+    expect(calls).toEqual([[3, 6, 8]])
+  })
+
+  it('puts one guardFired counter at each card foot, mapped per section', () => {
+    const withStats = guardGrid(render({ stats: sampleStats }))
+    const firedOf = (cell: TreeNode): unknown[] => {
+      const hits: unknown[] = []
+      walk(cell as unknown as ReactNode, (node) => { if (classHas(node, 'v3-kbd')) hits.push(node.props.children) })
+      return hits
+    }
+    // A = reminders.repeat, B = reminders.cycle, C = denials.
+    expect(firedOf(withStats[0])).toEqual(['4'])
+    expect(firedOf(withStats[1])).toEqual(['1'])
+    expect(firedOf(withStats[2])).toEqual(['2'])
+  })
+
+  it('shows — for a card with no reported counter, never a fake zero', () => {
+    const bare = guardGrid(render())
+    for (let index = 0; index < 3; index += 1) {
+      const hits: unknown[] = []
+      walk(bare[index] as unknown as ReactNode, (node) => { if (classHas(node, 'v3-kbd')) hits.push(node.props.children) })
+      expect(hits).toEqual(['—'])
+    }
+  })
+
+  it('states each card’s purpose / threshold hint', () => {
+    const text = textOf(render())
+    expect(text).toContain('guardPurposeB')
+    expect(text).toContain('guardPurposeC')
+    expect(text).toContain('guardThresholdHint')
+    expect(text).toContain('guardFired')
+  })
+
+  it('keeps the four-cell guard counter board and the short boundary hint', () => {
     const cells = nodesWhere(render(), (node) => node.props['data-guard-stat'] !== undefined)
     expect(cells).toHaveLength(4)
     const boards = nodesWhere(render(), (node) => node.props['data-guard-stats'] === 'true')
     expect(boards).toHaveLength(1)
 
-    const withStats = render({
-      stats: {
-        observations: 128,
-        outcomes: { success: 120, error: 8, cancelled: 0 },
-        reminders: { repeat: 4, cycle: 1 },
-        denials: 2,
-        since: Date.UTC(2026, 10, 15, 1, 0),
-      },
-    })
-    const since = nodesWhere(withStats, (node) => node.props['data-guard-stats-since'] !== undefined)
-    expect(since).toHaveLength(1)
+    const withStats = render({ stats: sampleStats })
+    const values = nodesWhere(withStats, (node) => node.props['data-guard-stat'] !== undefined)
+      .map((node) => {
+        const flat: string[] = []
+        walk(node.props.children as ReactNode, (inner) => {
+          if (typeof inner.props.children === 'string') flat.push(inner.props.children)
+        })
+        return flat.join('|')
+      })
+    expect(values.some((value) => value.includes('128'))).toBe(true)
+    expect(values.some((value) => value.includes('120 / 8'))).toBe(true)
+    expect(values.some((value) => value.includes('4 / 1'))).toBe(true)
+
+    // One short boundary hint, and no "counting since" line.
+    const hints = nodesWhere(render(), (node) => classHas(node, 'v3-hint') && node.props.children === 'guardBoundaryShort')
+    expect(hints).toHaveLength(1)
+    expect(nodesWhere(render({ stats: sampleStats }), (node) => node.props['data-guard-stats-since'] !== undefined))
+      .toHaveLength(0)
+  })
+
+  it('drops the in-page title and activity sub-title', () => {
+    const el = GuardPanel({
+      t: (key: string) => ({
+        guardTitle: '执行保护',
+        guardStatsTitle: '执行保护活动',
+        guardStatsSince: '统计自',
+        guardScopeTitle: '生效范围',
+      } as Record<string, string>)[key] ?? key,
+      enabled: { duplicate_call: true, alternating_cycle: true, no_progress: true },
+      duplicateThresholds: [3, 5, 8],
+      stats: sampleStats,
+    }) as ReactElement
+    const headings = nodesWhere(el, (node) => node.type === 'h1' || node.type === 'h2')
+    expect(headings).toHaveLength(0)
+    const text = textOf(el)
+    expect(text).not.toContain('执行保护活动')
+    expect(text).not.toContain('统计自')
   })
 
   it('makes the fourth cell a scope note, not a switch', () => {
     const grid = guardGrid(render())
-    // The three guard cards each carry exactly one switch.
     for (let index = 0; index < 3; index += 1) {
       expect(countSwitches(grid[index])).toBe(1)
     }
-    // The fourth cell explains the effective scope and has no switch.
     expect(countSwitches(grid[3])).toBe(0)
     expect(textOf(grid[3])).toContain('生效范围')
   })

@@ -2,7 +2,7 @@
 
 一个 DSH 插件：把**能力目录与按需调用**（Capability Menu 思路）和 **Agent 效率守卫**（重复/循环调用提醒）整合在一起。
 
-当前版本 **0.1.22**。
+当前版本 **0.1.23**。
 
 ## 它做什么
 
@@ -24,7 +24,7 @@ dsh plugin --profile desktop add dsh-thinking-guard
 
 ```bash
 dsh plugin --profile desktop add dsh-thinking-guard           # 升到最新
-dsh plugin --profile desktop add dsh-thinking-guard@0.1.22    # 锁定某个版本
+dsh plugin --profile desktop add dsh-thinking-guard@0.1.23    # 锁定某个版本
 ```
 
 装完**重启 DSH**。

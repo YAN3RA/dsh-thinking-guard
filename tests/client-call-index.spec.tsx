@@ -62,6 +62,8 @@ import {
   CALL_INDEX_SCOPES,
   CALL_INDEX_SCOPE_LABELS,
   callIndexScanProgress,
+  callIndexRefreshPolicy,
+  callIndexTrendWidth,
   callIndexSessionName,
   scopeQuery,
   scopeHint,
@@ -392,21 +394,18 @@ describe('zero source counts', () => {
       .toBe(false)
   })
 
-  it('renders the placeholder text in the overview, not a bare 0', () => {
+  it('renders the source placeholder instead of a bare 0 when per-tool data is unread', () => {
     const text = visible(CallIndexOverviewPanelView({
       status: statusView(),
       overview: overviewView(),
     }))
-    expect(text).toContain('未解析出')
-    // The page may *deny* the "unused" reading ("不等于未使用" / "不能说明「未使用」")
-    // — that is the point of the placeholder — but must never *assert* it. Strip
-    // the known negations, then require that no bare claim survives.
+    // No per-tool read yet: the source card says 「来源未解析」 and explains it,
+    // rather than printing a confident 0.
+    expect(text).toContain('来源未解析')
     const stripped = text
       .replaceAll('不等于未使用', '')
       .replaceAll('不表示「未使用」', '')
       .replaceAll('不表示未使用', '')
-      .replaceAll('不能说明「未使用」', '')
-      .replaceAll('不能说明未使用', '')
     expect(stripped).not.toContain('未使用')
   })
 })
@@ -642,6 +641,7 @@ describe('aggregates and trend', () => {
     const view = CallIndexOverviewPanelView({
       status: statusView(),
       overview: overviewView({ aggregates: { ...AGGREGATES, byDay: undefined } }),
+      tools: callIndexToolRows(callPage({ items: [ROW] })),
     })
     const missing = nodesWith(view, element => element.props['data-call-index-missing'] !== undefined)
     expect(missing.map(node => node.props['data-call-index-missing'])).toContain('by-day')
@@ -683,7 +683,7 @@ describe('aggregates and trend', () => {
     const view = CallIndexOverviewPanelView({ status: statusView(), overview: overviewView() })
     const svg = nodesWith(view, element => element.props['data-call-index-svg'] === 'trend')
     expect(svg).toHaveLength(1)
-    expect(svg[0]?.props.viewBox).toBe('0 0 720 212')
+    expect(svg[0]?.props.viewBox).toBe('0 0 ' + callIndexTrendWidth((AGGREGATES.byDay ?? []).length) + ' 212')
     const lines = nodesWith(view, element => element.props.className === 'v3-line')
     expect(lines).toHaveLength(1)
     expect(String(lines[0]?.props.points).split(' ')).toHaveLength(AGGREGATES.byDay?.length ?? 0)
@@ -756,7 +756,7 @@ describe('overview metrics', () => {
     // Both pages must now ask for 'all', and the header must say so literally.
     expect(CALL_INDEX_OVERVIEW_RANGE).toBe('all')
     const text = visible(CallIndexOverviewPanelView({ status: statusView(), overview: overviewView() }))
-    expect(text).toContain('范围：全部已索引会话')
+    expect(text).not.toContain('范围：')
     expect(text).not.toContain('最近 30 天')
     // And the request it actually sends carries no lower bound.
     const request = buildCallIndexSummaryRequest({ range: CALL_INDEX_OVERVIEW_RANGE }, Date.UTC(2026, 10, 10, 12))
@@ -1277,21 +1277,22 @@ describe('v3 structure', () => {
     expect(nodesWith(view, element => element.props['data-call-index-spark'] !== undefined).length).toBeGreaterThanOrEqual(3)
   })
 
-  it('draws the source donut as exactly one segment and lists all five kinds', () => {
-    // Real data has unknown = 100%. The donut must draw ONE segment and never
-    // fabricate a coloured slice for a zero source (D-028).
-    const allUnknown: CallIndexAggregates = {
-      distinctTools: 1,
-      bySource: { mcp: 0, native: 0, 'plugin-tool': 0, skill: 0, unknown: 745 },
-      byDay: AGGREGATES.byDay,
-      dayOffsetMinutes: 480,
-    }
-    const view = CallIndexOverviewPanelView({ status: statusView(), overview: overviewView({ aggregates: allUnknown }) })
-    expect(nodesWith(view, element => element.props.className === 'v3-seg')).toHaveLength(1)
-    expect(visible(view)).toContain('100%')
-    expect(visible(view)).toContain('未解析')
-    expect(nodesWith(view, element => element.props['data-source-row'] !== undefined).map(r => r.props['data-source-row']))
-      .toEqual(['mcp', 'native', 'plugin-tool', 'skill', 'unknown'])
+  it('classifies sources by tool-name prefix (mcp__ = MCP, else native), never a Host owner claim', () => {
+    // The source split is inferred from tool names, NOT from a Host-provided
+    // ownership fact. 2 MCP-prefixed calls + 1 plain call must read 2 / 1.
+    const tools = callIndexToolRows(callPage({ items: [
+      { ...ROW, toolName: 'mcp__srv__do', callSeq: 1, callId: 'c1', outcome: 'success' },
+      { ...ROW, toolName: 'mcp__srv__do', callSeq: 2, callId: 'c2', outcome: 'success' },
+      { ...ROW, toolName: 'read', callSeq: 3, callId: 'c3', outcome: 'success' },
+    ] }))
+    const view = CallIndexOverviewPanelView({ status: statusView(), overview: overviewView(), tools })
+    const rows = nodesWith(view, element => element.props['data-source-row'] !== undefined)
+    expect(rows.map(r => r.props['data-source-row'])).toEqual(['mcp', 'native'])
+    const counts = Object.fromEntries(rows.map(r => [String(r.props['data-source-row']), String(r.props['data-source-count'])]))
+    expect(counts).toEqual({ mcp: '2', native: '1' })
+    // The footnote must say it is an inference, and one arc per non-zero category.
+    expect(visible(view)).toContain('按工具名前缀推断')
+    expect(nodesWith(view, element => element.props.className === 'v3-seg')).toHaveLength(2)
   })
 
   it('caps the tool ranking at 12 rows', () => {
@@ -1311,7 +1312,7 @@ describe('v3 structure', () => {
   it('renders the detail page as two chart columns plus a .v3-ts table', () => {
     const view = CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), page: callPage(), status: statusView() })
     expect(nodesWith(view, element => element.props.className === 'v3-board').length).toBeGreaterThanOrEqual(1)
-    expect(visible(view)).toMatch(/个工具 · .*次调用/)
+    expect(visible(view)).toContain('索引已完成')
     expect(nodesWith(view, element => element.props.className === 'v3-stat')).toHaveLength(4)
     expect(nodesWith(view, element => element.props['data-call-index-summary'] === 'rates')).toHaveLength(1)
     expect(nodesWith(view, element => element.props['data-call-index-table'] === 'tools')).toHaveLength(1)
@@ -1340,13 +1341,17 @@ describe('v3 structure', () => {
       .toHaveLength(1)
   })
 
-  it('keeps "占该工具 %" (detail) and "占全部失败 %" (overview) as distinct denominators', () => {
+  it('shows the per-tool failure share on 明细 and a plain tool+count list on 总览', () => {
     const items = [withTool('bash', 'success', 1), withTool('grep', 'error', 2)]
     const page = callPage({ items })
     const detail = visible(CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), page, status: statusView() }))
     expect(detail).toContain('占该工具')
     const overview = visible(CallIndexOverviewPanelView({ status: statusView(), overview: overviewView(), tools: callIndexToolRows(page) }))
-    expect(overview).toContain('占全部失败')
+    // 总览 no longer prints a share or the removed blocks; it lists tools + counts.
+    expect(overview).toContain('工具调用失败')
+    expect(overview).not.toContain('占全部失败')
+    expect(overview).not.toContain('失败率最高')
+    expect(overview).not.toContain('未配对结果')
   })
 })
 
@@ -1635,18 +1640,27 @@ describe('read coverage of the tool rows', () => {
     const page = callPage({ total: 500, summary: BIG_SUMMARY })
     const text = visible(CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), page }))
     expect(text).toContain('已读取')
-    expect(text).toContain('全部 500 次')
+    expect(text).toContain('全部共 500 次')
   })
 
-it('computes the failure concentration share against the overall failure count', () => {
+it('lists failing tools and their counts in the 工具调用失败 card', () => {
     const overview = overviewView({
       total: 500,
       summary: { total: 500, success: 390, error: 100, cancelled: 0, unresolved: 0, unknown: 0, running: 0, inherited: 0 },
     })
-    const tools = [{ toolName: 'read', sourceKind: 'native' as const, lastAt: 1, success: 5, error: 5, calls: 10 }]
+    const tools = [
+      { toolName: 'read', sourceKind: 'native' as const, lastAt: 1, success: 5, error: 5, calls: 10 },
+      { toolName: 'bash', sourceKind: 'native' as const, lastAt: 2, success: 1, error: 2, calls: 3 },
+    ]
     const text = visible(CallIndexOverviewPanelView({ overview, tools }))
-    // 5 failures out of the 100 the overview reports, not out of the 5 read here.
-    expect(text).toContain('占全部失败的 5%')
+    expect(text).toContain('工具调用失败')
+    expect(text).toContain('read')
+    expect(text).toContain('bash')
+    expect(text).toContain('5 次')
+    // The removed blocks never come back.
+    expect(text).not.toContain('占全部失败')
+    expect(text).not.toContain('失败率最高')
+    expect(text).not.toContain('未配对结果')
   })
 
   it('does not claim full coverage on the overview when only part was read', () => {
@@ -1657,3 +1671,57 @@ it('computes the failure concentration share against the overall failure count',
     expect(text).toContain('共 500 次')
   })
 })
+// ---------------------------------------------------------------------------
+// 13. v3 polish — plain language, source heuristic, pannable trend, scan-safe refresh
+// ---------------------------------------------------------------------------
+
+describe('v3 polish', () => {
+  it('keeps internal wording off both pages', () => {
+    const overview = visible(CallIndexOverviewPanelView({
+      status: statusView(), overview: overviewView(), tools: callIndexToolRows(callPage({ items: [ROW] })),
+    }))
+    const detail = visible(CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), status: statusView(), page: callPage() }))
+    for (const word of ['快照代', '按工具聚合', '口径']) {
+      expect(overview, 'overview leaked ' + word).not.toContain(word)
+      expect(detail, 'detail leaked ' + word).not.toContain(word)
+    }
+  })
+
+  it('pans the trend: a scroll strip whose svg width grows with the day count', () => {
+    const manyDays = Array.from({ length: 30 }, (_, i) => ({
+      day: '2026-10-' + String((i % 28) + 1).padStart(2, '0'),
+      calls: i + 1, success: 0, error: 0, cancelled: 0, unresolved: 0, unknown: 0, running: 0,
+    }))
+    const few = CallIndexOverviewPanelView({ status: statusView(), overview: overviewView() })
+    const many = CallIndexOverviewPanelView({
+      status: statusView(), overview: overviewView({ aggregates: { ...AGGREGATES, byDay: manyDays } }),
+    })
+    // A scroll container carries the drag-to-pan surface.
+    expect(nodesWith(few, el => el.props['data-call-index-chartview'] !== undefined)).toHaveLength(1)
+    const wFew = Number(nodesWith(few, el => el.props['data-call-index-width'] !== undefined)[0]?.props['data-call-index-width'])
+    const wMany = Number(nodesWith(many, el => el.props['data-call-index-width'] !== undefined)[0]?.props['data-call-index-width'])
+    expect(wMany).toBeGreaterThan(wFew)
+    // The last day label is right-anchored so it cannot overlap the previous one.
+    const lastTick = nodesWith(many, el => el.props['data-call-index-lasttick'] === 'true')[0]
+    expect(lastTick?.props['text-anchor']).toBe('end')
+  })
+
+  it('does not re-read calls while a scan runs: the refresh policy is status-only', () => {
+    const running = statusView({ phase: 'running', sessions: { listed: 5, visible: 5, completed: 1, pending: 4, pendingLive: 0, failed: 0 } })
+    expect(callIndexRefreshPolicy(running)).toEqual({ scanning: true, mode: 'status-only' })
+    expect(callIndexRefreshPolicy(statusView()).mode).toBe('full')
+    expect(callIndexRefreshPolicy(undefined)).toEqual({ scanning: false, mode: 'full' })
+  })
+
+  it('summarises the scan state in one plain sentence', () => {
+    const running = visible(CallIndexOverviewPanelView({
+      status: statusView({ phase: 'running', sessions: { listed: 132, visible: 132, completed: 100, pending: 32, pendingLive: 0, failed: 0 } }),
+      overview: overviewView(),
+    }))
+    expect(running).toContain('已索引 132 个会话')
+    expect(running).toContain('仍在扫描')
+    const done = visible(CallIndexOverviewPanelView({ status: statusView(), overview: overviewView() }))
+    expect(done).toContain('扫描已完成')
+  })
+})
+

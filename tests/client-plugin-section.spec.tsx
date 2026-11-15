@@ -335,10 +335,12 @@ describe('思考限制 page', () => {
     }) as ReactElement
     const inputs = nodesWhere(element, node => node.props['data-guard-thresholds'] === 'true')
     expect(inputs).toHaveLength(1)
+    // The thresholds are now three number steppers (v3.1) instead of one
+    // comma-separated text field, so the same edit affordance is three inputs.
     const field = nodesWhere(element, node => node.type === 'input')
-    expect(field).toHaveLength(1)
-    expect(field[0]?.props.value).toBe('3, 5, 8')
-    expect(field[0]?.props.readOnly).toBe(false)
+    expect(field).toHaveLength(3)
+    expect(field.map(node => node.props.value)).toEqual(['3', '5', '8'])
+    expect(field.every(node => node.props.readOnly !== true)).toBe(true)
   })
 
   it('reads the field back as a plain list, with no Chinese-only punctuation', () => {
@@ -353,7 +355,7 @@ describe('思考限制 page', () => {
     // The value lives on the <input>, so it is read from props rather than from
     // text nodes — and the helper must expand the editor component to reach it.
     const field = nodesWhere(element, node => node.type === 'input')
-    expect(field[0]?.props.value).toBe('3, 5, 8')
+    expect(field.map(node => node.props.value)).toEqual(['3', '5', '8'])
     const text: string[] = []
     walk(element, (node) => {
       if (typeof node.props.children === 'string') text.push(node.props.children)
@@ -601,6 +603,20 @@ describe('工具与技能 v3 版式', () => {
     expect(textOf(values[3]!.props.children as ReactNode)).toBe('—')
   })
 
+  it('keeps the zero-call cell hint 按已索引调用统计', () => {
+    const strip = CatalogStatStrip({
+      cells: [
+        { label: '常驻', value: 6 },
+        { label: '按需', value: 5 },
+        { label: '禁用', value: 2 },
+        { label: '零调用', value: 0, hint: '按已索引调用统计' },
+      ],
+    }) as ReactElement
+    expect(byClass(strip, 'v3-catstat')).toHaveLength(1)
+    const values = byClass(strip, 'v3-v')
+    expect(textOf(values[3]!.props.children as ReactNode)).toContain('按已索引调用统计')
+  })
+
   const groups = [{
     server: 'github',
     tools: [
@@ -647,7 +663,7 @@ describe('工具与技能 v3 版式', () => {
     expect(byClass(expanded, 'v3-trow')).toHaveLength(3)
   })
 
-  it('labels class chips as 10px .v3-tag with data-tone info|warn|bad', () => {
+  it('labels class chips as 11px .v3-tag with data-tone info|warn|bad', () => {
     const tree = renderTools(true)
     const tones = byClass(tree, 'v3-tag')
       .map(node => node.props['data-tone'])

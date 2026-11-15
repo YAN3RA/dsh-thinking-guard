@@ -147,6 +147,11 @@ export type PluginSectionKey =
   | 'guardScopeBody'
   | 'guardScopeFoot'
   | 'guardBoundaryLabel'
+  | 'guardBoundaryShort'
+  | 'guardThresholdHint'
+  | 'guardFired'
+  | 'guardPurposeB'
+  | 'guardPurposeC'
   | 'guardFootCycle'
   | 'guardFootNoProgress'
   | 'guardSectionA'
@@ -243,6 +248,20 @@ export function PluginSection(props: PluginSectionProps): ReactElement {
     })()
     return () => { live = false }
   }, [callIndexApi])
+  /**
+   * Reset the settings content scroller when the category changes.
+   *
+   * The shell owns the scrolling column and swaps panels with `hidden`, so the
+   * previous tab's scrollTop survives the switch and the next page opens halfway
+   * down (observed: 执行保护 opened below its counter board). Reset the nearest
+   * scrollable ancestor of the active panel.
+   */
+  useEffect(() => {
+    const panel = document.getElementById('mc-category-panel-' + active)
+    let node: HTMLElement | null = panel
+    while (node !== null && !(node.scrollHeight > node.clientHeight + 4)) node = node.parentElement
+    if (node !== null) node.scrollTop = 0
+  }, [active])
   return createElement(PluginSectionView, {
     capability: props.capability,
     usageApi: props.usageApi,

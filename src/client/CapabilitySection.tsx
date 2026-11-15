@@ -271,6 +271,11 @@ export type CapabilityKey =
   | 'guardScopeBody'
   | 'guardScopeFoot'
   | 'guardBoundaryLabel'
+  | 'guardBoundaryShort'
+  | 'guardThresholdHint'
+  | 'guardFired'
+  | 'guardPurposeB'
+  | 'guardPurposeC'
   | 'guardFootCycle'
   | 'guardFootNoProgress'
   | 'guardSectionA'
@@ -552,6 +557,30 @@ button.v3-tag{border:0;cursor:pointer;font-family:inherit}
 button.v3-tag:disabled{opacity:.55;cursor:default}
 .v3-group>summary:focus-visible{outline:2px solid var(--v3-info);outline-offset:-2px}
 .v3-tools{display:flex;flex-direction:column}
+/* ---- v3 catalog rework: 一行工具栏 / 能力诊断卡片 / 卡片向总览看齐 ---- */
+.mc-cat-root{display:flex;flex-direction:column;gap:12px;min-width:0}
+.mc-cat-root .v3-catstat{margin-bottom:0}
+.mc-cat-bar{display:flex;align-items:center;gap:8px;flex-wrap:nowrap;min-width:0}
+.mc-cat-bar>.mc-cat-actions{flex:none}
+.mc-cat-bar .mc-cat-actions button{font-size:11px;white-space:nowrap}
+.mc-cat-tabs{display:flex;align-items:center;flex:none;min-width:0}
+.mc-cat-tabs .mc-main-tabs{border-bottom:0}
+.mc-cat-search{flex:1 1 auto;width:auto;min-width:96px;max-width:220px;display:flex}
+.mc-cat-search input{box-sizing:border-box;width:100%;height:28px;padding:0 9px;border:1px solid var(--v3-line-2);border-radius:var(--v3-r-sm);background:var(--v3-panel);color:var(--v3-t1);font:inherit;font-size:12.5px}
+.mc-cat-search input:hover{border-color:var(--v3-line-2)}
+.mc-cat-search input:focus-visible{outline:2px solid var(--v3-info);outline-offset:1px;border-color:transparent}
+.mc-cat-actions{display:flex;align-items:center;gap:6px;flex:none;margin-left:auto;flex-wrap:nowrap}
+.mc-cat-diag{background:var(--v3-panel);border:1px solid var(--v3-line);border-radius:var(--v3-r-lg);overflow:hidden}
+.mc-cat-diag>summary{display:flex;align-items:center;gap:8px;padding:11px 15px;min-height:38px;cursor:pointer;list-style:none;font-size:12.5px;font-weight:600;color:var(--v3-t2)}
+.mc-cat-diag>summary::-webkit-details-marker{display:none}
+.mc-cat-diag>summary:hover{background:var(--v3-panel-2)}
+.mc-cat-diag[open]>summary{border-bottom:1px solid var(--v3-line)}
+.mc-cat-diag-body{display:flex;flex-direction:column;gap:4px;padding:11px 15px;font-size:11.5px;line-height:18px;color:var(--v3-t3)}
+.v3-root .v3-catgrid{gap:14px}
+.v3-root .v3-group{border-radius:var(--v3-r-lg);margin-bottom:0}
+.v3-root .v3-group>summary{padding:11px 15px;min-height:38px}
+.v3-root .v3-tag{font-size:11px;height:19px;line-height:19px;padding:0 7px}
+.v3-root .v3-trow{min-height:34px;font-size:12.5px}
 `
 if (typeof document !== 'undefined' && document.querySelector(`style[data-css-id="${CSS_ID}"]`) === null) {
   const tag = document.createElement('style')
@@ -642,17 +671,7 @@ function MarkdownFilePreview(props: {
   )
 }
 
-/**
- * Which build of the plugin is on screen. Several rounds of "is my profile
- * running the version I just installed?" had to be answered by grepping
- * `node_modules`, because the panel said nothing about itself. The value is
- * inlined by `tsdown` (see `src/client/env.d.ts`).
- */
-// `typeof` guard: the identifier is inlined by `tsdown` (see env.d.ts) in the
-// shipped bundle, but the vitest process loads this module without that define.
-// `typeof` on an undeclared name is safe and keeps the module importable in tests.
-const PLUGIN_VERSION = typeof __CAPABILITY_MENU_VERSION__ !== 'undefined' ? __CAPABILITY_MENU_VERSION__ : '0.0.0'
-const PLUGIN_TITLE = `capability-menu v${PLUGIN_VERSION}`
+
 
 /**
  * dsh's skill source labels, shown on rows this plugin cannot edit — so "why is
@@ -1534,34 +1553,56 @@ function ReadyBody(props: {
   ]
 
   return (
-    <div className="v3-root">
+    <div className="v3-root mc-cat-root">
       <V3Styles />
-      <div className="mc-heading-row">
-        <div className="mc-heading-meta">
-          <h2 className="mc-heading">{t('title')}</h2>
-          <span className="mc-version" title={PLUGIN_TITLE}>v{PLUGIN_VERSION}</span>
-          {updateStatus?.updateAvailable && (updateStatus.updatable || updateStatus.reason === 'local') && updatePhase !== 'done' && (
-            <Button type="button" variant="primary" size="sm" className="mc-update-check" title={t('updateAvailable', { version: updateStatus.latest })} disabled={updatePhase === 'installing'} onClick={() => setUpdateDialogOpen(true)}>
-              {t('newVersion')}
-            </Button>
-          )}
+      <div className="mc-cat-bar" data-v3-catalog-bar="true">
+        <div className="mc-cat-tabs">
+          <SegmentedTabs
+            className="mc-main-tabs"
+            items={[
+              { value: 'tools', id: 'mc-tab-tools', panelId: 'mc-panel-tools', label: t('toolsGroup') },
+              { value: 'skills', id: 'mc-tab-skills', panelId: 'mc-panel-skills', label: t('skillsGroup') },
+            ]}
+            value={activeTab}
+            onChange={onTabChange}
+            label={t('title')}
+          />
         </div>
-        <div className="mc-heading-actions">
+        {/* 一个搜索框同时服务两个页签：匹配行名，也匹配行所在分组（服务器 /
+            来源目录 / 预设），输入「系统」能找到「系统内置」，输入 cordis 能找到
+            该预设下的技能。什么都不需要筛选时不显示。 */}
+        {snapshot.rows.length > 0 && (
+          <div className="mc-cat-search">
+            <Input
+              type="search"
+              value={filter}
+              placeholder={t('filterByName')}
+              aria-label={t('filterByName')}
+              title={t('filterHint')}
+              onChange={e => setFilter(e.target.value)}
+            />
+          </div>
+        )}
+        <div className="mc-cat-actions">
           <Button size="sm" variant="outline" onClick={() => setRegisterOpen(true)}>
             {t('registerCapability')}
           </Button>
           <Button size="sm" variant="outline" onClick={() => void openCatalogDocs()}>
             {t('viewCatalog')}
           </Button>
-          <a
-            className="mc-feedback-link"
-            href="https://github.com/PKUfudawei/dsh-capability-menu"
-            target="_blank"
-            rel="noopener noreferrer"
-            aria-label={t('feedback')}
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => window.open('https://github.com/PKUfudawei/dsh-capability-menu', '_blank', 'noopener,noreferrer')}
           >
             {t('feedback')}
-          </a>
+          </Button>
+          {updateStatus?.updateAvailable && (updateStatus.updatable || updateStatus.reason === 'local') && updatePhase !== 'done' && (
+            <Button type="button" variant="primary" size="sm" className="mc-update-check" title={t('updateAvailable', { version: updateStatus.latest })} disabled={updatePhase === 'installing'} onClick={() => setUpdateDialogOpen(true)}>
+              {t('newVersion')}
+            </Button>
+          )}
         </div>
       </div>
       {(updatePhase === 'done' || (updateStatus?.updateAvailable && !updateStatus.updatable && updateStatus.reason !== 'local')) && (
@@ -1574,52 +1615,20 @@ function ReadyBody(props: {
           )}
         </div>
       )}
-      <p className="mc-desc">{t('desc')}</p>
+      <CatalogStatStrip cells={statCells} />
       {diagnostics !== null && skillDiagnosticCount > 0 && (
-        <details className="mc-diagnostics">
+        <details className="mc-cat-diag" data-v3-catalog-diagnostics="true">
           <summary>
             {t('diagnosticTitle', { count: skillDiagnosticCount })}
           </summary>
-          {diagnostics.unavailableSkills.map((item, index) => <div key={`unavailable-${item.name}-${item.preset ?? ''}-${index}`}>{t('diagnosticUnavailable', { name: item.name, source: item.source, preset: item.preset ?? '' })}</div>)}
-          {diagnostics.shadowedSkills.map((item, index) => <div key={`shadowed-${item.name}-${item.shadowedFrom}-${index}`}>{t('diagnosticShadowed', { name: item.name, winner: item.selectedFrom, hidden: item.shadowedFrom })}</div>)}
-          {diagnostics.brokenPresets.map(item => <div key={`broken-${item.id}`}>{t('diagnosticBroken', { id: item.id, reason: item.reason })}</div>)}
-          {diagnostics.unbrowseableSkills.map(item => <div key={`browse-${item.name}`}>{t('diagnosticUnbrowseable', { name: item.name, reason: item.reason })}</div>)}
-          {diagnostics.undocumentedSkills.map(item => <div key={`undocumented-${item.name}`}>{t('diagnosticUndocumented', { name: item.name, summary: item.summary })}</div>)}
+          <div className="mc-cat-diag-body">
+            {diagnostics.unavailableSkills.map((item, index) => <div key={`unavailable-${item.name}-${item.preset ?? ''}-${index}`}>{t('diagnosticUnavailable', { name: item.name, source: item.source, preset: item.preset ?? '' })}</div>)}
+            {diagnostics.shadowedSkills.map((item, index) => <div key={`shadowed-${item.name}-${item.shadowedFrom}-${index}`}>{t('diagnosticShadowed', { name: item.name, winner: item.selectedFrom, hidden: item.shadowedFrom })}</div>)}
+            {diagnostics.brokenPresets.map(item => <div key={`broken-${item.id}`}>{t('diagnosticBroken', { id: item.id, reason: item.reason })}</div>)}
+            {diagnostics.unbrowseableSkills.map(item => <div key={`browse-${item.name}`}>{t('diagnosticUnbrowseable', { name: item.name, reason: item.reason })}</div>)}
+            {diagnostics.undocumentedSkills.map(item => <div key={`undocumented-${item.name}`}>{t('diagnosticUndocumented', { name: item.name, summary: item.summary })}</div>)}
+          </div>
         </details>
-      )}
-
-      <div className="mc-tabs">
-        <SegmentedTabs
-          className="mc-main-tabs"
-          items={[
-            { value: 'tools', id: 'mc-tab-tools', panelId: 'mc-panel-tools', label: t('toolsGroup') },
-            { value: 'skills', id: 'mc-tab-skills', panelId: 'mc-panel-skills', label: t('skillsGroup') },
-          ]}
-          value={activeTab}
-          onChange={onTabChange}
-          label={t('title')}
-        />
-      </div>
-      <CatalogStatStrip cells={statCells} />
-
-      {/* Name filter. A long list is the actual problem behind "why can't I find
-          this capability" — grouping only helps when you already know where to
-          look — and one box serves both tabs. It matches the row name *and* the
-          group the row sits in (server / source root / preset), because typing
-          系统 should find 系统内置 and typing cordis should find that preset's
-          skills. Hidden when there is nothing to filter at all, so the empty
-          catalog keeps its plain message. */}
-      {snapshot.rows.length > 0 && (
-        <div className="mc-filter">
-          <Input
-            type="search"
-            value={filter}
-            placeholder={t('filterByName')}
-            aria-label={t('filterByName')}
-            title={t('filterHint')}
-            onChange={e => setFilter(e.target.value)}
-          />
-        </div>
       )}
 
       <div role="tabpanel" id="mc-panel-tools" aria-labelledby="mc-tab-tools" hidden={activeTab !== 'tools'} className="mc-panel">

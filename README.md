@@ -2,13 +2,13 @@
 
 一个 DSH 插件：把**能力目录与按需调用**（Capability Menu 思路）和 **Agent 效率守卫**（重复/循环调用提醒）整合在一起。
 
-当前版本 **0.1.20**。
+当前版本 **0.1.21**。
 
 ## 它做什么
 
 - `meta_search` 按需查找能力，`meta_invoke` 调用能力。工具与技能按 **Resident / On-demand / Disabled** 三档分层：Resident 直接出现在模型工具列表里，On-demand 收起、需要时搜索后调用，Disabled 在**执行入口**拒绝，不只是隐藏 Schema。
 - Guard 按 Agent / Turn 隔离，用工具签名与结果/错误指纹识别**重复调用**与 **A-B 交替循环**。只在证据满足门槛时对匹配调用局部拒绝一次，**不停止整个 Turn**。
-- 设置页四个页面：总览、执行保护、工具与技能、调用明细。
+- 设置页四个页面：总览、执行保护、工具与技能、调用明细，采用 **v3 数据看板**版式：趋势/环形/排行用手写 SVG，断点按**内容列宽度**（CSS 容器查询）而非视口，因此在设置面板固定的 564px 内容列里也是完整形态（D-044）。
 
 ## 安装
 
@@ -24,7 +24,7 @@ dsh plugin --profile desktop add dsh-thinking-guard
 
 ```bash
 dsh plugin --profile desktop add dsh-thinking-guard           # 升到最新
-dsh plugin --profile desktop add dsh-thinking-guard@0.1.20    # 锁定某个版本
+dsh plugin --profile desktop add dsh-thinking-guard@0.1.21    # 锁定某个版本
 ```
 
 装完**重启 DSH**。

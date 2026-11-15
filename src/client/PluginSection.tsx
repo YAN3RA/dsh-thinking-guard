@@ -24,6 +24,7 @@ import {
   CallIndexDetailPanel,
   CallIndexDiagnostics,
   CallIndexOverviewPanel,
+  MAX_AUTO_PAGES,
   callIndexToolRows,
   createCallIndexPanelApi,
   type CallIndexPanelApi,
@@ -226,28 +227,59 @@ export function PluginSection(props: PluginSectionProps): ReactElement {
   // beside each policy instead of an empty column. A failed read leaves it
   // undefined, which the catalog renders as `—`, never as zero.
   const [catalogUsage, setCatalogUsage] = useState<ReadonlyMap<string, CatalogUsage> | undefined>(undefined)
+  /** Bumped when a scan finishes, so the catalog's usage map is re-read once. */
+  const [usageToken, setUsageToken] = useState(0)
   useEffect(() => {
+    // Poll while a scan is running and re-read the catalog usage when it ends.
+    // A single mount-time read (the previous behaviour) froze BOTH the shared
+    // diagnostic box and the catalog counts at whatever the index held 1.5s
+    // after mount — so a later scan failure looked healthy and every "N 次"
+    // stayed at its first-page value.
     let live = true
-    void (async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const tick = async (): Promise<void> => {
       const result = await callIndexApi.getStatus()
       if (!live) return
       setDiagnostics(result.ok ? { status: result.value } : { failure: result })
-    })()
-    return () => { live = false }
+      if (!result.ok) return
+      const scanning = result.value.phase === 'running'
+        || (result.value.sessions?.pending ?? 0) > 0
+        || (result.value.sessions?.pendingLive ?? 0) > 0
+      if (scanning) { timer = setTimeout(() => { void tick() }, 3000); return }
+      setUsageToken(value => value + 1)
+    }
+    void tick()
+    return () => { live = false; if (timer !== undefined) clearTimeout(timer) }
   }, [callIndexApi])
   useEffect(() => {
+    // Read EVERY page of the same pinned window, not just the first 50 calls:
+    // a first-page-only map under-counts large corpora and reports "0 calls" for
+    // tools that simply fell off page one. Bounded by MAX_AUTO_PAGES like the
+    // detail table; a failure leaves the map undefined, which the catalog renders
+    // as `—`, never as a fabricated zero.
     let live = true
+    const anchor = Date.now()
     void (async () => {
-      const result = await callIndexApi.listCalls({ range: 'all' })
-      if (!live || !result.ok) return
       const map = new Map<string, CatalogUsage>()
-      for (const row of callIndexToolRows(result.value)) {
-        map.set(row.toolName, { uses: row.calls, failures: row.error })
+      let cursor: string | undefined
+      for (let pages = 0; pages < MAX_AUTO_PAGES; pages += 1) {
+        const result = await callIndexApi.listCalls({ range: 'all' }, cursor, anchor)
+        if (!live) return
+        if (!result.ok) return
+        for (const row of callIndexToolRows(result.value)) {
+          const previous = map.get(row.toolName)
+          map.set(row.toolName, {
+            uses: (previous?.uses ?? 0) + row.calls,
+            failures: (previous?.failures ?? 0) + row.error,
+          })
+        }
+        cursor = result.value.nextCursor
+        if (cursor === undefined) break
       }
       setCatalogUsage(map)
     })()
     return () => { live = false }
-  }, [callIndexApi])
+  }, [callIndexApi, usageToken])
   /**
    * Reset the settings content scroller when the category changes.
    *

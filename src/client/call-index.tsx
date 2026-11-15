@@ -1847,6 +1847,13 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
     : page.items.map(item => item.durationMs).filter((ms): ms is number => ms !== undefined && Number.isFinite(ms))
   const averageDuration = durations.length > 0 ? durations.reduce((sum, ms) => sum + ms, 0) / durations.length : undefined
 
+  // How many calls the tool rows actually cover. The page appends up to
+  // MAX_AUTO_PAGES pages, so on a large corpus it can be short of the total;
+  // every "share of calls" claim below is stated against this read count.
+  const readCalls = rows.reduce((sum, row) => sum + row.calls, 0)
+  const totalCalls = page === undefined ? undefined : (page.total ?? page.summary.total)
+  const readIsPartial = totalCalls !== undefined && readCalls < totalCalls
+
   const rankRows = rows.slice(0, 12)
   const rankMax = rankRows.length > 0 ? rankRows[0]!.calls : 1
   const failingRows = rows.filter(row => row.error > 0).slice().sort((a, b) => b.error - a.error)
@@ -1884,7 +1891,7 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
         }),
         statusText),
       createElement('span', { className: 'v3-statusline v3-status-dash' },
-        `${rows.length} 个工具 · ${rows.reduce((sum, row) => sum + row.calls, 0)} 次调用`),
+        `${rows.length} 个工具 · ${formatCallIndexCount(readCalls, page?.totalExact)} 次调用${readIsPartial ? `（全部 ${formatCallIndexCount(totalCalls, page?.totalExact)} 次）` : ''}`),
     ),
     // filter card: three scopes + search + bind hint + scan progress
     createElement('div', { className: 'v3-panel v3-filtercard' },
@@ -1963,7 +1970,7 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
                 )
               })),
         createElement('p', { className: 'v3-hint', style: { marginTop: 9 } },
-          '条长 = 调用量，按最大值归一；失败率 ≥ 20% 的条变红。'),
+          `条长 = 调用量，按最大值归一；失败率 ≥ 20% 的条变红。${readIsPartial ? `本页已读取 ${formatCallIndexCount(readCalls, page?.totalExact)} 次调用，全部共 ${formatCallIndexCount(totalCalls, page?.totalExact)} 次，未读取部分不参与排行。` : ''}`),
       ),
       createElement('div', { className: 'v3-panel' },
         createElement('div', { className: 'v3-ph' },
@@ -2205,7 +2212,10 @@ export function CallIndexOverviewPanelView(props: CallIndexOverviewPanelViewProp
           createElement('span', { className: 'v3-pt' }, '工具调用排行'),
           createElement('span', { className: 'v3-pn' }, topRows === undefined
             ? '前 12 名'
-            : `前 12 名${topCoverage === undefined ? '' : ` · 覆盖 ${topCoverage}% 的调用`}`),
+            : `前 12 名${topCoverage === undefined ? '' : ` · 占已读取调用的 ${topCoverage}%`}`
+              + (metrics.calls !== undefined && totalToolCalls < metrics.calls
+                ? ` · 已读取 ${formatCallIndexCount(totalToolCalls, exact)} / 共 ${formatCallIndexCount(metrics.calls, exact)} 次`
+                : '')),
         ),
         toolsNotice !== null
           ? toolsNotice

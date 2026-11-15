@@ -1623,3 +1623,26 @@ describe('scope errors are answers, not failures', () => {  it('classifies a dis
     expect(metrics.sessionsListed).toBeUndefined()
   })
 })
+// ---------------------------------------------------------------------------
+// Read-coverage honesty: the tool rows come from a bounded number of appended
+// pages, so on a large corpus they can be shorter than the headline total.
+// Every "share of calls" figure must then say so instead of implying全量.
+// ---------------------------------------------------------------------------
+describe('read coverage of the tool rows', () => {
+  const BIG_SUMMARY = { total: 500, success: 400, error: 5, cancelled: 0, unresolved: 0, unknown: 0, running: 0, inherited: 0 }
+
+  it('tells the detail page how much of the total the rows cover', () => {
+    const page = callPage({ total: 500, summary: BIG_SUMMARY })
+    const text = visible(CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), page }))
+    expect(text).toContain('已读取')
+    expect(text).toContain('全部 500 次')
+  })
+
+  it('does not claim full coverage on the overview when only part was read', () => {
+    const overview = overviewView({ total: 500, summary: BIG_SUMMARY })
+    const tools = [{ toolName: 'read', sourceKind: 'native' as const, lastAt: 1, success: 4, error: 0, calls: 5 }]
+    const text = visible(CallIndexOverviewPanelView({ overview, tools }))
+    expect(text).toContain('已读取')
+    expect(text).toContain('共 500 次')
+  })
+})

@@ -13,8 +13,17 @@
  * internals. `vitest.config.ts` aliases the real specifier to this file, so the
  * API surface here must stay a faithful subset of the real one — if we call a
  * prop that does not exist, this stub should not be the reason it passes.
+ *
+ * Modal is the one primitive whose CLOSE path our shell depends on: every
+ * capability dialog (tool detail, skill file preview, catalog docs, search
+ * metadata, adopt confirmation) can be dismissed while its read is still in
+ * flight, and the shell promises a late reply cannot re-open it. A stub that
+ * dropped `onClose` made that promise untestable — the close button and the mask
+ * now call the caller's `onClose`, mirroring the real component (portal, mask
+ * click, labelled close button), so "close, then let the promise settle" is a
+ * real interaction instead of a private ref poke.
  */
-import { createElement, type ReactNode } from 'react'
+import { createElement, Fragment, type ReactNode } from 'react'
 
 interface BasicProps {
   readonly children?: ReactNode
@@ -34,12 +43,116 @@ export function Input(props: BasicProps) {
   return createElement('input', rest)
 }
 
-/** Real API: {open, onClose, title, closeLabel, children, footer, headless, …}. */
+/**
+ * Real API: {open, onClose, title, closeLabel, description, children, footer,
+ * className, contentClassName, onKeyDownCapture, headless, backdropBlur,
+ * shortcutModal}.
+ *
+ * Mirrored contract:
+ * - `open !== true` renders nothing (the real component returns null);
+ * - the dialog carries `role="dialog"`, `aria-modal="true"` and `aria-label={title}`;
+ * - the mask is `aria-hidden` and closes on click;
+ * - the header carries a `<button aria-label={closeLabel}>` that closes;
+ * - `headless` renders the children alone, with no header/close/body chrome
+ *   (the mask, card and Escape remain in the real one).
+ *
+ * Deliberately NOT reproduced: the portal into `document.body`, focus return,
+ * Escape handling, the CSS-module chrome. Tests therefore query
+ * `document.body`, which is correct under both this stub and the real portal.
+ */
 export function Modal(props: BasicProps) {
-  const { open, onClose: _onClose, title, closeLabel: _closeLabel, footer, headless: _h, backdropBlur: _b, contentClassName: _c, shortcutModal: _s, onKeyDownCapture: _k, ...rest } = props
+  const {
+    open,
+    onClose,
+    title,
+    closeLabel,
+    description,
+    children,
+    footer,
+    className,
+    headless = false,
+    backdropBlur: _backdropBlur,
+    contentClassName: _contentClassName,
+    shortcutModal: _shortcutModal,
+    onKeyDownCapture,
+  } = props as unknown as {
+    open?: boolean
+    onClose?: () => void
+    title?: ReactNode
+    closeLabel?: string
+    description?: ReactNode
+    children?: ReactNode
+    footer?: ReactNode
+    className?: string
+    headless?: boolean
+    backdropBlur?: boolean
+    contentClassName?: string
+    shortcutModal?: string
+    onKeyDownCapture?: (event: unknown) => void
+  }
   if (open !== true) return null
-  const children = [title, rest.children, footer]
-  return createElement('div', { ...rest, role: 'dialog' }, ...(children as ReactNode[]))
+  const close = (): void => { onClose?.() }
+  const chrome = headless
+    ? children
+    : createElement(Fragment, null,
+        createElement('div', { className: 'stub-modal-header' },
+          createElement('h2', null, title),
+          createElement('button', { type: 'button', 'aria-label': closeLabel ?? '', onClick: close }),
+        ),
+        description !== undefined && description !== ''
+          ? createElement('p', null, description)
+          : null,
+        createElement('div', { className: 'stub-modal-body' }, children),
+        footer !== undefined ? createElement('div', { className: 'stub-modal-footer' }, footer) : null,
+      )
+  return createElement('div',
+    { className: 'stub-modal-root', role: 'presentation', onKeyDownCapture },
+    createElement('div', { className: 'stub-modal-mask', 'aria-hidden': 'true', onClick: close }),
+    createElement('div',
+      {
+        className: className === undefined ? 'stub-modal' : `stub-modal ${className}`,
+        role: 'dialog',
+        'aria-modal': 'true',
+        'aria-label': typeof title === 'string' ? title : undefined,
+        tabIndex: -1,
+        'data-stub-modal': 'true',
+      },
+      chrome,
+    ),
+  )
+}
+
+/**
+ * Real API: a `memo` component taking {text, streaming, labels, fileMentions,
+ * pathImages, variant, omitHtml, textInteractionSource}. It renders dsh's safe
+ * Markdown (code blocks, KaTeX, footnotes) — none of which is this repo's
+ * contract. The stub renders the source text so a test can assert WHICH text
+ * reached the renderer (the dialog's content), and nothing about how it is
+ * painted.
+ */
+export function MarkdownText(props: BasicProps) {
+  const { text, labels: _labels, streaming: _s, fileMentions: _f, pathImages: _p, variant: _v, omitHtml: _o, textInteractionSource: _t } = props
+  return createElement('div', { 'data-stub-markdown': 'true' }, typeof text === 'string' ? text : null)
+}
+
+/** Real API: {size, className} → the skill-tree chevron glyph. */
+export function IconTriangleRightFillMedium(props: { size?: number | undefined; className?: string | undefined }) {
+  const { size = 16, className } = props
+  return createElement(
+    'svg',
+    { width: size, height: size, className, 'data-icon': 'dsw-icon-triangle-right-fill-medium', 'aria-hidden': 'true' },
+    createElement('use', { href: '#dsw-icon-triangle-right-fill-medium' }),
+  )
+}
+
+/** Real API: {size, className}; the fallback the shell looks up first. */
+export function IconTriangleRightFillRegular(props: { size?: number | undefined; className?: string | undefined }) {
+  const { size = 16, className } = props
+  return createElement(
+    'svg',
+    { width: size, height: size, className, 'data-icon': 'dsw-icon-triangle-right-fill-regular', 'aria-hidden': 'true' },
+    createElement('use', { href: '#dsw-icon-triangle-right-fill-regular' }),
+  )
 }
 
 /** Real API: {tone, children}. */

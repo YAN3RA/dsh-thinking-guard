@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 import { TOOL_ABORTED, TOOL_ABORTED_BEFORE_DISPATCH, type ToolExecution, type ToolExecutionResult } from '@deepseek-ai/dsh-tools'
-import type { CapabilityPolicyService } from './policy.ts'
+import type { CapabilityPolicyService, GuardSwitches } from './policy.ts'
 import {
   DEFAULT_REPEAT_THRESHOLDS,
   LOOP_HISTORY_LIMIT,
@@ -302,12 +302,85 @@ function toGuardConfig(config: Config): Partial<GuardConfig> {
 }
 
 /**
- * Live Guard switches, with the settings page taking precedence.
+ * The switch values this deployment's patch file declares, as the policy base.
  *
- * The page writes through `ctx.capabilityPolicy.updateGuard`, which persists and
- * updates the service immediately, so a toggle takes effect on the next tool call
- * without reloading the plugin. The patch-file config stays the base for a
- * deployment that never opens the page.
+ * These are the middle layer of `shipped default < patch base < persisted
+ * explicit override`. Only the five keys the settings page exposes are
+ * published: profiles and host integration are not part of `GuardSwitches`,
+ * and sending them would let the patch overwrite UI state it does not own.
+ */
+function toGuardBase(config: Config): Partial<GuardSwitches> {
+  return {
+    ...(config.enabled !== undefined ? { enabled: config.enabled } : {}),
+    ...(config.duplicateDetection !== undefined ? { duplicateDetection: config.duplicateDetection } : {}),
+    ...(config.alternatingCycleDetection !== undefined
+      ? { alternatingCycleDetection: config.alternatingCycleDetection } : {}),
+    ...(config.noProgressProtection !== undefined ? { noProgressProtection: config.noProgressProtection } : {}),
+    ...(config.repeatThresholds !== undefined ? { repeatThresholds: [...config.repeatThresholds] } : {}),
+  }
+}
+
+/**
+ * Run `callback` against the policy service whenever it becomes available.
+ *
+ * `ctx.inject` is the real cordis path: the callback starts when the service
+ * appears and its `scope.effect` disposers run when this fiber unloads, which
+ * covers "Guard mounted before policy", "policy reloaded" and "Guard unmounted"
+ * without any stale registration surviving.
+ *
+ * Two guards around that: a host may have no `inject` (minimal test hosts), and
+ * an OLDER policy service may lack the new lifecycle entry points. Both fall
+ * back to "keep using the patch config", exactly as before this change — the
+ * Guard must never throw because a host predates the diagnostics API.
+ */
+function withPolicyService(
+  ctx: Context,
+  callback: (policy: CapabilityPolicyService) => (() => void) | undefined,
+): void {
+  const capabilityOf = (service: unknown): CapabilityPolicyService | undefined => {
+    const candidate = service as Partial<CapabilityPolicyService> | undefined
+    if (candidate === undefined || candidate === null) return undefined
+    return typeof candidate.getGuard === 'function' ? candidate as CapabilityPolicyService : undefined
+  }
+  const inject = (ctx as unknown as { inject?: (deps: string[], fn: (scope: Context) => void) => unknown }).inject
+  if (typeof inject === 'function') {
+    ctx.inject(['capabilityPolicy'], (scope) => {
+      const policy = capabilityOf(scope.capabilityPolicy)
+      if (policy === undefined) return
+      let withdraw: (() => void) | undefined
+      try {
+        withdraw = callback(policy)
+      } catch {
+        // A host that predates the lifecycle API must not break the Guard.
+        withdraw = undefined
+      }
+      if (withdraw !== undefined) scope.effect(() => withdraw as () => void)
+    })
+    return
+  }
+  // Fallback for a minimal host: register once if the service is already there.
+  const policy = capabilityOf(ctx.get('capabilityPolicy'))
+  if (policy === undefined) return
+  let withdraw: (() => void) | undefined
+  try {
+    withdraw = callback(policy)
+  } catch {
+    withdraw = undefined
+  }
+  if (withdraw !== undefined) ctx.effect(() => withdraw as () => void, 'thinking-guard: guard registration')
+}
+/**
+ * Live Guard switches, resolved by the policy service.
+ *
+ * The policy is the single resolver: it already holds `shipped default < patch
+ * base < persisted explicit override`, and the Guard registers its patch values
+ * there as the base. Reading the whole object from the service (instead of
+ * `live?.key ?? patch.key` per field) is what stops a defaulted `getGuard()`
+ * from silently overwriting the patch: previously the service always returned
+ * a fully defaulted object, so every patch value lost.
+ *
+ * A host without the policy service still falls back to the patch config, which
+ * is the only layer that exists there.
  */
 function readSwitches(ctx: Context, config: Config): Required<Pick<Config,
   'enabled' | 'duplicateDetection' | 'alternatingCycleDetection' | 'noProgressProtection'>> & {
@@ -338,12 +411,96 @@ export function apply(ctx: Context, config: Config = {}): void {
   if (config.duplicateHardBlock === true) {
     ctx.logger.warn('thinking-guard: duplicateHardBlock is deprecated and ignored; duplicate calls are advisory until no-progress evidence is confirmed')
   }
-  const guard = new EfficiencyGuard(toGuardConfig(config))
-  const disposers: Array<() => void> = []
   const excludedTools = new Set(config.excludedTools ?? [])
   const pollingTools = new Set([...DEFAULT_POLLING_TOOLS, ...(config.pollingTools ?? [])])
   const warnOnlyTools = new Set([...DEFAULT_WARN_ONLY_TOOLS, ...(config.warnOnlyTools ?? [])])
   const switches = (): ReturnType<typeof readSwitches> => readSwitches(ctx, config)
+  /**
+   * Construct the Guard, or disable just this sub-plugin.
+   *
+   * A patch file with illegal thresholds is an operator error, not a reason to
+   * take the whole plugin down: the capability catalog, policy and usage pages
+   * have nothing to do with it. Previously the throw escaped `apply`, cordis
+   * logged it and the fiber failed — with no machine-readable answer anywhere.
+   * Now the Guard registers no hooks at all (so it cannot silently run with
+   * defaults) and reports `invalid-patch` through the policy diagnostics.
+   */
+  let guard: EfficiencyGuard | undefined
+  let constructionError: unknown
+  try {
+    guard = new EfficiencyGuard(toGuardConfig(config), undefined, {
+      // Same live switch the hooks read: `admitStep`/`observeTool` must obey the
+      // settings page too, or a UI-off Guard keeps creating turn state.
+      isEnabled: () => switches().enabled,
+    })
+  } catch (error) {
+    constructionError = error
+  }
+  const disposers: Array<() => void> = []
+  if (guard === undefined) {
+    ctx.logger.error(`thinking-guard: Guard disabled by an invalid patch: ${String(constructionError)}`)
+    // Registered on the policy as soon as it is available, and withdrawn when
+    // this fiber unloads, so a reload cannot inherit a dead instance's reason.
+    // Call it now and hand the returned un-register to the lifecycle helper.
+    withPolicyService(ctx, policy => (
+      typeof policy.noteGuardUnavailable === 'function' ? policy.noteGuardUnavailable() : undefined
+    ))
+    return
+  }
+  const activeGuard = guard
+  /**
+   * Publish the patch values as the policy base layer.
+   *
+   * Bound to the service lifetime instead of a one-shot read at mount: if the
+   * policy is mounted after this Guard, or replaced by a reload, the base is
+   * registered on the instance that actually exists and withdrawn with it.
+   * A one-shot registration would leave a stale base behind after a policy
+   * reload, which is exactly the "old base pollutes the next instance" bug.
+   */
+  withPolicyService(ctx, policy => (
+    typeof policy.registerGuardBase === 'function' ? policy.registerGuardBase(toGuardBase(config)) : undefined
+  ))
+  /**
+   * Turn number per Agent, recorded even while the Guard is off.
+   *
+   * A live switch can turn the Guard ON in the middle of a turn, after the
+   * pre-step that would normally have created state. Without the turn number the
+   * hooks could not lazily create it, and "switched on" would silently mean
+   * "works from the next turn" — the very lag the live switch is supposed to
+   * remove. A WeakMap keeps this bounded by live Agents.
+   */
+  const turnOf = new WeakMap<object, number>()
+  /**
+   * Turn state for the CURRENT turn, creating it only when the live switch is on.
+   *
+   * The previous version returned whatever state happened to be cached, which is
+   * exactly how evidence crossed a turn boundary: with the Guard switched off at
+   * the new pre-step, `admitStep` returned before `getOrBegin`, so the old turn's
+   * state (history + pending block candidates) survived and the next turn's first
+   * identical call consumed it. Every lookup now compares the cached state's turn
+   * with the live turn and drops a stale one instead of reusing it.
+   */
+  const stateFor = (agent: object): TurnState | undefined => {
+    const turn = turnOf.get(agent)
+    if (turn === undefined) return undefined
+    const existing = activeGuard.states.get(agent)
+    if (existing !== undefined && existing.turn !== turn) activeGuard.states.clear(agent)
+    if (!switches().enabled) return undefined
+    return activeGuard.states.getOrBegin(agent, turn)
+  }
+  /**
+   * Cached state only if it belongs to the current turn; never creates one.
+   *
+   * Used by read-only entry points (the local-deny guard, result observation)
+   * that must not resurrect a turn, and must never read across a turn boundary.
+   */
+  const stateIfCurrent = (agent: object): TurnState | undefined => {
+    const state = activeGuard.states.get(agent)
+    if (state === undefined) return undefined
+    const turn = turnOf.get(agent)
+    if (turn !== undefined && state.turn !== turn) return undefined
+    return state
+  }
   /**
    * True while at least one of the two detectors is on. The observation entries
    * key off this instead of `duplicateDetection` alone, so turning exact-repeat
@@ -385,7 +542,9 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (!sw.enabled || sw.noProgressProtection === false || allowed.size === 0 || agent === undefined
         || isControlPlaneTool(ctx.capabilityPolicy, execution.name)
         || excludedTools.has(execution.name) || pollingTools.has(execution.name) || warnOnlyTools.has(execution.name)) return undefined
-      const state = guard.states.get(agent)
+      // Read-only lookup: it must never resurrect a turn, and never read a
+      // previous turn's pending candidate (that was the cross-turn denial).
+      const state = stateIfCurrent(agent)
       if (state === undefined || state.loopDetectionDisabled) return undefined
       // A signature beyond the fingerprint budget is not a stable identity, so it
       // can never justify a denial: fail open instead of comparing it.
@@ -408,15 +567,25 @@ export function apply(ctx: Context, config: Config = {}): void {
   disposers.push(toolGuard)
 
   disposers.push(ctx.on('agent/pre-step', async (payload, next) => {
-    guard.admitStep(payload.agent, payload.turn)
+    const agent = payload.agent as object | undefined
+    if (agent !== undefined) {
+      const previousTurn = turnOf.get(agent)
+      turnOf.set(agent, payload.turn)
+      // A new turn starts here even when the Guard is OFF: the cached state is
+      // from an older turn and must be discarded now, not when (or if) the switch
+      // is turned back on. Otherwise turn-2's first identical call would consume
+      // turn-1's pending candidate / repeat history.
+      if (previousTurn !== undefined && previousTurn !== payload.turn) activeGuard.states.clear(agent)
+    }
+    activeGuard.admitStep(payload.agent, payload.turn)
     return next()
   }))
 
   disposers.push(ctx.on('agent/inbox/inserted', ({ agent, message }) => {
-    const state = guard.states.get(agent)
+    const state = stateIfCurrent(agent)
     if (state === undefined || message.source.kind !== 'user') return
     if (!rememberUserMessage(state, String(message.id))) return
-    guard.resetLoopState(agent)
+    activeGuard.resetLoopState(agent)
   }))
 
   disposers.push(ctx.on('tools/execute', async (execution, next) => {
@@ -426,7 +595,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       // either switch is on; gating on `duplicateDetection` alone starved the cycle
       // detector whenever exact-repeat detection was turned off.
       if (!switches().enabled || !loopDetectionActive() || agent === undefined) return next()
-      const state = guard.states.get(agent)
+      const state = stateFor(agent)
       if (state === undefined || state.loopDetectionDisabled) return next()
 
       const callId = String(execution.callId)
@@ -452,7 +621,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       state.dispatchRecords.set(callId, {
         sequence: dispatchSequence, epoch, name: execution.name, signature, fingerprintNeeded,
       })
-      guard.observeTool(agent, state.turn, { controlPlane: isControlPlaneTool(ctx.capabilityPolicy, execution.name) })
+      activeGuard.observeTool(agent, state.turn, { controlPlane: isControlPlaneTool(ctx.capabilityPolicy, execution.name) })
       return next()
     } catch {
       // Fail open: loop detection is advisory, the tool call is not.
@@ -464,7 +633,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     let activeState: TurnState | undefined
     try {
       const agent = execution.agent
-      const state = agent === undefined ? undefined : guard.states.get(agent)
+      // A result that belonged to an older turn must not be observed into the
+      // new turn's history: only a state for the CURRENT turn may consume it.
+      const state = agent === undefined ? undefined : stateIfCurrent(agent)
       if (!switches().enabled || agent === undefined || state === undefined) return
       activeState = state
       const callId = String(execution.callId)
@@ -528,9 +699,12 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
   }))
 
-  disposers.push(ctx.on('agent/disposed', ({ agent }) => guard.states.clear(agent)))
+  disposers.push(ctx.on('agent/disposed', ({ agent }) => activeGuard.states.clear(agent)))
 
-  ctx.logger.info(`thinking-guard: ${guard.config.enabled ? 'enabled' : 'disabled'}; host Token Saver/Prompt Cache remain owned by the host and existing Save Token plugin`)
+  // The live switch, not the constructed snapshot: with the settings page able to
+  // flip `enabled`, reporting the patch value here would describe a state the
+  // Guard may no longer be in.
+  ctx.logger.info(`thinking-guard: ${switches().enabled ? 'enabled' : 'disabled'}; host Token Saver/Prompt Cache remain owned by the host and existing Save Token plugin`)
   ctx.effect(() => () => {
     for (const dispose of disposers.splice(0)) dispose()
   }, 'thinking-guard: cleanup')

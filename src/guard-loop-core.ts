@@ -11,6 +11,21 @@ export const REPEAT_THRESHOLD_MAX = 50
 export const REPEAT_THRESHOLD_LIMIT = 5
 
 /**
+ * Saturating ceiling for the independent consecutive-repeat counter.
+ *
+ * The counter must be able to reach every legal threshold, so it is bounded one
+ * step ABOVE `REPEAT_THRESHOLD_MAX`. Bounding it AT the maximum would pin the
+ * reported count to a legal value forever once saturated, making a reminder fire
+ * on every later call; one past the maximum keeps all legal thresholds exactly
+ * reachable while saturating cleanly out of the legal set afterwards.
+ *
+ * This is deliberately separate from `LOOP_HISTORY_LIMIT`: the 16-entry window is
+ * short so the alternating-cycle scan stays cheap, but deriving the repeat count
+ * from it capped every legal threshold above 16 (the TG-03 defect).
+ */
+export const CONSECUTIVE_COUNT_LIMIT = REPEAT_THRESHOLD_MAX + 1
+
+/**
  * Validate a repeat-threshold list and return a frozen copy.
  *
  * One shared validator so the settings page, the persisted state file and the
@@ -90,6 +105,15 @@ type LoopHistoryEntry = {
 export interface GuardLoopState {
   readonly turn: number
   readonly history: readonly LoopHistoryEntry[]
+  /**
+   * Independent saturating count of the current consecutive run. It is NOT
+   * derived from `history`, so a legal threshold above `LOOP_HISTORY_LIMIT` is
+   * still reachable. Zero when no run is active; advances only while the same
+   * signature repeats.
+   */
+  readonly consecutiveCount: number
+  /** Signature of the current consecutive run; unset before the first observation. */
+  readonly consecutiveSignature?: string
 }
 
 export interface GuardLoopObservation {
@@ -157,7 +181,7 @@ export interface GuardLoopObservationResult {
 }
 
 export function createGuardLoopState(turn: number): GuardLoopState {
-  return { turn, history: [] }
+  return { turn, history: [], consecutiveCount: 0 }
 }
 
 interface FingerprintBudget {
@@ -318,11 +342,17 @@ export function observeGuardLoop(
     ...(fingerprint !== undefined ? { resultFingerprint: fingerprint } : {}),
   }
   const history = base.history.slice(-LOOP_HISTORY_LIMIT)
-  let repeatCount = 1
-  for (let index = history.length - 1; index >= 0; index -= 1) {
-    if (history[index].signature !== signature) break
-    repeatCount += 1
-  }
+  // The consecutive count is an INDEPENDENT saturating counter. Deriving it from
+  // `history` (capped at LOOP_HISTORY_LIMIT) made every legal threshold above 16
+  // unreachable — the TG-03 defect. The counter resets whenever the signature
+  // changes (see `continuesRun`) and on a new turn / effective reset (fresh state),
+  // and never resets on a result change: reminders track identical CALLS, while
+  // no-progress EVIDENCE is gated separately below.
+  const continuesRun = base.consecutiveSignature === signature
+  const repeatCount = Math.min(
+    (continuesRun ? base.consecutiveCount : 0) + 1,
+    CONSECUTIVE_COUNT_LIMIT,
+  )
   const previousConsecutive = history.at(-1)?.signature === signature ? history.at(-1) : undefined
   const exactEvidence = unchangedEvidence(previousConsecutive, current)
   const nextHistory = [...history, current].slice(-LOOP_HISTORY_LIMIT)
@@ -362,7 +392,7 @@ export function observeGuardLoop(
     && blockSource !== undefined
 
   return {
-    state: { turn, history: nextHistory },
+    state: { turn, history: nextHistory, consecutiveCount: repeatCount, consecutiveSignature: signature },
     decision: {
       ignored: false,
       signature,

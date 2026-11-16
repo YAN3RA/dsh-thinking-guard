@@ -44,7 +44,16 @@ const USAGE_NS = 'settings.usage'
  * key that is neither tab copy nor catalog copy is declared here so both
  * dictionaries stay exhaustive without editing those unions.
  */
-export type GuardToastKey = 'guardToastSaved'
+export type GuardToastKey =
+  | 'guardToastSaved'
+  | 'guardDiagUnavailableTitle'
+  | 'guardDiagInvalidPatch'
+  | 'guardDiagNotMounted'
+  | 'guardDiagPersistenceDirty'
+  // Threshold draft editor (TG-14 #5): the explicit save button and the hint
+  // shown while the draft is not yet a valid ascending list.
+  | 'guardThresholdSave'
+  | 'guardThresholdDraftHint'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -116,6 +125,8 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     guardStatsSince: '统计自',
     guardThresholdsEditableHint: '逗号分隔，2–50 递增，最多 5 个',
     guardThresholdsFixedHint: '当前 Host 不支持修改',
+    guardThresholdSave: '保存',
+    guardThresholdDraftHint: '需为 2–50 的递增整数、最多 5 个；未合法前不会提交。',
     recentCalls: '近期调用',
     tierSummary: '能力策略',
     attention: '需要关注',
@@ -135,7 +146,7 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     guardScopeFoot: '恢复默认只写回开关值，不重写其他配置',
     guardBoundaryLabel: '边界',
     guardBoundaryShort: '这里的数字只用于展示，不构成硬停止；三档阈值只参与校验与计数，不产生提醒也不停止任务。',
-    guardThresholdHint: '默认 3 / 5 / 8 次；改的是第几次重复时提醒，只提醒、不拦截。',
+    guardThresholdHint: '默认 3 / 5 / 8 次，分别在第 3、5、8 次重复时提醒；最高阈值还会作为无进展候选门槛，是否局部拒绝由 C 与证据决定。',
     guardFired: '实际触发',
     guardPurposeB: '作用：识别 A→B→A→B 这类交替循环并提醒，避免来回空转。',
     guardPurposeC: '作用：证据明确时拦下已证实的重复操作，其余情况只提醒。',
@@ -146,7 +157,7 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     guardSectionC: 'C · 无进展保护',
     guardModelLabel: '模型侧标识',
     guardABody1: '检查相同工具 + 相同参数的重复调用。',
-    guardABody2: '提醒阈值固定为 3 / 5 / 8 次，当前不支持逐级自定义。',
+    guardABody2: '重复提醒阈值可编辑（默认 3 / 5 / 8 次）；与交替循环检测相互独立，两个开关都不会压住对方。',
     guardABody3: '达到阈值只提醒，并以结果/错误指纹为证据判断是否真的重复。',
     guardBBody1: '识别 A → B → A → B 这样的交替调用序列。',
     guardBBody2: '只用工具调用序列与可获得的「结果 / 错误指纹」判断是否连续多轮没有新结果，不会为了判断循环额外请求一次模型。',
@@ -211,6 +222,7 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     markdownFootnotes: '脚注',
     detailNotFound: '未找到该工具的详情',
     cycleOverridden: '分类未生效：{count} 个能力被更高优先级规则覆盖（如通配规则），可移除对应通配规则后重试',
+    cycleReadOnly: '当前 Host 版本不支持意图级分层接口，分层编辑已置为只读（请升级插件/Host）；不会用整表写入回退。',
     refreshFailed: '刷新失败，请查看日志',
     mcpToolsPending: '已注册「{name}」，但暂未加载出工具。请检查连接和认证后点刷新。',
     retry: '重试',
@@ -304,6 +316,12 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     // CapabilitySection 拥有，这里只加字典项，因此把 `satisfies` 放宽到
     // `CapabilityKey | 'guardToastSaved'`，不改那份 union。
     guardToastSaved: '已保存',
+    // 诊断横幅：只解释「Guard 当前没有生效」与「有改动尚未落盘」，
+    // 不把配置值本身说成出错，也不改统计看板。
+    guardDiagUnavailableTitle: '执行保护当前未生效',
+    guardDiagInvalidPatch: '启动配置非法（补丁文件里的阈值或档位不合法），本模块已停用；其余功能不受影响。',
+    guardDiagNotMounted: '执行保护尚未挂载完成，因此现在不会提醒也不会拒绝。',
+    guardDiagPersistenceDirty: '有改动尚未写入状态文件，下次保存成功后会自动补写。',
   } satisfies Record<CapabilityKey | GuardToastKey, string>
   const en = {
     nav: 'Capability Management',
@@ -330,6 +348,8 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     guardStatsSince: 'Counting since',
     guardThresholdsEditableHint: 'Comma separated, 2–50 ascending, up to 5',
     guardThresholdsFixedHint: 'This Host cannot edit them',
+    guardThresholdSave: 'Save',
+    guardThresholdDraftHint: 'Needs 2–50 ascending integers, at most 5; nothing is submitted until it is valid.',
     recentCalls: 'Recent calls',
     tierSummary: 'Capability tiers',
     attention: 'Needs attention',
@@ -349,7 +369,7 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     guardScopeFoot: 'Restoring defaults writes only the switch values; no other configuration is rewritten.',
     guardBoundaryLabel: 'Boundary',
     guardBoundaryShort: 'These numbers are informational only and never stop a task; the three tier thresholds participate in validation and counting only.',
-    guardThresholdHint: 'Defaults are 3 / 5 / 8; editing changes when the reminder fires. Reminders never block a call.',
+    guardThresholdHint: 'Defaults are 3 / 5 / 8, reminding on the 3rd, 5th and 8th repeat; the highest value also gates no-progress candidates, and a local denial is decided by C together with the evidence.',
     guardFired: 'Fired',
     guardPurposeB: 'Purpose: detect alternating A→B→A→B cycles and remind, so the agent stops going in circles.',
     guardPurposeC: 'Purpose: block a confirmed repeat when the evidence is clear; otherwise only remind.',
@@ -360,7 +380,7 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     guardSectionC: 'C · No-progress protection',
     guardModelLabel: 'Model-side id',
     guardABody1: 'Checks calls that repeat the same tool with the same arguments.',
-    guardABody2: 'Reminder thresholds are fixed at 3 / 5 / 8; per-level editing is not supported.',
+    guardABody2: 'Repeat reminder thresholds are editable (default 3 / 5 / 8); repeat and alternating-cycle detection stay independent, and neither switch suppresses the other.',
     guardABody3: 'Reaching a threshold only reminds, and repetition is confirmed by result/error fingerprints.',
     guardBBody1: 'Detects alternating sequences such as A -> B -> A -> B.',
     guardBBody2: 'Judges no-new-result purely from the call sequence and available result/error fingerprints; it never spends an extra model request to decide whether a loop exists.',
@@ -425,6 +445,7 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     markdownFootnotes: 'Footnotes',
     detailNotFound: 'Tool detail not found',
     cycleOverridden: 'Classification not applied: {count} capability(ies) overridden by a higher-priority rule (e.g. a wildcard). Remove the matching wildcard rule and retry.',
+    cycleReadOnly: 'This Host version has no intent-level tier interface, so tier editing is read-only (upgrade the plugin/Host). It will not fall back to a whole-table write.',
     refreshFailed: 'Refresh failed; see the log',
     mcpToolsPending: '"{name}" is registered, but its tools have not loaded yet. Check its connection and authentication, then refresh.',
     retry: 'Retry',
@@ -515,6 +536,10 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
     projectRootLabel: 'Project root: {path}',
     skillBrowseUnavailable: 'This Skill has no browsable directory root; its provider may be non-filesystem based.',
     guardToastSaved: 'Saved',
+    guardDiagUnavailableTitle: 'Execution guard is not in effect',
+    guardDiagInvalidPatch: 'The startup configuration is invalid (an illegal threshold or profile in the patch file), so this module is disabled; everything else is unaffected.',
+    guardDiagNotMounted: 'The guard has not finished mounting, so it currently neither reminds nor denies.',
+    guardDiagPersistenceDirty: 'Changes have not reached the state file yet; they are retried after the next successful save.',
   } satisfies Record<CapabilityKey | GuardToastKey, string>
 
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'capability-menu: dictionaries')
@@ -664,6 +689,17 @@ export async function apply(ctx: ClientContext): Promise<() => void> {
         return Promise.resolve({ ok: false as const, error: { code: 'unsupported', message: 'Host does not expose Guard stats.' } })
       }
       return face.getGuardStats()
+    },
+    // Guarded the same way, but with a different meaning: an older Host has no
+    // diagnostics at all, and the container then shows NO banner. Reporting a
+    // failure here would be worse than silence — "unknown" must not render as
+    // "available", and it must not render as "broken" either.
+    getGuardDiagnostics: () => {
+      const face = remote() as { getGuardDiagnostics?(): ReturnType<NonNullable<GuardSwitchesRemote['getGuardDiagnostics']>> }
+      if (typeof face.getGuardDiagnostics !== 'function') {
+        return Promise.resolve({ ok: false as const, error: { code: 'unsupported', message: 'Host does not expose Guard diagnostics.' } })
+      }
+      return face.getGuardDiagnostics()
     },
   } satisfies GuardSwitchesRemote
 

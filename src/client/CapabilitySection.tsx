@@ -123,6 +123,7 @@ export type CapabilityKey =
   | 'markdownFootnotes'
   | 'detailNotFound'
   | 'cycleOverridden'
+  | 'cycleReadOnly'
   | 'refreshFailed'
   | 'mcpToolsPending'
   | 'feedback'
@@ -305,6 +306,16 @@ const NEXT_CLASS: Record<CapabilityClass, CapabilityClass> = {
   'on-demand': 'disabled',
   disabled: 'resident',
   resident: 'on-demand',
+}
+
+/**
+ * A Host proxy can expose `moveCapabilities` yet answer 404 /
+ * `definition-unavailable` (an older Host that has no real endpoint). Treat
+ * that as "tier editing is read-only" and never fall back to a whole-table
+ * write; any other error is a real failure.
+ */
+function isIntentMoveUnsupported(message: string): boolean {
+  return /definition-unavailable|HTTP 404|\b404\b|is not a function/i.test(message)
 }
 
 /** i18n keys for the short display labels, keyed by the machine class value. */
@@ -853,6 +864,11 @@ export function ToolGroupsView(props: ToolGroupsViewProps): ReactElement {
                       aria-label={tool.name}
                       onClick={() => props.onOpenDetail(tool.id)}
                       onKeyDown={(e: KeyboardEvent<HTMLElement>) => {
+                        // Only the row itself responds. A key press on a child
+                        // control (检索 / 档位 chips) must not bubble up and open
+                        // the detail pane, nor have its own activation cancelled
+                        // (Space would otherwise scroll the page).
+                        if (e.target !== e.currentTarget) return
                         if (e.key === 'Enter' || e.key === ' ') {
                           e.preventDefault()
                           props.onOpenDetail(tool.id)
@@ -1131,11 +1147,19 @@ export function CapabilitySection(props: CapabilitySectionProps): JSX.Element {
   /** Move one or more capability ids to the next class in the click cycle. */
   const cycleClass = useCallback(async (ids: readonly string[], kind: 'tool' | 'skill') => {
     if (ids.length === 0 || busy) return
+    // A Host older than the intent interface has no safe way to move one id
+    // without rewriting every list from this window's snapshot. Refuse to edit
+    // (read-only) rather than silently fall back to that whole-table write.
+    const move = remote.moveCapabilities
+    if (move === undefined) {
+      setToast(t('cycleReadOnly'))
+      return
+    }
     setBusy(true)
     // The move is decided from the rows already on screen, so the dot flips on
     // the click frame rather than after a round trip: how fast this feels must
-    // not depend on how busy the server happens to be. The round trips below
-    // only reconcile.
+    // not depend on how busy the server happens to be. The round trip below
+    // only reconciles.
     const first = ids.map(id => state.status === 'ready' ? state.snapshot.rows.find(r => r.id === id)?.class : undefined)
       .find((c): c is CapabilityClass => c !== undefined)
     const from: CapabilityClass = first ?? 'on-demand'
@@ -1152,41 +1176,33 @@ export function CapabilitySection(props: CapabilitySectionProps): JSX.Element {
         }
       : prev)
     try {
-      const config = await withTransientRetry(async () => unwrap(await remote.getConfig(), 'capabilityPolicy.getConfig'))
-      const key = kind === 'skill' ? 'skills' : 'tools'
-      const set = config[key]
-      const lists: Record<CapabilityClass, string[]> = {
-        resident: [],
-        'on-demand': [],
-        disabled: [],
-      }
-      for (const cls of CLASS_KEYS) {
-        const raw = set && typeof set === 'object' && !Array.isArray(set) ? (set as Record<string, unknown>)[cls] : undefined
-        lists[cls] = Array.isArray(raw) ? raw.filter((x): x is string => typeof x === 'string') : []
-      }
-      // Remove moved ids from every list, then append to the destination list.
-      for (const cls of CLASS_KEYS) {
-        lists[cls] = lists[cls].filter(id => !ids.includes(id))
-      }
-      lists[to] = [...lists[to], ...ids]
-      const nextLists: Record<string, string[]> = {}
-      for (const cls of CLASS_KEYS) nextLists[cls] = lists[cls]
-      // Unwrap like every other remote call: a rejected write (e.g. the
-      // server's meta-tool fail-loud check) must surface as an error, not be
-      // misread below as "overridden by a higher-priority rule".
-      unwrap(await remote.updateConfig({ [key]: nextLists }), 'capabilityPolicy.updateConfig')
+      // Intent-level: name only these ids and the target. The Host applies them
+      // to its LATEST state and journals only these ids, so a concurrent move in
+      // another window is never reverted by carrying a stale copy of the lists.
+      unwrap(await move.call(remote, { kind, ids, target: to }), 'capabilityPolicy.moveCapabilities')
       const next = await loadSnapshot(remote)
       setState({ status: 'ready', snapshot: next })
       // Detect silently-overridden changes: a broader wildcard rule (or a hard
       // disabled rule) still wins over the exact id just pinned, so the class
       // did not move to `to`. Surface that instead of failing silently.
       const overridden = ids.filter(id => next.rows.find(r => r.id === id)?.class !== to)
-      // Transient feedback: the user just clicked, and the outcome is only
-      // readable for a moment. Keep the persistent notice slot for messages
-      // that carry an action (the MCP retry below).
       setToast(overridden.length > 0 ? t('cycleOverridden', { count: overridden.length }) : null)
     } catch (e) {
-      setState({ status: 'error', message: String(e) })
+      const message = String(e)
+      if (isIntentMoveUnsupported(message)) {
+        // The proxy advertised the method but the Host has no usable endpoint:
+        // read-only, never a whole-table write. Re-read the true state in case
+        // the optimistic flip painted a class the Host did not accept.
+        try {
+          const next = await loadSnapshot(remote)
+          setState({ status: 'ready', snapshot: next })
+        } catch {
+          setState(prev => prev.status === 'ready' ? prev : { status: 'error', message })
+        }
+        setToast(t('cycleReadOnly'))
+      } else {
+        setState({ status: 'error', message })
+      }
     } finally {
       setBusy(false)
     }
@@ -1352,16 +1368,25 @@ function ReadyBody(props: {
     detail?: ToolDetail
     message?: string
   } | null>(null)
+  /** Token for the open tool-detail request: closing/opening advances it so a
+   *  late reply cannot re-open a pane the operator already dismissed. */
+  const toolDetailRequest = useRef(0)
 
   /** Fetch and show the model-facing tool definition (name/description/parameters). */
   const openToolDetail = useCallback(async (id: string) => {
+    const request = toolDetailRequest.current + 1
+    toolDetailRequest.current = request
     setToolDetail({ id, status: 'loading' })
     try {
       const detail = unwrap(await remote.getDetail(id), 'capabilityPolicy.getDetail')
+      // The modal may have been closed (or another tool opened) while this was
+      // in flight; that reply is stale and must be discarded, not applied.
+      if (toolDetailRequest.current !== request) return
       setToolDetail(detail === undefined
         ? { id, status: 'error', message: t('detailNotFound') }
         : { id, status: 'ready', detail })
     } catch (error) {
+      if (toolDetailRequest.current !== request) return
       setToolDetail({ id, status: 'error', message: String(error) })
     }
   }, [remote, t])
@@ -1380,14 +1405,22 @@ function ReadyBody(props: {
   const [searchEdit, setSearchEdit] = useState<{ status: 'loading' | 'ready' | 'error'; id: string; kind: 'tool' | 'skill'; metadata?: SearchMetadata; message?: string } | null>(null)
   const [searchDescription, setSearchDescription] = useState('')
   const [searchSaving, setSearchSaving] = useState(false)
+  /** Token for the search-metadata read: closing advances it so a late reply
+   *  cannot re-open a dialog the operator already dismissed (same guard the
+   *  tool detail and the skill file preview use). */
+  const searchEditRequest = useRef(0)
   const openSearchEdit = useCallback(async (id: string, kind: 'tool' | 'skill') => {
+    const request = searchEditRequest.current + 1
+    searchEditRequest.current = request
     setSearchEdit({ status: 'loading', id, kind })
     try {
       const metadata = unwrap(await remote.getSearchMetadata(id, kind), 'capabilityPolicy.getSearchMetadata')
+      if (searchEditRequest.current !== request) return
       if (metadata === undefined) throw new Error(t('detailNotFound'))
       setSearchDescription(metadata.description ?? metadata.defaultDescription)
       setSearchEdit({ status: 'ready', id, kind, metadata })
     } catch (error) {
+      if (searchEditRequest.current !== request) return
       setSearchEdit({ status: 'error', id, kind, message: String(error) })
     }
   }, [remote, t])
@@ -1501,15 +1534,22 @@ function ReadyBody(props: {
     }
   }, [remote, t, onNotice])
 
+  /** Token for the catalog-docs read: closing advances it so a late reply
+   *  cannot re-open the dialog the operator already dismissed. */
+  const catalogDocsRequest = useRef(0)
   /** Fetch exposure rules, searchable summaries, and the description limit. */
   const openCatalogDocs = useCallback(async () => {
+    const request = catalogDocsRequest.current + 1
+    catalogDocsRequest.current = request
     setCatalogDocs({ status: 'loading' })
     try {
       const docs = unwrap(await remote.getCatalogDocs(), 'capabilityPolicy.getCatalogDocs')
+      if (catalogDocsRequest.current !== request) return
       setSummaryLimitDraft(String(docs.summaryMaxChars))
       setSummaryLimitError(undefined)
       setCatalogDocs({ status: 'ready', docs })
     } catch (error) {
+      if (catalogDocsRequest.current !== request) return
       setCatalogDocs({ status: 'error', message: String(error) })
     }
   }, [remote])
@@ -1736,7 +1776,7 @@ function ReadyBody(props: {
       {toolDetail !== null && (
         <Modal
           open
-          onClose={() => setToolDetail(null)}
+          onClose={() => { toolDetailRequest.current += 1; setToolDetail(null) }}
           title={toolDetail.detail?.name ?? toolDetail.id}
           closeLabel={t('previewClose')}
         >
@@ -1800,7 +1840,7 @@ function ReadyBody(props: {
       {searchEdit !== null && (
         <Modal
           open
-          onClose={() => setSearchEdit(null)}
+          onClose={() => { searchEditRequest.current += 1; setSearchEdit(null) }}
           title={`${t('editSearchMetadata')} · ${searchEdit.id}`}
           closeLabel={t('previewClose')}
           className="mc-search-dialog"
@@ -1854,7 +1894,7 @@ function ReadyBody(props: {
       {catalogDocs !== null && (
         <Modal
           open
-          onClose={() => setCatalogDocs(null)}
+          onClose={() => { catalogDocsRequest.current += 1; setCatalogDocs(null) }}
           title={t('viewCatalog')}
           closeLabel={t('previewClose')}
         >
@@ -1955,6 +1995,9 @@ function SkillList(props: {
   const [tree, setTree] = useState<SkillTreeState>({ open: {}, dirs: {} })
   const [browseErrors, setBrowseErrors] = useState<Record<string, string>>({})
   const [preview, setPreview] = useState<{ id: string; relPath: string; content?: string; error?: string } | null>(null)
+  /** Token for the file-preview read: closing/switching advances it so a late
+   *  read cannot re-open a preview the operator already closed. */
+  const previewRequest = useRef(0)
 
   const toggleSkill = useCallback(async (id: string) => {
     if (openSkill === id) {
@@ -1995,15 +2038,20 @@ function SkillList(props: {
   }, [remote, t, tree.dirs, tree.open])
 
   const openPreview = useCallback(async (id: string, relPath: string) => {
+    const request = previewRequest.current + 1
+    previewRequest.current = request
     setPreview({ id, relPath })
     try {
       const content = unwrap(await remote.readSkillFile(id, relPath), 'capabilityPolicy.readSkillFile')
+      // Closed or switched file while in flight: drop the stale content.
+      if (previewRequest.current !== request) return
       if (content === undefined) {
         setPreview({ id, relPath, error: t('notPreviewable') })
       } else {
         setPreview({ id, relPath, content })
       }
     } catch (error) {
+      if (previewRequest.current !== request) return
       setPreview({ id, relPath, error: String(error) })
     }
   }, [remote, t])
@@ -2169,7 +2217,7 @@ function SkillList(props: {
       {preview !== null && (
         <Modal
           open
-          onClose={() => setPreview(null)}
+          onClose={() => { previewRequest.current += 1; setPreview(null) }}
           title={preview.relPath}
           closeLabel={t('previewClose')}
         >

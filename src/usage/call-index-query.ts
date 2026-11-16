@@ -3,9 +3,23 @@
  *
  * `SessionCallIndex` (session-index.ts) is the scanner: it owns enumeration,
  * live observation and freshness. This file is the read-model in front of it:
- * it captures ONE immutable projection per query snapshot, serves summary and
- * stable pagination from that frozen copy, and only re-reads `stamp()` (cheap)
- * on later pages. It never re-reads the whole snapshot mid-pagination.
+ * it captures ONE immutable projection per query view, filters it ONCE to the
+ * requested query, pre-sorts the call page order and reuses that frozen copy for
+ * summary and stable pagination. Later pages only re-read `stamp()` (cheap); the
+ * whole filtered set is never re-sorted per page.
+ *
+ * Cost model (TG-12): a narrow filter (one Session, one tool, `limit: 1`) must
+ * not pay the full-corpus byte budget. Raw snapshot rows are tested against the
+ * filter before they are projected, so the retained rows and the capacity check
+ * are proportional to the MATCHED set, not the whole corpus. An unfiltered read
+ * over an oversized corpus still answers `query-capacity` — the budget protects
+ * what a view retains, not what it scans.
+ *
+ * Detail reads (TG-12): omitting `snapshotId` reuses the most recently listed
+ * CALLS view instead of capturing a brand-new one. Previously each detail read
+ * created a fifth view, evicted the page the user was browsing and turned its
+ * cursor stale (the "V5" defect). Passing `snapshotId` remains the precise,
+ * filter-bound path and is still enforced.
  *
  * Trust model: a `snapshot()` row is Host data, not a wire object. Every field
  * is copied individually through an allowlist (never spread), so raw tool
@@ -118,6 +132,7 @@ interface ViewData {
   asOf?: number
   coverage: 'complete' | 'partial' | 'unknown'
   sessions: SessionMeta[]
+  /** Rows already filtered to the query and pre-sorted desc-by-start. */
   rows: Row[]
   totals: Summary
   semanticCoverage: SemanticCoverage
@@ -310,7 +325,45 @@ function aggregateRows(rows: readonly Row[], dayOffsetMinutes: number): Aggregat
   return aggregates
 }
 
-function projectSnapshot(raw: unknown): Projection {
+/**
+ * Cheap raw-field prefilter. Runs BEFORE `projectRow` so a narrow query never
+ * allocates a projected `Row` for a call it will not return. Every branch reads
+ * only the fields the filter cares about; a type that cannot possibly match is
+ * treated as "does not match" rather than projected and rejected. A row that
+ * DOES match is then fully validated by `projectRow` (invalid metadata on a
+ * matching row still fails the whole read, never silently dropped).
+ */
+function rawMatchesFilter(raw: unknown, filter: NormalizedQuery, cwdBySession: Map<string, string | undefined>): boolean {
+  if (!filter.includeInherited && read(raw, 'inherited') === true) return false
+  const sessionId = read(raw, 'sessionId')
+  if (filter.sessionId !== undefined && sessionId !== filter.sessionId) return false
+  if (filter.cwd !== undefined) {
+    if (!isStr(sessionId) || cwdBySession.get(sessionId) !== filter.cwd) return false
+  }
+  if (filter.toolName !== undefined) {
+    const toolName = read(raw, 'toolName')
+    if (!isStr(toolName) || !toolName.toLowerCase().includes(filter.toolName)) return false
+  }
+  if (filter.outcome !== undefined && read(raw, 'outcome') !== filter.outcome) return false
+  if (filter.sourceKind !== undefined && read(raw, 'sourceKind') !== filter.sourceKind) return false
+  if (filter.fromMs !== undefined) {
+    const startedAt = read(raw, 'startedAt')
+    if (!isNum(startedAt) || startedAt < filter.fromMs) return false
+  }
+  if (filter.toMs !== undefined) {
+    const startedAt = read(raw, 'startedAt')
+    if (!isNum(startedAt) || startedAt >= filter.toMs) return false
+  }
+  return true
+}
+
+/**
+ * Project ONE query view from a snapshot: validate the scope envelope, read the
+ * raw rows that match the filter, project only those, then sort the matched
+ * calls once. Sessions are filtered with the same predicate (and, for a
+ * call-level filter, restricted to Sessions that actually have a matching call).
+ */
+function projectSnapshot(raw: unknown, filter: NormalizedQuery): Projection {
   if (!isRecord(raw)) return { kind: 'invalid' }
   const scope = read(raw, 'scope')
   const status = read(scope, 'status')
@@ -323,28 +376,46 @@ function projectSnapshot(raw: unknown): Projection {
   const coverage = coverageRaw === 'complete' || coverageRaw === 'partial' || coverageRaw === 'unknown' ? coverageRaw : 'unknown'
   const sessionsRaw = read(raw, 'sessions')
   const rowsRaw = read(raw, 'rows')
-  const sessions: SessionMeta[] = []
   if (!Array.isArray(sessionsRaw) || !Array.isArray(rowsRaw)) return { kind: 'invalid' }
-  if (Array.isArray(sessionsRaw)) {
-    for (const entry of sessionsRaw) {
-      const meta = projectSession(entry)
-      if (!meta) return { kind: 'invalid' }
-      sessions.push(meta)
-    }
-  }
-  const rows: Row[] = []
-  if (Array.isArray(rowsRaw)) {
-    for (const entry of rowsRaw) {
-      const row = projectRow(entry)
-      if (!row) return { kind: 'invalid' }
-      rows.push(row)
-    }
-  }
+
+  // Session cwd map first: the `cwd` filter tests a call by its Session's cwd.
   const cwdBySession = new Map<string, string | undefined>()
-  for (const session of sessions) cwdBySession.set(session.sessionId, session.cwd)
+  for (const entry of sessionsRaw) {
+    const sessionId = read(entry, 'sessionId')
+    if (!isStr(sessionId)) continue
+    const cwd = read(entry, 'cwd')
+    cwdBySession.set(sessionId, isStr(cwd) ? cwd : undefined)
+  }
+
+  const callLevel = filter.toolName !== undefined || filter.outcome !== undefined
+    || filter.sourceKind !== undefined || filter.fromMs !== undefined || filter.toMs !== undefined
+  const rows: Row[] = []
+  const matchedSessions = new Set<string>()
+  for (const entry of rowsRaw) {
+    if (!rawMatchesFilter(entry, filter, cwdBySession)) continue
+    const row = projectRow(entry)
+    if (row === undefined) return { kind: 'invalid' }
+    rows.push(row)
+    matchedSessions.add(row.sessionId)
+  }
+
+  const sessions: SessionMeta[] = []
+  for (const entry of sessionsRaw) {
+    const sessionId = read(entry, 'sessionId')
+    const cwd = read(entry, 'cwd')
+    if (filter.sessionId !== undefined && sessionId !== filter.sessionId) continue
+    if (filter.cwd !== undefined && cwd !== filter.cwd) continue
+    if (callLevel && !(isStr(sessionId) && matchedSessions.has(sessionId))) continue
+    const meta = projectSession(entry)
+    if (meta === undefined) return { kind: 'invalid' }
+    sessions.push(meta)
+  }
+  sessions.sort((a, b) => (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0))
+
+  const ordered = sortRows(rows)
   const semantic = read(raw, 'semanticCoverage')
   const semanticCoverage: SemanticCoverage = { source: read(semantic, 'source') === 'verified' ? 'verified' : 'unknown', ptc: read(semantic, 'ptc') === 'verified' ? 'verified' : 'unknown', skillExecution: read(semantic, 'skillExecution') === 'verified' ? 'verified' : 'unavailable', denied: read(semantic, 'denied') === 'verified' ? 'verified' : 'unavailable' }
-  const data: ViewData = { snapshotId: randomUUID(), generation, coverage, sessions, rows, totals: summarize(rows), semanticCoverage, cwdBySession }
+  const data: ViewData = { snapshotId: randomUUID(), generation, coverage, sessions, rows: ordered, totals: summarize(ordered), semanticCoverage, cwdBySession }
   const asOf = read(raw, 'asOf')
   if (isNum(asOf)) data.asOf = asOf
   return { kind: 'ok', data }
@@ -401,7 +472,8 @@ function sortRows(rows: readonly Row[]): Row[] {
  * Immutable, bounded query views behind the `callIndex` namespace.
  *
  * One instance is owned by the Host runtime. Views are frozen captures of a
- * single `snapshot()`; cursors point at offsets inside one view.
+ * single `snapshot()` filtered to one query; cursors point at offsets inside
+ * one view.
  */
 export class CallIndexQueries {
   private readonly now: () => number
@@ -413,6 +485,8 @@ export class CallIndexQueries {
   private readonly cursors = new Map<string, Cursor>()
   private readonly cursorKeys = new Map<string, string>()
   private totalBytes = 0
+  /** Most recently served CALLS view; a detail read reuses it (TG-12 "V5"). */
+  private lastCallsViewId: string | undefined
 
   constructor(private readonly source: CallIndexQuerySource, options: CallIndexQueryOptions = {}) {
     this.now = options.now ?? Date.now
@@ -466,6 +540,7 @@ export class CallIndexQueries {
     this.cursors.clear()
     this.cursorKeys.clear()
     this.totalBytes = 0
+    this.lastCallsViewId = undefined
   }
 
   private estimateBytes(data: ViewData): number {
@@ -480,6 +555,7 @@ export class CallIndexQueries {
     if (view === undefined) return
     this.views.delete(id)
     this.totalBytes = Math.max(0, this.totalBytes - view.bytes)
+    if (this.lastCallsViewId === id) this.lastCallsViewId = undefined
     for (const [cursorId, cursor] of this.cursors) {
       if (cursor.viewId !== id) continue
       this.cursors.delete(cursorId)
@@ -501,7 +577,7 @@ export class CallIndexQueries {
   private capture(filter: NormalizedQuery): { kind: 'ok'; view: View } | { kind: 'error'; reason: CallIndexErrorReason } {
     let projection: Projection
     let before: string
-    try { before = this.source.stamp(); projection = projectSnapshot(this.source.snapshot()) }
+    try { before = this.source.stamp(); projection = projectSnapshot(this.source.snapshot(), filter) }
     catch { return { kind: 'error', reason: 'internal-error' } }
     if (projection.kind === 'scope-disabled') return { kind: 'error', reason: 'scope-disabled' }
     if (projection.kind === 'persistence-unavailable') return { kind: 'error', reason: 'persistence-unavailable' }
@@ -621,19 +697,6 @@ export class CallIndexQueries {
     return { ok: true, view, filter: view.filter, offset: 0 }
   }
 
-  private sessionsFor(view: View, filter: NormalizedQuery): SessionMeta[] {
-    const callLevel = filter.toolName !== undefined || filter.outcome !== undefined
-      || filter.sourceKind !== undefined || filter.fromMs !== undefined || filter.toMs !== undefined
-    const out: SessionMeta[] = []
-    for (const session of view.sessions) {
-      if (filter.sessionId !== undefined && session.sessionId !== filter.sessionId) continue
-      if (filter.cwd !== undefined && session.cwd !== filter.cwd) continue
-      if (callLevel && !view.rows.some(row => row.sessionId === session.sessionId && matches(row, filter, view))) continue
-      out.push(session)
-    }
-    return out
-  }
-
   /** Summarise the whole filtered set (not the current page). */
   getSummary(request?: unknown): CallIndexReply {
     const parsed = callIndexSummaryRequestSchema.safeParse(requestObject(request))
@@ -642,14 +705,13 @@ export class CallIndexQueries {
     if (resolved.kind === 'error') return callIndexError(resolved.reason)
     const view = resolved.view
     const filter = view.filter
-    const filtered = view.rows.filter(row => matches(row, filter, view))
     const dayOffsetMinutes = parsed.data.dayOffsetMinutes ?? 0
-    const aggregates = aggregateRows(filtered, dayOffsetMinutes)
+    const aggregates = aggregateRows(view.rows, dayOffsetMinutes)
     if (aggregates === undefined) return callIndexError('reply-too-large')
     const data: Record<string, unknown> = {
       ...this.meta(view, filter),
-      summary: summarize(filtered),
-      total: filtered.length,
+      summary: view.totals,
+      total: view.rows.length,
       hasUpdates: this.hasUpdates(view),
       aggregates,
     }
@@ -664,10 +726,10 @@ export class CallIndexQueries {
     const context = this.listContext(parsed.data, 'sessions')
     if (!context.ok) return context.reply
     const { view, filter, offset } = context
-    const ordered = this.sessionsFor(view, filter).sort((a, b) => (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0))
+    const ordered = view.sessions
     if (offset > ordered.length) return callIndexError('cursor-stale')
     const limit = parsed.data.limit ?? CALL_INDEX_DEFAULT_LIMIT
-    const summary = summarize(view.rows.filter(row => matches(row, filter, view)))
+    const summary = view.totals
     const placeholder = 'x'.repeat(36)
     const make = (count: number, nextCursor: string | undefined): CallIndexReply => {
       const data: Record<string, unknown> = {
@@ -695,43 +757,94 @@ export class CallIndexQueries {
     const context = this.listContext(parsed.data, 'calls')
     if (!context.ok) return context.reply
     const { view, filter, offset } = context
-    const filtered = sortRows(view.rows.filter(row => matches(row, filter, view)))
-    if (offset > filtered.length) return callIndexError('cursor-stale')
+    this.lastCallsViewId = view.snapshotId
+    // `view.rows` is already filtered AND sorted once at capture, so a page is a
+    // pure slice; the full filtered set is never re-sorted per page (TG-12).
+    const ordered = view.rows
+    if (offset > ordered.length) return callIndexError('cursor-stale')
     const limit = parsed.data.limit ?? CALL_INDEX_DEFAULT_LIMIT
-    const summary = summarize(filtered)
+    const summary = view.totals
     const placeholder = 'x'.repeat(36)
     const make = (count: number, nextCursor: string | undefined): CallIndexReply => {
       const data: Record<string, unknown> = {
         ...this.meta(view, filter),
         summary,
-        total: filtered.length,
-        items: filtered.slice(offset, offset + count),
+        total: ordered.length,
+        items: ordered.slice(offset, offset + count),
         hasUpdates: this.hasUpdates(view),
       }
       if (view.asOf !== undefined) data.asOf = view.asOf
       if (nextCursor !== undefined) data.nextCursor = nextCursor
       return { schemaVersion: 1, ok: true, kind: 'calls', data }
     }
-    const room = Math.min(limit, filtered.length - offset)
-    const count = this.fitCount(room, (n) => Buffer.byteLength(JSON.stringify(make(n, offset + n < filtered.length ? placeholder : undefined)), 'utf8'))
+    const room = Math.min(limit, ordered.length - offset)
+    const count = this.fitCount(room, (n) => Buffer.byteLength(JSON.stringify(make(n, offset + n < ordered.length ? placeholder : undefined)), 'utf8'))
     if (room > 0 && count === 0) return callIndexError('reply-too-large')
-    const nextCursor = offset + count < filtered.length ? this.newCursor(view, 'calls', filter, offset + count) : undefined
+    const nextCursor = offset + count < ordered.length ? this.newCursor(view, 'calls', filter, offset + count) : undefined
     return this.bounded(make(count, nextCursor))
   }
 
   /**
-   * Safely read one call's metadata. The row must be in the frozen view, then
-   * the Session must still be visible, then the authorization stamp must still
+   * Find a pooled view (same authorization stamp) containing one call, so a
+   * detail read can reuse an existing snapshot instead of capturing a new one.
+   * Prefers the most recent CALLS view, then the newest other view.
+   */
+  private findDetailView(sessionId: string, callSeq: number): { view: View; row: Row } | undefined {
+    this.evictExpired()
+    let stamp: string
+    try {
+      stamp = this.source.stamp()
+    } catch {
+      return undefined
+    }
+    const ordered: View[] = []
+    const last = this.lastCallsViewId === undefined ? undefined : this.views.get(this.lastCallsViewId)
+    if (last !== undefined) ordered.push(last)
+    for (const view of this.views.values()) if (view !== last) ordered.push(view)
+    for (const view of ordered) {
+      if (view.stamp !== stamp) continue
+      const row = view.rows.find(item => item.sessionId === sessionId && item.callSeq === callSeq && matches(item, view.filter, view))
+      if (row !== undefined) return { view, row }
+    }
+    return undefined
+  }
+
+  /**
+   * Safely read one call's metadata. The row must be in a frozen view, then the
+   * Session must still be visible, then the authorization stamp must still
    * match — a detail read never trusts a browser-supplied id by itself.
+   *
+   * With `snapshotId` the read is bound to that exact view's filter (the precise
+   * path). Without it, the most recent CALLS view is reused so opening a detail
+   * does not churn the view pool (TG-12 "V5"); only if no pooled view holds the
+   * row is a fresh view captured.
    */
   async getCallDetail(request: unknown): Promise<CallIndexReply> {
     const parsed = callIndexDetailRequestSchema.safeParse(requestObject(request))
     if (!parsed.success) return callIndexError('invalid-request')
-    const resolved = this.resolveView(parsed.data.snapshotId)
-    if (resolved.kind === 'error') return callIndexError(resolved.reason)
-    const view = resolved.view
-    const row = view.rows.find(item => item.sessionId === parsed.data.sessionId && item.callSeq === parsed.data.callSeq && matches(item, view.filter, view))
-    if (row === undefined) return callIndexError('not-visible')
+    let view: View
+    let row: Row | undefined
+    if (parsed.data.snapshotId !== undefined) {
+      const resolved = this.resolveView(parsed.data.snapshotId)
+      if (resolved.kind === 'error') return callIndexError(resolved.reason)
+      view = resolved.view
+      row = view.rows.find(item => item.sessionId === parsed.data.sessionId && item.callSeq === parsed.data.callSeq && matches(item, view.filter, view))
+      if (row === undefined) return callIndexError('not-visible')
+    } else {
+      const found = this.findDetailView(parsed.data.sessionId, parsed.data.callSeq)
+      if (found !== undefined) {
+        view = found.view
+        row = found.row
+      } else {
+        // No pooled view holds it: capture a NARROW view for just this Session so
+        // a single detail read never pays the whole-corpus byte budget.
+        const captured = this.capture({ includeInherited: true, sessionId: parsed.data.sessionId })
+        if (captured.kind === 'error') return callIndexError(captured.reason)
+        view = captured.view
+        row = view.rows.find(item => item.sessionId === parsed.data.sessionId && item.callSeq === parsed.data.callSeq && matches(item, view.filter, view))
+        if (row === undefined) return callIndexError('not-visible')
+      }
+    }
     let visible = false
     try {
       visible = await this.source.isSessionVisible(parsed.data.sessionId)

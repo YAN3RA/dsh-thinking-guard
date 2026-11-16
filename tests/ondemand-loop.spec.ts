@@ -167,6 +167,59 @@ describe('On-demand loop: search, detail and invoke stay reachable', () => {
       .toContain('mcp__km__search')
   })
 
+  /**
+   * TG-01 guard on the healthy path: multi-agent churn must not cost the
+   * On-demand loop, and the deferred reapply must stay bounded.
+   *
+   * Each agent installs exactly one own restriction, so the number of
+   * `tools/change` events observed while three agents are announced equals the
+   * number of agents: a recursive re-apply would show up here as a storm long
+   * before it became a hang. All three agents keep a working forward
+   * afterwards, which is what stops the fix from degenerating into
+   * "fail closed after any re-entry".
+   */
+  it('keeps the loop working for every agent across cross-agent reentry, with a bounded change count', async () => {
+    const fs = await import('node:fs/promises')
+    const home = await fs.mkdtemp(join(tmpdir(), 'dsh-ondemand-multi-'))
+    const ctx = await setup(home)
+    register(ctx, 'hidden_tool', 'An On-demand tool hidden behind meta_search')
+    register(ctx, 'visible_tool', 'A Resident tool')
+    await ctx.capability.refresh()
+
+    let changes = 0
+    ctx.on('tools/change', () => { changes += 1 })
+
+    const agents = [
+      await announceAgent(ctx, 'multi-a'),
+      await announceAgent(ctx, 'multi-b'),
+      await announceAgent(ctx, 'multi-c'),
+    ]
+    expect(changes).toBe(agents.length)
+
+    for (const [index, agent] of agents.entries()) {
+      // Still hidden from the model surface…
+      expect(ctx.tools.schemas(agent as never).map(s => s.name)).not.toContain('hidden_tool')
+      // …and still discoverable through the catalog loop. (The forward itself
+      // is covered by tests/tg01-admission.spec.ts, which mounts meta_invoke.)
+      const listed = await runOneToolCall(ctx, {
+        callId: `multi-search-${index}`,
+        name: 'meta_search',
+        arguments: { query: 'hidden', kind: 'tool' },
+        agent,
+        signal: testSignal,
+      })
+      expect(listed.isError).toBe(false)
+      expect((listed.value as { results: Array<{ id: string }> }).results.map(row => row.id))
+        .toContain('hidden_tool')
+    }
+
+    // A tier move still reaches every live agent and lifts cleanly.
+    await ctx.capabilityPolicy.updateConfig({ tools: { resident: ['hidden_tool'] } })
+    for (const agent of agents) {
+      expect(ctx.tools.schemas(agent as never).map(s => s.name)).toContain('hidden_tool')
+    }
+  })
+
   it('filters On-demand skills out of the catalog message but keeps them readable', async () => {
     const fs = await import('node:fs/promises')
     const { join: joinPath } = await import('node:path')

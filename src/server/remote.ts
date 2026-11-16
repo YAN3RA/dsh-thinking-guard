@@ -14,7 +14,9 @@ import type {
   CapabilityClassification,
   CapabilityPolicyService,
   Config as CapabilityPolicyConfig,
+  GuardDiagnostics,
   GuardSwitches,
+  MoveCapabilitiesRequest,
 } from '../policy.ts'
 import type { GuardStatsSnapshot } from '../guard-core.ts'
 import type { CapabilityDetail, SkillDirEntry, CapabilityService, CapabilityDiagnostics, SearchMetadata, SearchMetadataUpdate } from '../registry.ts'
@@ -108,6 +110,19 @@ export class CapabilityPolicyGateway extends TypertRemoteService {
   @Remote('updateGuard')
   async updateGuard(change: Partial<GuardSwitches>): Promise<void> {
     await this.ctx.capabilityPolicy.updateGuard(change)
+  }
+
+  /**
+   * Whether the Guard is actually in effect, plus fixed-code failure reasons.
+   *
+   * Deliberately separate from {@link getGuardStats}: the counters keep their
+   * seven numeric fields and privacy contract, while this answers "is it running
+   * and did the last write land" with a closed allowlist of codes — no exception
+   * text, no paths, nothing derived from tool arguments or results.
+   */
+  @Remote('getGuardDiagnostics')
+  getGuardDiagnostics(): GuardDiagnostics {
+    return this.ctx.capabilityPolicy.getGuardDiagnostics()
   }
 
   /**
@@ -339,6 +354,12 @@ export class CapabilityPolicyGateway extends TypertRemoteService {
   @Remote('catalogVersion')
   catalogVersion(): number {
     return this.ctx.capability.version()
+  }
+
+  /** TG-05: apply an intent-level tier move to the latest live state. */
+  @Remote('moveCapabilities')
+  async moveCapabilities(request: MoveCapabilitiesRequest): Promise<void> {
+    await this.ctx.capabilityPolicy.moveCapabilities(request)
   }
 }
 

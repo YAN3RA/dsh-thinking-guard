@@ -57,6 +57,8 @@ import {
   type CallIndexTaskView,
   type CallIndexViewError,
 } from './call-index-adapter.ts'
+// Re-exported for sibling client modules (PluginSection) that consume the panel.
+export type { CallIndexCallPageView } from './call-index-adapter.ts'
 import {
   CALL_INDEX_OUTCOMES,
   type CallIndexErrorReason,
@@ -474,6 +476,13 @@ export const CALL_INDEX_EMPTY_SESSION_MENU: CallIndexSessionMenu = Object.freeze
   onKey: () => {},
 })
 
+/** Stable ids so the trigger can name its listbox and active option. */
+export const CALL_INDEX_SESSION_LIST_ID = 'mc-ci-session-list'
+/** Option id for one row; also the value of aria-activedescendant while active. */
+export function callIndexSessionOptionId(index: number): string {
+  return CALL_INDEX_SESSION_LIST_ID + '-opt-' + String(index)
+}
+
 export interface CallIndexSessionMenuKeyResult {
   readonly action: 'close' | 'open' | 'move' | 'select' | 'none'
   readonly highlight: number
@@ -511,6 +520,10 @@ export function callIndexSessionMenuKey(
     case ' ':
       if (state.open && count > 0) return { action: 'select', highlight: wrap(state.highlight) }
       return { action: state.open ? 'none' : 'open', highlight: wrap(state.highlight) }
+    case 'Tab':
+      // Tab never traps focus: it closes an open list but lets focus advance to
+      // the next control (the caller must NOT preventDefault for Tab).
+      return { action: state.open ? 'close' : 'none', highlight: state.highlight }
     default:
       return { action: 'none', highlight: state.highlight }
   }
@@ -1205,8 +1218,7 @@ export function callIndexDetailState(input: CallIndexDetailStateInput): CallInde
     if (loading) return { kind: 'initial', title: '正在读取调用明细…', detail: '首次读取尚未返回。', keepsRows: false, canRetry: false }
     return { kind: 'initial', title: '尚未读取调用明细', detail: '点击刷新以读取调用索引。', keepsRows: false, canRetry: true }
   }
-  const scanning = status !== undefined
-    && (status.phase === 'running' || status.sessions.pending > 0 || status.sessions.pendingLive > 0)
+  const scanning = callIndexScanActive(status)
   // A running scan beats "empty": while the scan is still walking the corpus,
   // zero rows is an unfinished observation, not a coverage finding. Reporting
   // 「覆盖不完整」here hides the very counters (扫描状态 / 扫描提示 / 事件读取)
@@ -1922,11 +1934,15 @@ export interface CallIndexScanProgress {
 export function callIndexScanProgress(status: CallIndexStatusView | undefined): CallIndexScanProgress {
   if (status === undefined) return { detail: '尚未收到索引状态。', running: false }
   const sessions = status.sessions
-  const running = status.phase === 'running'
+  const running = callIndexScanActive(status)
   // An older Host may omit the census entirely; a missing counter is not a
   // reason to crash the page (this is a diagnostic, it runs on the failure path).
   if (sessions === undefined) return { detail: running ? '正在扫描…' : '没有可索引的会话。', running }
-  const total = sessions.completed + sessions.pending
+  // `completed` counts coverage-complete Sessions only, so an under-reported but
+  // fully read corpus looked like "nothing to index". Exhausted Sessions are a
+  // read fact and belong in the denominator.
+  const exhausted = sessions.exhausted ?? 0
+  const total = sessions.completed + sessions.pending + Math.max(0, exhausted - sessions.completed)
   if (total <= 0) {
     return {
       detail: running ? '正在枚举会话…' : '没有可索引的会话。',
@@ -1934,11 +1950,29 @@ export function callIndexScanProgress(status: CallIndexStatusView | undefined): 
     }
   }
   const percent = Math.max(0, Math.min(100, Math.round((sessions.completed / total) * 100)))
+  // What THIS pass has really done. The cumulative counters say nothing about
+  // "is it moving right now", and "0 rows published" was exactly the state that
+  // looked like a dead scan while the disk was being read (TG-08).
+  const pass = status.passReadEvents === undefined
+    ? ''
+    : `，本轮已读 ${formatCallIndexCount(status.passReadEvents)} 个事件 / ${status.passReadSessions ?? 0} 个会话`
+  // Two DIFFERENT terminal stories must never read the same:
+  // - read finished, coverage partial  → a diagnosis about the data (under-report);
+  // - read unfinished and paused       → work is owed and stopped on capacity.
+  const readDone = status.exhaustedSessions !== undefined && status.exhaustedSessions >= total
+  const pausedNow = status.paused === true || status.reasons.includes('scan-paused-capacity')
+  const tail = pausedNow
+    ? '；因容量上限暂停，可恢复（已读进度保留）'
+    : readDone && status.coverage !== 'complete'
+      ? '；读取已完成，覆盖部分（后端少报事件数，属诊断信息）'
+      : ''
   return {
     percent,
     running,
     detail: `已完成 ${sessions.completed} / ${total} 个会话`
-      + (sessions.failed > 0 ? `，失败 ${sessions.failed} 个` : ''),
+      + (sessions.failed > 0 ? `，失败 ${sessions.failed} 个` : '')
+      + pass
+      + tail,
   }
 }
 
@@ -2002,35 +2036,49 @@ function CallIndexSessionSelectView(props: {
       type: 'button',
       className: 'v3-dd-btn',
       'data-call-index-session-select': 'true',
+      role: 'combobox',
       'aria-haspopup': 'listbox',
       'aria-expanded': menu.open,
+      'aria-controls': CALL_INDEX_SESSION_LIST_ID,
       'aria-label': '选择会话',
+      // Focus stays on the trigger; aria-activedescendant names the active option.
+      ...(menu.open ? { 'aria-activedescendant': callIndexSessionOptionId(menu.highlight) } : {}),
       disabled,
       onClick: () => { if (!disabled) menu.onToggle() },
       onKeyDown: (event: { key: string; preventDefault?: () => void }) => {
         if (disabled) return
         const result = callIndexSessionMenuKey(event.key, { open: menu.open, highlight: menu.highlight, count: items.length })
         if (result.action === 'none') return
-        if (typeof event.preventDefault === 'function') event.preventDefault()
+        // Tab must advance focus normally: only close the list, never swallow it.
+        if (event.key !== 'Tab' && typeof event.preventDefault === 'function') event.preventDefault()
         menu.onKey(event.key)
       },
     },
       createElement('span', { className: 'v3-dd-nm' }, triggerLabel),
       createElement('svg', { className: 'v3-dd-chev', viewBox: '0 0 10 6', 'aria-hidden': 'true' },
         createElement('path', {
-          d: 'M1 1l4 4 4-4', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.4,
-          'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+          d: 'M1 1l4 4 4-4', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4,
+          strokeLinecap: 'round', strokeLinejoin: 'round',
         })),
     ),
     menu.open
-      ? createElement('ul', { className: 'v3-dd-list', role: 'listbox', 'aria-label': '会话列表' },
+      ? createElement('ul', { className: 'v3-dd-list', role: 'listbox', id: CALL_INDEX_SESSION_LIST_ID, 'aria-label': '会话列表' },
           ...items.map((item, index) => createElement('li', {
             key: item.id,
+            id: callIndexSessionOptionId(index),
             className: 'v3-dd-item',
             role: 'option',
             'aria-selected': item.id === query.sessionId,
             'data-hl': index === menu.highlight,
+            'data-active': index === menu.highlight,
             'data-sel': item.id === query.sessionId,
+            // Follow keyboard movement with the scroll box (End / arrows), so
+            // the active row never stays out of view in a long Session list.
+            ref: (node: { scrollIntoView?: (options: { block: 'nearest' }) => void } | null) => {
+              if (node !== null && index === menu.highlight && typeof node.scrollIntoView === 'function') {
+                node.scrollIntoView({ block: 'nearest' })
+              }
+            },
             onMouseEnter: () => menu.onHighlight(index),
             onClick: () => { if (!disabled) menu.onSelect(index) },
           }, item.name)))
@@ -2089,7 +2137,11 @@ function CallIndexFilters(props: {
   // The hint is redundant while the session picker is on screen: the trigger
   // already names the selected session. Keep it (on its own line) for the other
   // scopes, where nothing else states what the numbers are bound to.
-  const hintText = sessionPicker === null ? scopeHint(query, catalog) : undefined
+  // When 按会话 is active but nothing is bound yet, still state the fallback —
+  // the picker must not hide the 「未绑定会话，实际按全部」 explanation.
+  const hintText = query.scope === 'session' && query.sessionId === undefined
+    ? scopeHint(query, catalog)
+    : sessionPicker === null ? scopeHint(query, catalog) : undefined
   return createElement('div', { className: 'mc-ci-filter', role: 'group', 'aria-label': '调用明细筛选' },
     createElement('div', { className: 'v3-filter-row' },
       createElement('div', { className: 'mc-tab-group', role: 'group', 'aria-label': '统计范围' }, scopes),
@@ -2342,8 +2394,7 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
   const totalText = page === undefined
     ? undefined
     : formatCallIndexCount(page.total ?? page.summary.total, page.totalExact)
-  const scanning = status !== undefined
-    && (status.phase === 'running' || (status.sessions?.pending ?? 0) > 0 || (status.sessions?.pendingLive ?? 0) > 0)
+  const scanning = callIndexScanActive(status)
   // One plain sentence: the snapshot generation and the aggregation wording
   // were internal and are gone. While a scan runs the numbers keep growing.
   const statusText = page === undefined
@@ -2398,8 +2449,8 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
 
   const searchInput = createElement('label', { className: 'v3-search' },
     createElement('svg', { width: 12, height: 12, viewBox: '0 0 14 14', fill: 'none', 'aria-hidden': 'true', style: { color: 'var(--v3-t4)', flex: 'none' } },
-      createElement('circle', { cx: 6.2, cy: 6.2, r: 4.4, stroke: 'currentColor', 'stroke-width': 1.3 }),
-      createElement('path', { d: 'm9.6 9.6 3 3', stroke: 'currentColor', 'stroke-width': 1.3, 'stroke-linecap': 'round' }),
+      createElement('circle', { cx: 6.2, cy: 6.2, r: 4.4, stroke: 'currentColor', strokeWidth: 1.3 }),
+      createElement('path', { d: 'm9.6 9.6 3 3', stroke: 'currentColor', strokeWidth: 1.3, strokeLinecap: 'round' }),
     ),
     createElement('input', onSearchChange === undefined
       ? { type: 'search', placeholder: '筛选工具名…', 'aria-label': '筛选工具名', defaultValue: search ?? '', 'data-call-index-search': 'true' }
@@ -2478,7 +2529,15 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
       }),
       V3Stat({ label: '失败率', value: rateText(failureStats?.rate), hint: rateHint(failureStats) }),
       V3Stat({ label: '需要关注', value: suggestionCount === undefined ? '—' : String(suggestionCount), hint: suggestionHint() }),
-      V3Stat({ label: '平均耗时', value: formatCallIndexDuration(averageDuration), hint: '按有耗时的调用平均' }),
+      V3Stat({
+        label: '平均耗时',
+        value: formatCallIndexDuration(averageDuration),
+        // Name the sample: this is a mean over READ calls that reported a
+        // duration, never a claim about the whole range when only part was read.
+        hint: durations.length === 0
+          ? '没有带耗时的已读调用'
+          : `按 ${durations.length} 次有耗时的已读调用平均${readIsPartial ? '（仅本页已读取部分，非全量）' : ''}`,
+      }),
     ),
     page !== undefined && page.droppedItems > 0
       ? createElement('p', { className: 'v3-hint', 'data-call-index-note': 'dropped', style: { marginTop: 8 } },
@@ -2595,8 +2654,7 @@ export function CallIndexOverviewPanelView(props: CallIndexOverviewPanelViewProp
       : callIndexFailureText(failure)
 
   const coverageLabel = status === undefined ? '未知' : COVERAGE_LABELS[status.coverage]
-  const scanning = status !== undefined
-    && (status.phase === 'running' || (status.sessions?.pending ?? 0) > 0 || (status.sessions?.pendingLive ?? 0) > 0)
+  const scanning = callIndexScanActive(status)
   const pendingSessions = status?.sessions?.pending ?? 0
   const scanPhrase = status !== undefined && status.phase === 'running'
     ? '仍在扫描'
@@ -2623,7 +2681,12 @@ export function CallIndexOverviewPanelView(props: CallIndexOverviewPanelViewProp
   const trendMode = callIndexTrendMode(trendSpan)
   const trend = callIndexTrendSeries(trendBuckets, trendMode)
   const callSpark = aggregates?.byDay === undefined ? undefined : aggregates.byDay.map(bucket => bucket.calls)
-  const successSpark = aggregates?.byDay === undefined ? undefined : aggregates.byDay.map(bucket => bucket.calls > 0 ? bucket.success / bucket.calls : 0)
+  // Same known-outcome denominator as the headline metric: a day with
+  // unresolved/running calls must not water down its success rate. Reuse the
+  // one rate helper so the sparkline and the headline can never disagree.
+  const successSpark = aggregates?.byDay === undefined
+    ? undefined
+    : aggregates.byDay.map(bucket => callIndexRates(bucket)?.success?.rate ?? 0)
   const errorSpark = aggregates?.byDay === undefined ? undefined : aggregates.byDay.map(bucket => bucket.error)
 
   // Per-tool panels (from the listCalls read the container supplies).
@@ -2892,6 +2955,24 @@ export function mergeRefreshedPage(
   }
 }
 
+/**
+ * How many appended pages survive a refresh.
+ *
+ * A refresh that returns a DIFFERENT snapshot id is a new data generation: the
+ * rows the operator appended belong to the old one, so the counter must reset to
+ * 0 or auto-fill stays permanently blocked at MAX_AUTO_PAGES (the TG-11
+ * 「读满 1050 行 → 自动刷新塌回首页且不再补页」 defect). A same-snapshot refresh
+ * keeps the depth; a first read (no previous id) starts from zero.
+ */
+export function callIndexAppendedAfterRefresh(
+  previousSnapshotId: string | undefined,
+  freshSnapshotId: string,
+  appendedPages: number,
+): number {
+  if (previousSnapshotId !== undefined && previousSnapshotId !== freshSnapshotId) return 0
+  return appendedPages
+}
+
 export function detailAfterRefresh(
   previous: { readonly detailTarget?: { readonly sessionId: string; readonly callSeq: number } },
   page: CallIndexCallPageView | undefined,
@@ -2919,10 +3000,41 @@ export interface CallIndexRefreshPolicy {
   readonly mode: 'status-only' | 'full'
 }
 
+/**
+ * Is a scan ACTUALLY working right now?
+ *
+ * The old definition was `phase === 'running' || pending > 0`, i.e. it treated
+ * the BACKLOG as activity. A finished pass that left Sessions unread therefore
+ * reported 「扫描中」 forever, the page only ever refreshed status, and no full
+ * read happened again — TG-09's "pending>0 就永远 status-only".
+ *
+ * Three things count as active, and a backlog alone does not:
+ * - the index phase is `running` (a pass is executing);
+ * - the automatic scheduler has another pass queued (`auto.state === 'scheduled'`
+ *   or `'running'`) — this is the between-passes gap that used to look terminal,
+ *   which made the client stop polling and miss the next round entirely;
+ * - a live queue is waiting on the debounce timer.
+ */
+export function callIndexScanActive(status: CallIndexStatusView | undefined): boolean {
+  if (status === undefined) return false
+  // Without a readable scope there is no corpus to scan: never paint activity.
+  if (status.scope.status !== 'ready') return false
+  // A capacity pause is terminal-and-explainable, not work in progress.
+  if (status.paused === true) return false
+  if (status.phase === 'running') return true
+  // When the Host reports a scheduler, its state is the whole answer: a live
+  // backlog on a stopped scheduler is owed work, not activity.
+  if (status.auto !== undefined) return status.auto.state === 'scheduled' || status.auto.state === 'running'
+  // No scheduler evidence (older Host): there is still no proof of work. A live
+  // queue can persist while a paused/stopped scheduler owes work, so `pendingLive`
+  // alone is NOT evidence of a running scan — that inference is exactly what made
+  // the page poll forever. Only `phase: 'running'` above can claim activity.
+  return false
+}
+
 /** Pure policy decision, so the container's refresh strategy is testable. */
 export function callIndexRefreshPolicy(status: CallIndexStatusView | undefined): CallIndexRefreshPolicy {
-  const scanning = status !== undefined
-    && (status.phase === 'running' || status.sessions.pending > 0 || status.sessions.pendingLive > 0)
+  const scanning = callIndexScanActive(status)
   return { scanning, mode: scanning ? 'status-only' : 'full' }
 }
 
@@ -2965,6 +3077,10 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
     cursorStaleRetried.current = false
     pagingStopped.current = false
   }
+  /** Snapshot id the on-screen page belongs to; a different one is a new generation. */
+  const lastSnapshotId = useRef<string | undefined>(undefined)
+  /** Query the on-screen page was loaded for; detects a cross-query switch. */
+  const loadedQueryKey = useRef(queryKey)
   const narrow = useNarrowViewport()
   // Read the Host Session catalog on every render: names must not go stale, and
   // this is a synchronous snapshot, not a subscription. Guarded so a missing
@@ -3024,13 +3140,22 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
     pageAnchor.current = anchor
     // A full first-page read is a clean paging start: let auto-fill run again.
     pagingStopped.current = false
+    // A different query is a different row set. Drop the previous query's page
+    // at once so a failed read for B can never leave A's numbers on screen —
+    // that was the cross-session 「旧数据冒用」 bug. Same-query refreshes keep it.
+    const isNewQuery = loadedQueryKey.current !== queryKey
+    loadedQueryKey.current = queryKey
     // NOTE: do NOT reset `appendedPages` here. This effect also runs for the
     // 2s background refresh (it depends on `refreshToken`), so resetting here
     // cleared the counter on every tick — the merge then always saw 0 and
-    // collapsed the table back to page one. That was the second half of
-    // 「点加载更多后自动缩回」. The counter is reset only when the QUERY
-    // changes, which is the one event that genuinely invalidates paging.
-    setState(previous => ({ ...previous, loading: true, moreFailure: undefined }))
+    // collapsed the table back to page one. The counter is reset only when the
+    // QUERY changes, or when a refresh returns a genuinely new snapshot below.
+    setState(previous => ({
+      ...previous,
+      loading: true,
+      moreFailure: undefined,
+      ...(isNewQuery ? { page: undefined, sessions: undefined, failure: undefined } : {}),
+    }))
     void (async () => {
       const [statusResult, pageResult, sessionsResult] = await Promise.all([
         api.getStatus(),
@@ -3038,6 +3163,20 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
         api.listSessions(query),
       ])
       if (!active || generation.current !== requestGeneration) return
+      if (pageResult.ok) {
+        const previousSnapshot = lastSnapshotId.current
+        const nextAppended = callIndexAppendedAfterRefresh(previousSnapshot, pageResult.value.snapshotId, appendedPages.current)
+        if (nextAppended !== appendedPages.current) {
+          // A genuinely new snapshot (not just a same-generation refresh) makes
+          // the appended rows stale. Reset the paging counter so the auto-fill
+          // rebuilds to the previous depth instead of sitting at page one behind
+          // a stuck count — the TG-11 「满页→自动刷新→塌回首页」 case.
+          cursorStaleRetried.current = false
+          pagingStopped.current = false
+        }
+        appendedPages.current = nextAppended
+        lastSnapshotId.current = pageResult.value.snapshotId
+      }
       setState(previous => {
         const failures: CallIndexPanelFailure[] = []
         if (!pageResult.ok) failures.push(pageResult)
@@ -3173,11 +3312,17 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
    */
   useEffect(() => {
     if (pagingStopped.current) return
+    // A refused FIRST-page read is not permission to keep walking the cursor the
+    // previously displayed page still carries. When a refresh fails, the rows on
+    // screen belong to the previous generation; continuing to page them would
+    // append more of the old snapshot under a failure notice (and, on a stale
+    // cursor, trigger yet another refresh). Stop filling until a read succeeds.
+    if (state.failure !== undefined) return
     if (state.page?.nextCursor === undefined || state.loadingMore || state.loading) return
     if (appendedPages.current >= MAX_AUTO_PAGES) return
     if (state.moreFailure !== undefined) return
     loadMore()
-  }, [state.page?.nextCursor, state.loadingMore, state.loading, state.moreFailure, loadMore])
+  }, [state.failure, state.page?.nextCursor, state.loadingMore, state.loading, state.moreFailure, loadMore])
 
   const select = useCallback((row: CallIndexCallRow) => {
     setState(previous => ({

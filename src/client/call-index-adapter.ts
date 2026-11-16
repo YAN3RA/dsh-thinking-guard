@@ -189,6 +189,20 @@ export interface CallIndexFeatures {
   readonly denied?: boolean
 }
 
+/**
+ * Where the automatic scheduler is, independent of the scan phase.
+ *
+ * `scheduled` is the value that matters: it means "another pass is queued but
+ * has not started". Without it a poll taken between passes looks terminal and
+ * the client stops polling, missing the next round entirely.
+ */
+export const CALL_INDEX_AUTO_STATES = ['idle', 'scheduled', 'running', 'stopped'] as const
+export type CallIndexAutoStateName = (typeof CALL_INDEX_AUTO_STATES)[number]
+export interface CallIndexAutoState {
+  readonly state: CallIndexAutoStateName
+  readonly round: number
+}
+
 /** One explicit index run. */
 export interface CallIndexTaskView {
   readonly taskId: string
@@ -231,6 +245,13 @@ export interface CallIndexSessionCensus {
   readonly pending: number
   readonly failed: number
   readonly pendingLive: number
+  /**
+   * Sessions read through EOF, independent of coverage.
+   *
+   * Optional: an older Host does not send it, and the page must then fall back to
+   * the coverage-based counters rather than inventing a read-complete claim.
+   */
+  readonly exhausted?: number
 }
 
 /** Status of the index itself (`getIndexStatus`). */
@@ -250,6 +271,31 @@ export interface CallIndexStatusView {
   readonly declaredEvents?: number
   /** Aggregate scan diagnostic: events actually read (absent on old Hosts). */
   readonly readEvents?: number
+  /** Events read by the CURRENT/last pass (absent on old Hosts). */
+  readonly passReadEvents?: number
+  /** Sessions touched by the CURRENT/last pass. */
+  readonly passReadSessions?: number
+  /** Pages read by the CURRENT/last pass. */
+  readonly passPages?: number
+  /** Highest verified cut the CURRENT/last pass reached, in events. */
+  readonly passCut?: number
+  /** Monotone forward-scanned events; the scheduler's real progress signal. */
+  readonly scannedEvents?: number
+  /** The last pass stopped on a capacity reservation and can resume. */
+  readonly paused?: boolean
+  /**
+   * Sessions read through EOF, independent of coverage gaps.
+   *
+   * Distinct from `sessions.completed`: a log can be fully read AND still
+   * `partial` because the backend under-reported its event count. The page must
+   * be able to say "read complete, coverage partial (diagnosis)" instead of
+   * "not finished".
+   */
+  readonly exhaustedSessions?: number
+  /** Verified forward progress of the last pass, within a stable revision. */
+  readonly progressEvents?: number
+  /** Real automatic-scheduler state (whether another pass is queued). */
+  readonly auto?: CallIndexAutoState
   readonly totals: CallIndexTotals
   readonly corpus?: CallIndexCorpus
   readonly asOf?: number
@@ -390,6 +436,7 @@ const REASON_SET: ReadonlySet<string> = new Set<string>(CALL_INDEX_ERROR_REASONS
 const OUTCOME_SET: ReadonlySet<string> = new Set<string>(CALL_INDEX_OUTCOMES)
 const SOURCE_KIND_SET: ReadonlySet<string> = new Set<string>(CALL_INDEX_SOURCE_KINDS)
 const STATUS_PHASE_SET: ReadonlySet<string> = new Set<string>(CALL_INDEX_STATUS_PHASES)
+const AUTO_STATE_SET: ReadonlySet<string> = new Set<string>(CALL_INDEX_AUTO_STATES)
 const TASK_PHASE_SET: ReadonlySet<string> = new Set<string>(CALL_INDEX_TASK_PHASES)
 
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/
@@ -570,6 +617,14 @@ function projectTask(value: unknown): CallIndexTaskView | undefined {
   return { taskId, mode, phase, startedAt, cancelRequested, ...(finishedAt === undefined ? {} : { finishedAt }) }
 }
 
+function projectAuto(value: unknown): CallIndexAutoState | undefined {
+  if (!isRecord(value)) return undefined
+  const state = readEnum<CallIndexAutoStateName>(value.state, AUTO_STATE_SET)
+  const round = readCount(value.round)
+  if (state === undefined || round === undefined) return undefined
+  return { state, round }
+}
+
 function projectFeatures(value: unknown): CallIndexFeatures | undefined {
   if (!isRecord(value)) return undefined
   const history = readBool(value.history)
@@ -641,6 +696,7 @@ function projectStatus(data: Record<string, unknown>): CallIndexResult<CallIndex
   const asOf = readFinite(data.asOf)
   const corpus = projectCorpus(data.corpus)
   const task = projectTask(data.task)
+  const auto = projectAuto(data.auto)
   const features = projectFeatures(data.features)
   return success({
     scope,
@@ -651,11 +707,25 @@ function projectStatus(data: Record<string, unknown>): CallIndexResult<CallIndex
     eventCoverage,
     enumerationCoverage,
     semanticCoverage,
-    sessions: { listed, visible, completed, pending, failed, pendingLive },
+    sessions: {
+      listed, visible, completed, pending, failed, pendingLive,
+      ...(readCount(data.exhaustedSessions) === undefined ? {} : { exhausted: readCount(data.exhaustedSessions)! }),
+    },
     estimatedBytes,
     reasons: readReasons(data.reasons),
     ...(typeof data.declaredEvents === 'number' ? { declaredEvents: data.declaredEvents } : {}),
     ...(typeof data.readEvents === 'number' ? { readEvents: data.readEvents } : {}),
+    // Per-pass progress is optional on purpose: an older Host omits it and the
+    // page falls back to the cumulative counters instead of inventing zeros.
+    ...(readCount(data.passReadEvents) === undefined ? {} : { passReadEvents: readCount(data.passReadEvents)! }),
+    ...(readCount(data.passReadSessions) === undefined ? {} : { passReadSessions: readCount(data.passReadSessions)! }),
+    ...(readCount(data.passPages) === undefined ? {} : { passPages: readCount(data.passPages)! }),
+    ...(readCount(data.passCut) === undefined ? {} : { passCut: readCount(data.passCut)! }),
+    ...(readCount(data.scannedEvents) === undefined ? {} : { scannedEvents: readCount(data.scannedEvents)! }),
+    ...(readBool(data.paused) === undefined ? {} : { paused: readBool(data.paused)! }),
+    ...(readCount(data.exhaustedSessions) === undefined ? {} : { exhaustedSessions: readCount(data.exhaustedSessions)! }),
+    ...(readCount(data.progressEvents) === undefined ? {} : { progressEvents: readCount(data.progressEvents)! }),
+    ...(auto === undefined ? {} : { auto }),
     totals,
     ...(corpus === undefined ? {} : { corpus }),
     ...(asOf === undefined ? {} : { asOf }),

@@ -24,8 +24,9 @@
  * - capacity (events / calls / bytes / external reserve) and orphan bounds make
  *   the index degrade to `partial` instead of pretending to be complete.
  *
- * Raw events are never retained: a compact per-seq signature is kept only to
- * detect seq conflicts, and only bounded metadata rows survive.
+ * Raw events are never retained: compact per-seq evidence (presence bits, the
+ * exact time and an interned canonical payload) is kept only to detect seq
+ * conflicts, and only bounded metadata rows survive.
  */
 import { Buffer } from 'node:buffer'
 import {
@@ -35,6 +36,7 @@ import {
 } from '@deepseek-ai/dsh-session'
 import { TOOL_ABORTED, TOOL_ABORTED_BEFORE_DISPATCH } from '@deepseek-ai/dsh-tools'
 import type { CallIndexSourceKind } from './call-index-wire.ts'
+import { CallIndexSeqStore } from './call-index-seq-store.ts'
 
 /** One bounded, fixed reason code; never free-form error text. */
 export type CallIndexReason =
@@ -481,31 +483,34 @@ function utf8Length(text: string): number {
   return Buffer.byteLength(text, 'utf8')
 }
 
-/** Conservative per-entry byte estimate: payload copy plus projection/row overhead. */
-function estimateBytes(value: unknown): number {
-  let json = ''
-  try {
-    json = JSON.stringify(value) ?? ''
-  } catch {
-    json = ''
-  }
-  return 2 * utf8Length(json) + 1024
+/**
+ * Conservative retained-size model for a call row.
+ *
+ * The old estimator charged `2 * JSON.stringify(...) + 1024` for every event,
+ * including a bare `other` event whose only durable trace is one presence bit.
+ * These helpers charge the fields the partition actually retains: one record
+ * object plus its own strings and a small allowance for the callId bucket.
+ * They are intentionally a little above the fields' nominal size, not a hash or
+ * a fixed constant.
+ */
+function estimateCallBytes(event: CallIndexEvent): number {
+  return 192
+    + 2 * utf8Length(event.callId ?? '') + 24
+    + 2 * utf8Length(event.toolName ?? '') + 24
+    + (event.turn === undefined ? 0 : 8)
+    + (event.step === undefined ? 0 : 8)
 }
 
-function signatureOf(event: CallIndexEvent): string {
-  return JSON.stringify([
-    event.kind,
-    event.seq,
-    event.time,
-    event.turn ?? null,
-    event.step ?? null,
-    event.callId ?? null,
-    event.toolName ?? null,
-    event.outcome ?? null,
-    event.errorCode ?? null,
-    event.replacement === true,
-    event.turnClosed === true,
-  ])
+function estimateResultBytes(result: ResultRecord): number {
+  return 128
+    + 2 * utf8Length(result.callId) + 24
+    + (result.errorCode === undefined ? 0 : 2 * utf8Length(result.errorCode) + 24)
+    + (result.turn === undefined ? 0 : 8)
+    + (result.step === undefined ? 0 : 8)
+}
+
+function estimateOrphanBytes(result: ResultRecord): number {
+  return 96 + 2 * utf8Length(result.callId) + 24
 }
 
 function pickLowestSeq(results: readonly ResultRecord[]): ResultRecord | undefined {
@@ -530,8 +535,8 @@ export class CallIndexPartition {
   /** Resolved provenance per tool name; a catalog read must happen once per name. */
   private readonly sourceByTool = new Map<string, CallIndexSourceKind>()
 
-  /** seq -> compact signature, used only for dedupe/conflict detection. */
-  private readonly seqMeta = new Map<number, string>()
+  /** Exact compact seq evidence; dedupe/conflict and contiguous-prefix support. */
+  private readonly seqStore = new CallIndexSeqStore()
   private readonly calls: CallRecord[] = []
   private readonly callsByCallId = new Map<string, CallRecord[]>()
   private readonly orphans = new Map<string, ResultRecord[]>()
@@ -576,7 +581,7 @@ export class CallIndexPartition {
   }
 
   usage(): { events: number; calls: number; bytes: number } {
-    return { events: this.seqMeta.size, calls: this.calls.length, bytes: this.bytes }
+    return { events: this.seqStore.count, calls: this.calls.length, bytes: this.bytes }
   }
 
   snapshot(cut: number): CallIndexPartitionSnapshot {
@@ -638,26 +643,18 @@ export class CallIndexPartition {
       this.addReason('malformed-event')
       return
     }
-    const signature = signatureOf(event)
-    const existing = this.seqMeta.get(event.seq)
-    if (existing !== undefined) {
-      if (existing !== signature) this.addReason('seq-conflict')
+    const probe = this.seqStore.plan(event)
+    if (probe.status === 'same') return
+    if (probe.status === 'conflict') {
+      this.addReason('seq-conflict')
       return
     }
-    if (this.seqMeta.size >= this.maxEvents) {
+    if (this.seqStore.count >= this.maxEvents) {
       this.reachCapacity('index-capacity')
       return
     }
-    const seqBytes = estimateBytes({
-      kind: event.kind,
-      seq: event.seq,
-      time: event.time,
-      callId: event.callId ?? null,
-      toolName: event.toolName ?? null,
-      outcome: event.outcome ?? null,
-    })
-    if (!this.tryReserve(seqBytes, 'reserve-denied')) return
-    this.seqMeta.set(event.seq, signature)
+    if (!this.tryReserve(probe.bytes, 'reserve-denied')) return
+    this.seqStore.commit(event)
 
     if (event.kind === 'other') {
       if (event.turnClosed === true && event.turn !== undefined && safeCount(event.turn) !== undefined) {
@@ -698,15 +695,7 @@ export class CallIndexPartition {
       results: [],
       ambiguous: false,
     }
-    const bytes = estimateBytes({
-      kind: 'call',
-      seq: event.seq,
-      callId,
-      toolName,
-      turn: event.turn ?? null,
-      step: event.step ?? null,
-      time: event.time,
-    })
+    const bytes = estimateCallBytes(event)
     if (!this.tryReserve(bytes, 'reserve-denied')) return
     this.calls.push(record)
     const bucket = this.callsByCallId.get(callId)
@@ -777,15 +766,7 @@ export class CallIndexPartition {
       return 'skipped'
     }
     const record = candidates[0]
-    const bytes = estimateBytes({
-      kind: 'result',
-      seq: result.seq,
-      callId: result.callId,
-      outcome: result.outcome,
-      errorCode: result.errorCode ?? null,
-      replacement: result.replacement,
-      time: result.time,
-    })
+    const bytes = estimateResultBytes(result)
     if (!this.tryReserve(bytes, 'reserve-denied')) return 'skipped'
     record.results.push(result)
     if (result.time < record.startedAt) this.addReason('clock-anomaly')
@@ -797,7 +778,7 @@ export class CallIndexPartition {
       this.reachCapacity('orphan-capacity')
       return
     }
-    const bytes = estimateBytes({ kind: 'result-orphan', seq: result.seq, callId: result.callId })
+    const bytes = estimateOrphanBytes(result)
     if (!this.tryReserve(bytes, 'reserve-denied')) return
     const list = this.orphans.get(result.callId)
     if (list === undefined) this.orphans.set(result.callId, [result])
@@ -892,9 +873,6 @@ export class CallIndexPartition {
   private isComplete(limit: number): boolean {
     if (this.stopped) return false
     if (this.reasonCodes.size > 0) return false
-    for (let seq = 0; seq < limit; seq += 1) {
-      if (!this.seqMeta.has(seq)) return false
-    }
-    return true
+    return this.seqStore.isContiguous(limit)
   }
 }

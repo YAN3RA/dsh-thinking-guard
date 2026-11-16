@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /**
  * Contract tests for 调用明细 (N24-c) and 总览 (N24-d).
  *
@@ -15,8 +16,9 @@
  * - the corpus and the coverage status are always on screen;
  * - an absent `aggregates` is an explicit missing block, never a zero trend.
  */
-import { describe, expect, it } from 'vitest'
-import { isValidElement } from 'react'
+import { afterEach, describe, expect, it } from 'vitest'
+import { act, createElement, isValidElement } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
 import type * as React from 'react'
 import type { ReactElement, ReactNode } from 'react'
 import { RemoteError, type RemoteErrorCode, type RemoteFailure, type RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
@@ -72,10 +74,18 @@ import {
   CALL_INDEX_SCOPE_LABELS,
   callIndexScanProgress,
   callIndexRefreshPolicy,
+  callIndexScanActive,
   callIndexTrendWidth,
   callIndexSessionName,
   scopeQuery,
   scopeHint,
+  CallIndexDetailPanel,
+  callIndexAppendedAfterRefresh,
+  CALL_INDEX_SESSION_LIST_ID,
+  callIndexSessionOptionId,
+  callIndexRates,
+  type CallIndexPanelApi,
+  type CallIndexPanelResult,
 } from '../src/client/call-index.tsx'
 import {
   CALL_INDEX_ERROR_MESSAGE_KEYS,
@@ -1978,3 +1988,343 @@ describe('partial failure copy', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// TG-09: is-it-running must not be confused with there-is-a-backlog
+// ---------------------------------------------------------------------------
+describe('TG-09: activity, backlog and terminal pause are distinct', () => {
+  const ready = (overrides: Partial<CallIndexStatusView> = {}): CallIndexStatusView => statusView(overrides)
+
+  it('does not call a finished pass with a backlog scanning', () => {
+    const backlogOnly = ready({
+      phase: 'complete',
+      coverage: 'partial',
+      sessions: { listed: 10, visible: 10, completed: 4, pending: 6, failed: 0, pendingLive: 0 },
+    })
+    expect(callIndexScanActive(backlogOnly)).toBe(false)
+    expect(callIndexRefreshPolicy(backlogOnly)).toEqual({ scanning: false, mode: 'full' })
+  })
+
+  it('counts a queued automatic pass as activity even between passes', () => {
+    const scheduled = ready({
+      phase: 'partial',
+      coverage: 'partial',
+      sessions: { listed: 10, visible: 10, completed: 4, pending: 6, failed: 0, pendingLive: 0 },
+      auto: { state: 'scheduled', round: 3 },
+    })
+    expect(callIndexScanActive(scheduled)).toBe(true)
+    expect(callIndexRefreshPolicy(scheduled).mode).toBe('status-only')
+  })
+
+  it('treats a capacity pause as terminal-but-explained, not as running', () => {
+    const paused = ready({
+      phase: 'partial',
+      coverage: 'partial',
+      paused: true,
+      reasons: ['scan-paused-capacity'],
+      auto: { state: 'stopped', round: 9 },
+      sessions: { listed: 10, visible: 10, completed: 4, pending: 6, failed: 0, pendingLive: 0 },
+    })
+    expect(callIndexScanActive(paused)).toBe(false)
+    const progress = callIndexScanProgress(paused)
+    expect(progress.percent).toBe(40)
+    expect(progress.detail).toContain('容量')
+    expect(progress.detail).toContain('可恢复')
+  })
+
+  it('reports real per-pass progress instead of a bare 0%', () => {
+    const working = ready({
+      phase: 'running',
+      coverage: 'partial',
+      passReadEvents: 57344,
+      passReadSessions: 28,
+      scannedEvents: 57344,
+      sessions: { listed: 32, visible: 32, completed: 0, pending: 32, failed: 0, pendingLive: 0 },
+    })
+    const progress = callIndexScanProgress(working)
+    expect(progress.percent).toBe(0)
+    expect(progress.running).toBe(true)
+    expect(progress.detail).toContain('本轮已读')
+    expect(progress.detail).toContain('28 个会话')
+  })
+
+  it('renders the pause reason on the detail surface', () => {
+    const paused = ready({
+      phase: 'partial',
+      paused: true,
+      passReadEvents: 120,
+      passReadSessions: 3,
+      reasons: ['scan-paused-capacity'],
+      sessions: { listed: 4, visible: 4, completed: 1, pending: 3, failed: 0, pendingLive: 0 },
+    })
+    const text = visible(CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), status: paused, page: callPage() }))
+    expect(text).toContain('可恢复')
+  })
+
+  it('never claims a partial backlog as a running scan in the plain sentence', () => {
+    const backlog = ready({
+      phase: 'complete',
+      coverage: 'partial',
+      sessions: { listed: 132, visible: 132, completed: 100, pending: 32, pendingLive: 0, failed: 0 },
+    })
+    const text = visible(CallIndexOverviewPanelView({ status: backlog, overview: overviewView() }))
+    expect(text).toContain('32 个会话待补扫')
+    expect(text).not.toContain('仍在扫描')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// rework 4/3: activity needs a real mark; read-complete is not coverage-complete
+// ---------------------------------------------------------------------------
+describe('rework: activity marks and the two terminal stories', () => {
+  it('does not treat a live backlog alone as a running scan', () => {
+    const liveBacklog = statusView({
+      phase: 'complete',
+      coverage: 'partial',
+      sessions: { listed: 3, visible: 3, completed: 0, pending: 3, failed: 0, pendingLive: 2 },
+    })
+    expect(callIndexScanActive(liveBacklog)).toBe(false)
+    expect(callIndexRefreshPolicy(liveBacklog).mode).toBe('full')
+  })
+
+  it('does not paint activity when the scope is not ready', () => {
+    const noScope = statusView({
+      phase: 'running',
+      scope: { status: 'disabled', mode: 'disabled', reason: 'not-enabled' },
+      sessions: { listed: 3, visible: 3, completed: 0, pending: 3, failed: 0, pendingLive: 0 },
+    })
+    expect(callIndexScanActive(noScope)).toBe(false)
+  })
+
+  it('does not paint activity for a capacity pause', () => {
+    const paused = statusView({
+      phase: 'partial',
+      paused: true,
+      reasons: ['scan-paused-capacity'],
+      auto: { state: 'stopped', round: 4 },
+      sessions: { listed: 3, visible: 3, completed: 0, pending: 3, failed: 0, pendingLive: 1 },
+    })
+    expect(callIndexScanActive(paused)).toBe(false)
+  })
+
+  it('says read-complete-with-partial-coverage, not unfinished', () => {
+    const readDone = statusView({
+      phase: 'partial',
+      coverage: 'partial',
+      exhaustedSessions: 2,
+      reasons: ['event-count-underreported'],
+      sessions: { listed: 2, visible: 2, completed: 0, pending: 0, failed: 0, pendingLive: 0, exhausted: 2 },
+    })
+    const progress = callIndexScanProgress(readDone)
+    expect(progress.detail).toContain('读取已完成')
+    expect(progress.detail).toContain('覆盖部分')
+    expect(progress.detail).not.toContain('暂停')
+    // And it must not claim there is nothing to index.
+    expect(progress.detail).not.toContain('没有可索引的会话')
+  })
+
+  it('says paused-and-resumable for an unfinished capacity stop', () => {
+    const paused = statusView({
+      phase: 'partial',
+      paused: true,
+      reasons: ['scan-paused-capacity'],
+      passReadEvents: 500,
+      passReadSessions: 2,
+      sessions: { listed: 4, visible: 4, completed: 0, pending: 4, failed: 0, pendingLive: 0, exhausted: 0 },
+    })
+    const progress = callIndexScanProgress(paused)
+    expect(progress.detail).toContain('暂停')
+    expect(progress.detail).toContain('可恢复')
+    expect(progress.detail).not.toContain('读取已完成')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// TG-11 / TG-14: paging generation, cross-query honesty, listbox a11y, rates
+// ---------------------------------------------------------------------------
+
+describe('TG-11: a refresh is a data generation, not just a page swap', () => {
+  it('resets the appended depth when the snapshot id changes', () => {
+    expect(callIndexAppendedAfterRefresh('snap-A', 'snap-B', 20)).toBe(0)
+  })
+  it('keeps the appended depth for a same-snapshot refresh', () => {
+    expect(callIndexAppendedAfterRefresh('snap-A', 'snap-A', 20)).toBe(20)
+  })
+  it('starts from zero on the first read', () => {
+    expect(callIndexAppendedAfterRefresh(undefined, 'snap-A', 0)).toBe(0)
+  })
+  it('merge keeps the old rows only within one snapshot', () => {
+    const previous = callPage({ snapshotId: 'snap-A', items: [ROW, { ...ROW, callSeq: 5, callId: 'c5' }] })
+    const sameSnapshot = callPage({ snapshotId: 'snap-A', items: [ROW] })
+    const newSnapshot = callPage({ snapshotId: 'snap-B', items: [ROW] })
+    expect(mergeRefreshedPage(previous, sameSnapshot, 1).items).toHaveLength(2)
+    expect(mergeRefreshedPage(previous, newSnapshot, 1).items).toHaveLength(1)
+  })
+})
+
+describe('TG-14: the session listbox is a real combobox', () => {
+  const catalog = {
+    current: { id: 'session-aaa', name: '修复索引扫描' },
+    items: [
+      { id: 'session-aaa', name: '修复索引扫描' },
+      { id: 'session-bbb', name: '重构调用明细' },
+    ],
+  }
+  const query = { range: 'all' as const, scope: 'session' as const, sessionId: 'session-aaa' }
+  const openMenu = { open: true, highlight: 1, onToggle: () => {}, onClose: () => {}, onHighlight: () => {}, onSelect: () => {}, onKey: () => {} }
+
+  it('points the trigger at a stable listbox and active option', () => {
+    const view = CallIndexDetailPanelView({ query, page: callPage(), catalog, sessionMenu: openMenu } as never)
+    const trigger = nodesWith(view, el => el.props['data-call-index-session-select'] === 'true')[0]!
+    expect(trigger.props['aria-controls']).toBe(CALL_INDEX_SESSION_LIST_ID)
+    expect(trigger.props['aria-activedescendant']).toBe(callIndexSessionOptionId(1))
+    const list = nodesWith(view, el => el.props.role === 'listbox' && el.type === 'ul')[0]!
+    expect(list.props.id).toBe(CALL_INDEX_SESSION_LIST_ID)
+    const options = nodesWith(view, el => el.props.role === 'option')
+    expect(options.map(o => o.props.id)).toEqual([callIndexSessionOptionId(0), callIndexSessionOptionId(1)])
+    expect(options[1]!.props['data-active']).toBe(true)
+    expect(options[0]!.props['data-active']).toBe(false)
+  })
+
+  it('adds Tab to the pure key mapper (closes, never traps focus)', () => {
+    expect(callIndexSessionMenuKey('Tab', { open: true, highlight: 1, count: 3 })).toEqual({ action: 'close', highlight: 1 })
+    expect(callIndexSessionMenuKey('Tab', { open: false, highlight: 1, count: 3 })).toEqual({ action: 'none', highlight: 1 })
+  })
+
+  it('still states the fallback scope when 按会话 has no bound session', () => {
+    const unbound = { range: 'all' as const, scope: 'session' as const }
+    const view = CallIndexDetailPanelView({
+      query: unbound,
+      page: callPage(),
+      catalog: { current: { id: 'x', name: 'X' }, items: [{ id: 'x', name: 'X' }] },
+      sessionMenu: { ...openMenu, open: false, highlight: 0 },
+    } as never)
+    expect(visible(view)).toContain('未识别当前会话，已按全部范围展示。')
+  })
+})
+
+describe('TG-10/14: rate and duration denominators', () => {
+  it('computes the rate over known outcomes, excluding unresolved/running', () => {
+    const rates = callIndexRates({ success: 1, error: 1, unresolved: 1, running: 1 })
+    expect(rates.success?.denominator).toBe(2)
+    expect(rates.success?.rate).toBe(0.5)
+    expect(rates.failure?.rate).toBe(0.5)
+  })
+
+  it('returns no rate instead of 0% when nothing has a known outcome', () => {
+    expect(callIndexRates({ success: 0, error: 0, unresolved: 3, running: 1 })).toEqual({})
+  })
+
+  it('names the duration sample and flags a partial read', () => {
+    const page = callPage({
+      total: 500,
+      totalExact: true,
+      items: [ROW, { ...ROW, callSeq: 5, callId: 'c5', durationMs: 800 }],
+    })
+    const view = CallIndexDetailPanelView({ query: { range: 'all', scope: 'all' }, page, loading: false } as never)
+    const text = visible(view)
+    expect(text).toContain('次有耗时的已读调用平均')
+    expect(text).toContain('非全量')
+  })
+
+  it('says there is no duration sample rather than fabricating a mean', () => {
+    const page = callPage({ items: [{ ...ROW, durationMs: undefined }] })
+    const view = CallIndexDetailPanelView({ query: { range: 'all', scope: 'all' }, page, loading: false } as never)
+    expect(visible(view)).toContain('没有带耗时的已读调用')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Mounted container: cross-query honesty and auto-fill (real react-dom + jsdom)
+// ---------------------------------------------------------------------------
+
+let mountRoot: Root | undefined
+let mountHost: HTMLDivElement | undefined
+
+async function flush(times = 8): Promise<void> {
+  for (let index = 0; index < times; index += 1) {
+    await act(async () => { await Promise.resolve() })
+  }
+}
+
+function okPage(page: CallIndexCallPageView): CallIndexPanelResult<CallIndexCallPageView> {
+  return { ok: true, value: page }
+}
+
+function failedPage(): CallIndexPanelResult<CallIndexCallPageView> {
+  return { ok: false, code: 'internal-error', messageKey: 'callIndex.error.internal', retryable: true, disconnected: false }
+}
+
+function baseApi(overrides: Partial<CallIndexPanelApi> = {}): CallIndexPanelApi {
+  return {
+    getStatus: async () => ({ ok: true, value: statusView() }),
+    getOverview: async () => ({ ok: true, value: overviewView() }),
+    listCalls: async () => okPage(callPage()),
+    listSessions: async () => ({ ok: true, value: sessionPage() }),
+    getDetail: async () => ({ ok: false, code: 'internal-error', messageKey: 'callIndex.error.internal', retryable: true, disconnected: false }),
+    ...overrides,
+  }
+}
+
+async function mountDetail(api: CallIndexPanelApi, extra: Record<string, unknown> = {}): Promise<HTMLDivElement> {
+  mountHost = document.createElement('div')
+  document.body.appendChild(mountHost)
+  mountRoot = createRoot(mountHost)
+  await act(async () => {
+    mountRoot!.render(createElement(CallIndexDetailPanel, { api, ...extra } as never))
+  })
+  await flush()
+  return mountHost
+}
+
+afterEach(async () => {
+  if (mountRoot !== undefined) {
+    const current = mountRoot
+    mountRoot = undefined
+    await act(async () => { current.unmount() })
+  }
+  mountHost?.remove()
+  mountHost = undefined
+})
+
+describe('TG-11 (mounted): a failed cross-query read never shows the old query', () => {
+  it('drops the previous query rows when the new query read fails', async () => {
+    const catalog = { current: { id: 'sess-bbb', name: 'B' }, items: [{ id: 'sess-bbb', name: 'B' }] }
+    const api = baseApi({
+      listCalls: async (query) => query.scope === 'session'
+        ? failedPage()
+        : okPage(callPage({ items: [ROW], snapshotId: 'snap-A' })),
+    })
+    const el = await mountDetail(api, {
+      initialQuery: { scope: 'all' },
+      resolveScopeTarget: () => ({ sessionId: 'sess-bbb' }),
+      resolveSessionCatalog: () => catalog,
+    })
+    // 全部 scope shows the A row.
+    expect(el.textContent).toContain('bash')
+    // Switch to 按会话; the B read fails.
+    const pill = Array.from(el.querySelectorAll('.mc-tab-group button'))
+      .find(button => (button.textContent ?? '').includes('按会话'))
+    expect(pill).toBeTruthy()
+    await act(async () => { (pill as HTMLButtonElement).click() })
+    await flush()
+    // A's row must be gone; a visible failure state replaces it.
+    expect(el.textContent).not.toContain('bash')
+    expect(el.querySelector('[data-call-index-state]')).not.toBeNull()
+  })
+
+  it('auto-fills the next cursor page into the same table', async () => {
+    const page1 = callPage({ items: [ROW], snapshotId: 'snap-1', nextCursor: 'c1' })
+    const page2 = callPage({
+      items: [{ ...ROW, callSeq: 6, callId: 'call-6', toolName: 'grep', resultSeq: 10 }],
+      snapshotId: 'snap-1',
+      nextCursor: undefined,
+    })
+    const api = baseApi({
+      listCalls: async (_query, cursor) => cursor === 'c1' ? okPage(page2) : okPage(page1),
+    })
+    const el = await mountDetail(api, { initialQuery: { scope: 'all' } })
+    await flush(16)
+    expect(el.textContent).toContain('bash')
+    expect(el.textContent).toContain('grep')
+  })
+})

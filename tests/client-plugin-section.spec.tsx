@@ -1,36 +1,73 @@
 /**
  * Rules for the single combined settings page.
  *
- * Same constraint as `client-usage.spec.tsx`: this package has no DOM harness,
- * so the component is inspected as an element tree rather than mounted. What
- * matters here is the shell's contract — one page, one tab bar keyed to
- * categories in the product-specified order, and every view present so none
- * loses its subscriptions.
+ * Most cases inspect the component as an element tree rather than mounting it
+ * (same constraint as `client-usage.spec.tsx`). The seventh-batch polling cases
+ * at the bottom of this file DO mount the real container under jsdom with fake
+ * timers: the shared diagnostic timer is the thing under test, and a timer's
+ * cadence cannot be observed on an unmounted element tree.
+ *
+ * @vitest-environment jsdom
  */
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { isValidElement } from 'react'
+import { act } from 'react'
 import * as React from 'react'
+import { createRoot, type Root } from 'react-dom/client'
 import type { ReactElement, ReactNode } from 'react'
+import { callIndexReply } from '../src/usage/call-index-wire.ts'
+
+// React only batches under `act` when it is told it is in a test environment;
+// without this the mounted cases still pass but every update logs a warning.
+(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
 // The shell tests are about the tab bar and which views stay mounted, so the
 // heavy catalog view is stubbed out. The pure v3 catalog pieces (CatalogStatStrip
 // / ToolGroupsView) are NOT stubbed — the mock spreads the real module and only
 // replaces `CapabilitySection`, so the catalog assertions below can call them
 // directly (same hook-free pattern as `GuardPanel`).
+/**
+ * Every props object the stubbed catalog received, in render order.
+ *
+ * The mounted polling cases need to see how many times the container actually
+ * RE-READ the per-tool usage map (the scan→terminal edge must refresh it exactly
+ * once). The catalog is stubbed to `null`, so its props are the only observable
+ * trace — and counting distinct `usage` map identities is immune to unrelated
+ * re-renders, unlike counting renders.
+ */
+const catalogRenders = vi.hoisted(() => ({ props: [] as Array<Record<string, unknown>> }))
+
 vi.mock('../src/client/CapabilitySection.tsx', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/client/CapabilitySection.tsx')>()
-  return { ...actual, CapabilitySection: function CapabilitySection() { return null } }
+  return {
+    ...actual,
+    CapabilitySection: function CapabilitySection(props: Record<string, unknown>) {
+      catalogRenders.props.push(props)
+      return null
+    },
+  }
 })
 
 import {
+  CATALOG_USAGE_MAX_PAGES,
+  INDEX_STATUS_POLL_ERROR_BASE_MS,
+  INDEX_STATUS_POLL_ERROR_MAX_MS,
+  INDEX_STATUS_POLL_IDLE_MS,
+  INDEX_STATUS_POLL_SCANNING_MS,
   PluginSection,
   PluginSectionView,
+  indexStatusPollDelay,
+  isIndexScanning,
+  shouldReloadCatalog,
+  summarizeCatalogUsage,
   type PluginCategory,
   type PluginSectionProps,
 } from '../src/client/PluginSection.tsx'
+import type { CallIndexCallPageView, CallIndexRemoteFace } from '../src/client/call-index.tsx'
+import type { CallIndexStatusView } from '../src/client/call-index-adapter.ts'
 import { UsagePanel, type UsagePanelApi } from '../src/client/usage.tsx'
 import { OverviewContainer } from '../src/client/OverviewContainer.tsx'
-import { GuardPanel, parseGuardThresholds } from '../src/client/GuardPanel.tsx'
+import { GuardPanel, HOOK_COMPONENT, parseGuardThresholds } from '../src/client/GuardPanel.tsx'
 import { GuardContainer } from '../src/client/GuardContainer.tsx'
 import {
   CatalogStatStrip,
@@ -99,9 +136,14 @@ function walk(node: ReactNode, visit: (element: TreeNode) => void): void {
  * components.
  *
  * `walk` deliberately does not expand components — the combined-page tests
- * depend on seeing `PluginSectionView` as a single node. The Guard board and
- * threshold editor are separate hook-free components, so their contents are
- * only reachable through this variant.
+ * depend on seeing `PluginSectionView` as a single node. The Guard board and the
+ * other hook-free components are only reachable through this variant.
+ *
+ * One exception, and only one: a component tagged with `HOOK_COMPONENT` (the
+ * threshold editor owns a draft) calls hooks, so calling it outside a render
+ * throws "Invalid hook call". It is SKIPPED — every other component is still
+ * expanded, so no hook-free assertion is weakened. That editor's real behaviour
+ * is asserted by jsdom mounts in tests/tg-draft-editor.spec.tsx.
  */
 function nodesWhere(node: ReactNode, predicate: (element: TreeNode) => boolean): TreeNode[] {
   const out: TreeNode[] = []
@@ -111,8 +153,9 @@ function nodesWhere(node: ReactNode, predicate: (element: TreeNode) => boolean):
     if (!isElement(current)) return
     const element = current as unknown as TreeNode
     if (predicate(element)) out.push(element)
-    if (typeof element.type === 'function') {
-      visit((element.type as (props: unknown) => ReactNode)(element.props))
+    const type = element.type as unknown
+    if (typeof type === 'function' && (type as unknown as Record<symbol, boolean>)[HOOK_COMPONENT] !== true) {
+      visit((type as (props: unknown) => ReactNode)(element.props))
     }
     visit(element.props.children as ReactNode)
   }
@@ -335,12 +378,13 @@ describe('思考限制 page', () => {
     }) as ReactElement
     const inputs = nodesWhere(element, node => node.props['data-guard-thresholds'] === 'true')
     expect(inputs).toHaveLength(1)
-    // The thresholds are now three number steppers (v3.1) instead of one
-    // comma-separated text field, so the same edit affordance is three inputs.
-    const field = nodesWhere(element, node => node.type === 'input')
-    expect(field).toHaveLength(3)
-    expect(field.map(node => node.props.value)).toEqual(['3', '5', '8'])
-    expect(field.every(node => node.props.readOnly !== true)).toBe(true)
+    // The wrapper is hook-free, so the walk sees it; the boxes inside belong to
+    // the draft hook component and are asserted by real jsdom mounts in
+    // tg-draft-editor.spec.tsx. Here the wiring is what matters: one wrapper,
+    // the Host's list, and an editable (not read-only) surface.
+    expect(inputs[0].props['data-guard-thresholds-values']).toBe('3,5,8')
+    expect(inputs[0].props['data-guard-thresholds-editable']).toBe('true')
+    expect(nodesWhere(element, node => node.type === 'input')).toHaveLength(0)
   })
 
   it('reads the field back as a plain list, with no Chinese-only punctuation', () => {
@@ -352,10 +396,10 @@ describe('思考限制 page', () => {
       duplicateThresholds: [3, 5, 8],
       onThresholdsChange: () => {},
     }) as ReactElement
-    // The value lives on the <input>, so it is read from props rather than from
-    // text nodes — and the helper must expand the editor component to reach it.
-    const field = nodesWhere(element, node => node.type === 'input')
-    expect(field.map(node => node.props.value)).toEqual(['3', '5', '8'])
+    // The values live on the <input>s inside the hook-owned editor, which this
+    // walk does not expand; the initial rendering of those boxes is asserted by
+    // the jsdom mounts in tg-draft-editor.spec.tsx. What this case guards is that
+    // no Chinese-only punctuation leaks into the label/text around them.
     const text: string[] = []
     walk(element, (node) => {
       if (typeof node.props.children === 'string') text.push(node.props.children)
@@ -710,5 +754,443 @@ describe('工具与技能 · 调用次数接线', () => {
     const catalog = find(panel!.props.children as ReactNode, node => (node.type as { name?: string })?.name === 'CapabilitySection')
     expect(catalog).toBeDefined()
     expect(catalog!.props.usage).toBeUndefined()
+  })
+})
+
+describe('执行保护 · active 接线', () => {
+  it('tells the Guard page whether it is the visible tab', () => {
+    // The container must only poll its counters while the 执行保护 tab is the one
+    // on screen. The pure view is hook-free, so this asserts the prop it hands
+    // down; the mounted container proves it actually stops the timer.
+    const guardOn = find(render('guard'), element => element.type === GuardContainer)
+    expect((guardOn?.props as { active?: boolean } | undefined)?.active).toBe(true)
+    for (const category of ['overview', 'catalog', 'usage'] as const) {
+      const guardOff = find(render(category), element => element.type === GuardContainer)
+      expect((guardOff?.props as { active?: boolean } | undefined)?.active).toBe(false)
+    }
+  })
+})
+
+// ── TG-10：工具目录调用统计的完整性口径 ─────────────────────────────
+function callPage(
+  items: Array<{ toolName: string; outcome?: string }>,
+  extra: Partial<CallIndexCallPageView> = {},
+): CallIndexCallPageView {
+  return {
+    snapshotId: 'snap',
+    generation: 1,
+    coverage: 'complete',
+    summary: { total: items.length, success: 0, error: 0, cancelled: 0, unresolved: 0, unknown: 0, running: 0, inherited: 0 },
+    items: items.map((item, index) => ({
+      sessionId: 's',
+      callSeq: index,
+      callId: 'c' + index,
+      toolName: item.toolName,
+      startedAt: 1000,
+      outcome: (item.outcome ?? 'success') as never,
+      inherited: false,
+      sourceKind: 'unknown' as never,
+      layer: 'unknown',
+    })),
+    droppedItems: 0,
+    ...extra,
+  } as unknown as CallIndexCallPageView
+}
+
+describe('工具目录调用统计 · TG-10 完整性', () => {
+  it('aggregates every page and publishes exact per-tool counts only when complete', () => {
+    const p1 = callPage([{ toolName: 'read_file' }, { toolName: 'read_file', outcome: 'error' }], { total: 3, nextCursor: 'c1' })
+    const p2 = callPage([{ toolName: 'ops_bash' }], { total: 3 })
+    const agg = summarizeCatalogUsage([p1, p2])
+    expect(agg.completeness.complete).toBe(true)
+    expect(agg.completeness.readCalls).toBe(3)
+    expect(agg.usage?.get('read_file')).toEqual({ uses: 2, failures: 1 })
+    expect(agg.usage?.get('ops_bash')).toEqual({ uses: 1 })
+    // A tool that was simply not seen is an absent key, never an invented zero.
+    expect(agg.usage?.has('never_called')).toBe(false)
+  })
+
+  it('does not fabricate zero when the page cap truncates the read', () => {
+    const agg = summarizeCatalogUsage(
+      [callPage([{ toolName: 'read_file' }], { total: 1001, nextCursor: 'more' })],
+      { truncated: true },
+    )
+    expect(agg.usage).toBeUndefined()
+    expect(agg.completeness.complete).toBe(false)
+    expect(agg.completeness.hasMore).toBe(true)
+    expect(agg.completeness.truncated).toBe(true)
+  })
+
+  it('treats partial coverage, dropped rows or a total mismatch as unknown', () => {
+    const partial = summarizeCatalogUsage([callPage([{ toolName: 'x' }], { total: 1, coverage: 'partial' })])
+    expect(partial.usage).toBeUndefined()
+    expect(partial.completeness.complete).toBe(false)
+
+    const dropped = summarizeCatalogUsage([callPage([{ toolName: 'x' }], { total: 1, droppedItems: 2 })])
+    expect(dropped.usage).toBeUndefined()
+
+    const mismatch = summarizeCatalogUsage([callPage([{ toolName: 'x' }], { total: 5 })])
+    expect(mismatch.usage).toBeUndefined()
+    expect(mismatch.completeness.readCalls).toBe(1)
+    expect(mismatch.completeness.total).toBe(5)
+  })
+
+  it('honours the 1000-call read budget boundary (complete at the edge, unknown past it)', () => {
+    const page = (cursor?: string): CallIndexCallPageView => callPage(
+      Array.from({ length: 50 }, () => ({ toolName: 'read_file' })),
+      { total: 1000, ...(cursor === undefined ? {} : { nextCursor: cursor }) },
+    )
+    const exact = Array.from({ length: 20 }, (_, i) => page(i < 19 ? 'c' + i : undefined))
+    const okAgg = summarizeCatalogUsage(exact)
+    expect(okAgg.completeness.complete).toBe(true)
+    expect(okAgg.completeness.readCalls).toBe(1000)
+
+    const over = Array.from({ length: 20 }, (_, i) => page('c' + i))
+    const overAgg = summarizeCatalogUsage(over, { truncated: true })
+    expect(overAgg.usage).toBeUndefined()
+    expect(overAgg.completeness.hasMore).toBe(true)
+    expect(CATALOG_USAGE_MAX_PAGES).toBe(200)
+  })
+})
+
+// ── TG-12：共享索引状态轮询的恢复口径 ───────────────────────────────
+//
+// 第七批统一口径：这里曾经有自己的 "is it scanning" 定义
+// （`phase === 'running' || pending > 0 || pendingLive > 0`），而 调用明细
+// 用的是 `callIndexScanActive`。两者对「容量暂停」和「只剩积压」给出相反答案：
+// 暂停/仅积压时明细页判终态，共享诊断框却仍按 3s 轮询空转。现在只有一个定义。
+function statusOf(partialStatus: {
+  phase?: string
+  pending?: number
+  pendingLive?: number
+  paused?: boolean
+  auto?: 'idle' | 'scheduled' | 'running' | 'stopped'
+  scopeReady?: boolean
+}): CallIndexStatusView {
+  return {
+    scope: partialStatus.scopeReady === false
+      ? { status: 'disabled', mode: 'disabled', reason: 'not-enabled' }
+      : { status: 'ready', mode: 'host-visible' },
+    generation: 1,
+    censusGeneration: 1,
+    phase: (partialStatus.phase ?? 'idle') as never,
+    coverage: 'complete',
+    eventCoverage: 'complete',
+    enumerationCoverage: 'complete',
+    semanticCoverage: { source: 'unknown', ptc: 'unknown', skillExecution: 'unavailable', denied: 'unavailable' },
+    sessions: {
+      listed: 0,
+      visible: 0,
+      completed: 0,
+      pending: partialStatus.pending ?? 0,
+      failed: 0,
+      pendingLive: partialStatus.pendingLive ?? 0,
+    },
+    estimatedBytes: 0,
+    reasons: [],
+    ...(partialStatus.paused === undefined ? {} : { paused: partialStatus.paused }),
+    // An old Host omits `auto` entirely; that absence is exercised below.
+    ...(partialStatus.auto === undefined ? {} : { auto: { state: partialStatus.auto, round: 1 } }),
+    totals: { calls: 0, succeeded: 0, failed: 0, unresolved: 0, unknown: 0, cancelled: 0, running: 0, inherited: 0 },
+  } as unknown as CallIndexStatusView
+}
+
+describe('共享索引状态轮询 · TG-12 恢复', () => {
+  it('keeps a fast cadence while scanning and a slow-but-nonzero cadence once terminal', () => {
+    expect(isIndexScanning(statusOf({ phase: 'running' }))).toBe(true)
+    expect(isIndexScanning(statusOf({ phase: 'complete' }))).toBe(false)
+    expect(indexStatusPollDelay({ ok: true, value: statusOf({ phase: 'running' }) }, 0)).toBe(INDEX_STATUS_POLL_SCANNING_MS)
+    const idle = indexStatusPollDelay({ ok: true, value: statusOf({ phase: 'complete' }) }, 0)
+    expect(idle).toBe(INDEX_STATUS_POLL_IDLE_MS)
+    expect(idle).toBeGreaterThan(0)
+  })
+
+  it('does not call a leftover backlog "scanning" — the fourth-batch definition', () => {
+    // A finished pass that left Sessions unread owes work; it is not activity.
+    // The old definition returned true here and the 3s timer span forever.
+    expect(isIndexScanning(statusOf({ phase: 'complete', pending: 6 }))).toBe(false)
+    expect(isIndexScanning(statusOf({ phase: 'partial', pending: 6 }))).toBe(false)
+    // A live queue alone is likewise owed work, not a running scan.
+    expect(isIndexScanning(statusOf({ phase: 'complete', pendingLive: 2 }))).toBe(false)
+    for (const status of [
+      statusOf({ phase: 'complete', pending: 6 }),
+      statusOf({ phase: 'complete', pendingLive: 2 }),
+      statusOf({ phase: 'partial', pending: 32, pendingLive: 3 }),
+    ]) {
+      expect(indexStatusPollDelay({ ok: true, value: status }, 0)).toBe(INDEX_STATUS_POLL_IDLE_MS)
+    }
+  })
+
+  it('treats a capacity pause as terminal-but-observed, never as 3s activity', () => {
+    const paused = statusOf({
+      phase: 'partial',
+      paused: true,
+      pending: 6,
+      pendingLive: 3,
+      auto: 'stopped',
+    })
+    expect(isIndexScanning(paused)).toBe(false)
+    expect(indexStatusPollDelay({ ok: true, value: paused }, 0)).toBe(INDEX_STATUS_POLL_IDLE_MS)
+    // The pause is resumable, so the terminal cadence must stay nonzero.
+    expect(INDEX_STATUS_POLL_IDLE_MS).toBeGreaterThan(0)
+  })
+
+  it('never paints activity without a readable scope', () => {
+    expect(isIndexScanning(statusOf({ phase: 'running', scopeReady: false }))).toBe(false)
+    expect(indexStatusPollDelay({ ok: true, value: statusOf({ phase: 'running', scopeReady: false }) }, 0))
+      .toBe(INDEX_STATUS_POLL_IDLE_MS)
+  })
+
+  it('follows the automatic scheduler when the Host reports one', () => {
+    // Between passes: another pass is queued, so this is still activity.
+    expect(isIndexScanning(statusOf({ phase: 'complete', auto: 'scheduled' }))).toBe(true)
+    expect(isIndexScanning(statusOf({ phase: 'idle', auto: 'running' }))).toBe(true)
+    // A stopped or idle scheduler is terminal even with a backlog left over.
+    expect(isIndexScanning(statusOf({ phase: 'complete', pending: 9, auto: 'stopped' }))).toBe(false)
+    expect(isIndexScanning(statusOf({ phase: 'complete', pending: 9, auto: 'idle' }))).toBe(false)
+    expect(indexStatusPollDelay({ ok: true, value: statusOf({ phase: 'complete', auto: 'scheduled' }) }, 0))
+      .toBe(INDEX_STATUS_POLL_SCANNING_MS)
+    expect(indexStatusPollDelay({ ok: true, value: statusOf({ phase: 'complete', pending: 9, auto: 'stopped' }) }, 0))
+      .toBe(INDEX_STATUS_POLL_IDLE_MS)
+  })
+
+  it('stays conservative on an older Host that reports no scheduler', () => {
+    // Old Host: no `auto` at all. Only a running pass can claim activity, so a
+    // backlog — even a live one — must not spin the shared timer at 3s.
+    expect(isIndexScanning(statusOf({ phase: 'idle', pendingLive: 5 }))).toBe(false)
+    expect(isIndexScanning(statusOf({ phase: 'idle', pending: 5 }))).toBe(false)
+    expect(isIndexScanning(statusOf({ phase: 'running' }))).toBe(true)
+    expect(indexStatusPollDelay({ ok: true, value: statusOf({ phase: 'idle', pendingLive: 5 }) }, 0))
+      .toBe(INDEX_STATUS_POLL_IDLE_MS)
+  })
+
+  it('retries after a failure with a capped backoff instead of stopping forever', () => {
+    expect(indexStatusPollDelay({ ok: false }, 1)).toBe(INDEX_STATUS_POLL_ERROR_BASE_MS)
+    expect(indexStatusPollDelay({ ok: false }, 2)).toBe(INDEX_STATUS_POLL_ERROR_BASE_MS * 2)
+    expect(indexStatusPollDelay({ ok: false }, 30)).toBe(INDEX_STATUS_POLL_ERROR_MAX_MS)
+    expect(indexStatusPollDelay({ ok: false }, 30)).toBeGreaterThan(0)
+    // The cap is a ceiling, not a stop: it is still a finite retry delay.
+    expect(INDEX_STATUS_POLL_ERROR_MAX_MS).toBe(30000)
+  })
+
+  it('reloads the catalog exactly on the scan→terminal transition', () => {
+    // A mount read already happened: undefined→terminal does not double-read.
+    expect(shouldReloadCatalog(undefined, false)).toBe(false)
+    expect(shouldReloadCatalog(false, false)).toBe(false)
+    expect(shouldReloadCatalog(true, true)).toBe(false)
+    expect(shouldReloadCatalog(true, false)).toBe(true)
+    // The edge is defined on the UNIFIED predicate, so a pause is an edge too.
+    expect(shouldReloadCatalog(isIndexScanning(statusOf({ phase: 'running' })), isIndexScanning(statusOf({ phase: 'partial', paused: true }))))
+      .toBe(true)
+  })
+})
+
+// ── 第七批：真实 mounted 的共享轮询（jsdom + fake timers）────────────────
+//
+// The helper cases above prove the PREDICATE. These prove the TIMER: the shared
+// diagnostic box used to re-arm itself every 3s whenever `pending`/`pendingLive`
+// was non-zero, so a capacity pause — which 调用明细 already renders as a terminal
+// 「可恢复」 story — kept a 3s status request running forever on every tab.
+//
+// A cadence cannot be observed on an unmounted element tree, so this block mounts
+// the real container (`settings.section`'s own entry point) with fake timers.
+// It asserts the observable consequence, not an implementation detail: how many
+// status reads the timer actually issues, and how many times the catalog usage
+// map is re-read on the scan→terminal edge.
+
+const POLL_SUMMARY = {
+  total: 0, success: 0, error: 0, cancelled: 0, unresolved: 0, unknown: 0, running: 0, inherited: 0,
+}
+
+const POLL_META = {
+  snapshotId: 'snap-poll',
+  generation: 1,
+  coverage: 'complete' as const,
+  totalExact: true,
+}
+
+/** One wire-valid status payload; the real projector decides whether it parses. */
+function wireStatus(options: {
+  phase?: string
+  pending?: number
+  pendingLive?: number
+  paused?: boolean
+  auto?: 'idle' | 'scheduled' | 'running' | 'stopped'
+}): Record<string, unknown> {
+  return {
+    ...POLL_META,
+    censusGeneration: 1,
+    phase: options.phase ?? 'idle',
+    eventCoverage: 'complete',
+    enumerationCoverage: 'complete',
+    semanticCoverage: { source: 'unknown', ptc: 'unknown', skillExecution: 'unavailable', denied: 'unavailable' },
+    listedSessions: 0,
+    visibleSessions: 0,
+    completedSessions: 0,
+    pendingSessions: options.pending ?? 0,
+    failedSessions: 0,
+    pendingLive: options.pendingLive ?? 0,
+    estimatedBytes: 0,
+    reasons: [],
+    totals: POLL_SUMMARY,
+    scope: { status: 'ready', mode: 'host-visible', scope: 'host-visible', includesOtherProfiles: true, epoch: 1 },
+    ...(options.paused === undefined ? {} : { paused: options.paused }),
+    ...(options.auto === undefined ? {} : { auto: { state: options.auto, round: 1 } }),
+  }
+}
+
+const POLL_ROW = {
+  sessionId: 'sess-poll',
+  callSeq: 1,
+  callId: 'call-poll-1',
+  toolName: 'read_file',
+  startedAt: 1_700_000_000_000,
+  outcome: 'success' as const,
+  inherited: false,
+  sourceKind: 'native' as const,
+  layer: 'unknown',
+}
+
+/**
+ * Build a reply the REAL wire projector accepts.
+ *
+ * Using the projector (not a hand-built envelope) matters: a payload the Host
+ * would reject must fail here too, or these cases would prove a cadence for a
+ * status the page can never receive.
+ */
+function wireReply(kind: 'status' | 'calls' | 'sessions' | 'summary', data: Record<string, unknown>): unknown {
+  const reply = callIndexReply({ schemaVersion: 1, ok: true, kind, data })
+  if ((reply as { ok?: boolean }).ok !== true) throw new Error('wire rejected the ' + kind + ' payload: ' + JSON.stringify(reply))
+  return reply
+}
+
+interface PollHarness {
+  readonly face: CallIndexRemoteFace
+  readonly statusReads: () => number
+  setStatus(next: Record<string, unknown>): void
+}
+
+function pollHarness(initial: Record<string, unknown>): PollHarness {
+  let statusData = initial
+  let statusReads = 0
+  const face: CallIndexRemoteFace = {
+    getIndexStatus: async () => {
+      statusReads += 1
+      return { ok: true as const, value: wireReply('status', statusData) as never }
+    },
+    // One complete page: the catalog's bounded read must publish a real map, so
+    // a re-read is observable as a NEW map identity (and a non-read as none).
+    listCalls: async () => ({
+      ok: true as const,
+      value: wireReply('calls', {
+        ...POLL_META,
+        summary: { ...POLL_SUMMARY, total: 1, success: 1 },
+        total: 1,
+        items: [POLL_ROW],
+      }) as never,
+    }),
+    listSessions: async () => ({
+      ok: true as const,
+      value: wireReply('sessions', { ...POLL_META, summary: POLL_SUMMARY, total: 0, items: [] }) as never,
+    }),
+    getSummary: async () => ({
+      ok: true as const,
+      value: wireReply('summary', { ...POLL_META, summary: POLL_SUMMARY, total: 0 }) as never,
+    }),
+    // The mounted cases never open a detail pane; leaving the method out is the
+    // documented "older Host exposes fewer methods" path.
+  }
+  return {
+    face,
+    statusReads: () => statusReads,
+    setStatus: (next) => { statusData = next },
+  }
+}
+
+let pollRoot: Root | undefined
+let pollHost: HTMLDivElement | undefined
+
+async function mountPolled(face: CallIndexRemoteFace): Promise<HTMLDivElement> {
+  pollHost = document.createElement('div')
+  document.body.appendChild(pollHost)
+  pollRoot = createRoot(pollHost)
+  await act(async () => {
+    pollRoot!.render(React.createElement(PluginSection, { ...props(), callIndexRemote: () => face }))
+  })
+  return pollHost
+}
+
+/** How many DISTINCT usage maps the catalog has been handed (one per real re-read). */
+function distinctUsageMaps(): number {
+  const seen = new Set<unknown>()
+  for (const render of catalogRenders.props) {
+    if (render.usage !== undefined) seen.add(render.usage)
+  }
+  return seen.size
+}
+
+async function advance(ms: number): Promise<void> {
+  await act(async () => { await vi.advanceTimersByTimeAsync(ms) })
+}
+
+afterEach(async () => {
+  vi.useRealTimers()
+  if (pollRoot !== undefined) {
+    const current = pollRoot
+    pollRoot = undefined
+    await act(async () => { current.unmount() })
+  }
+  pollHost?.remove()
+  pollHost = undefined
+  catalogRenders.props.length = 0
+})
+
+describe('共享索引状态轮询 · 第七批 mounted 口径', () => {
+  it('a capacity pause does not re-arm the 3s timer, but the 15s observation still runs', async () => {
+    vi.useFakeTimers()
+    const harness = pollHarness(wireStatus({ phase: 'partial', paused: true, pending: 6, pendingLive: 3, auto: 'stopped' }))
+    await mountPolled(harness.face)
+    const afterMount = harness.statusReads()
+    // The whole defect: the old predicate saw pending/pendingLive > 0 and fired
+    // a status read every 3s while 调用明细 had already settled on 「可恢复」.
+    await advance(INDEX_STATUS_POLL_SCANNING_MS)
+    expect(harness.statusReads()).toBe(afterMount)
+    // Terminal is slower, never stopped: one more observation by the 15s mark.
+    await advance(INDEX_STATUS_POLL_IDLE_MS)
+    expect(harness.statusReads()).toBe(afterMount + 1)
+    // No catalog re-read ever happened: there was no scan→terminal edge to cross.
+    expect(distinctUsageMaps()).toBe(1)
+  })
+
+  it('stays terminal for an older Host that reports only a live backlog', async () => {
+    vi.useFakeTimers()
+    const harness = pollHarness(wireStatus({ phase: 'idle', pendingLive: 5 }))
+    await mountPolled(harness.face)
+    const afterMount = harness.statusReads()
+    await advance(INDEX_STATUS_POLL_SCANNING_MS)
+    expect(harness.statusReads()).toBe(afterMount)
+    await advance(INDEX_STATUS_POLL_IDLE_MS)
+    expect(harness.statusReads()).toBe(afterMount + 1)
+  })
+
+  it('re-reads the catalog exactly once on the real scan→terminal edge', async () => {
+    vi.useFakeTimers()
+    const harness = pollHarness(wireStatus({ phase: 'running', pending: 6, auto: 'running' }))
+    await mountPolled(harness.face)
+    // The mount read already produced one usage map.
+    expect(distinctUsageMaps()).toBe(1)
+    // Still scanning: the 3s tick must NOT re-read the catalog.
+    await advance(INDEX_STATUS_POLL_SCANNING_MS)
+    expect(distinctUsageMaps()).toBe(1)
+    // The Host finishes its pass. The next tick crosses the edge.
+    harness.setStatus(wireStatus({ phase: 'complete', auto: 'stopped' }))
+    await advance(INDEX_STATUS_POLL_SCANNING_MS)
+    expect(distinctUsageMaps()).toBe(2)
+    // Exactly once: neither the next 3s window nor a later 15s observation
+    // re-reads again, because the edge only fires on true→false.
+    await advance(INDEX_STATUS_POLL_SCANNING_MS)
+    expect(distinctUsageMaps()).toBe(2)
+    await advance(INDEX_STATUS_POLL_IDLE_MS)
+    expect(distinctUsageMaps()).toBe(2)
   })
 })

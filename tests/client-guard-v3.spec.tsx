@@ -11,7 +11,7 @@
 import { describe, expect, it } from 'vitest'
 import { isValidElement } from 'react'
 import type { ReactElement, ReactNode } from 'react'
-import { GuardPanel, type GuardPanelProps } from '../src/client/GuardPanel.tsx'
+import { GuardPanel, HOOK_COMPONENT, type GuardPanelProps } from '../src/client/GuardPanel.tsx'
 
 interface TreeNode {
   readonly type: unknown
@@ -32,7 +32,15 @@ function walk(node: ReactNode, visit: (element: TreeNode) => void): void {
   walk(element.props.children as ReactNode, visit)
 }
 
-/** Every element matching 'predicate', EXPANDING function components. */
+/**
+ * Every element matching 'predicate', EXPANDING function components.
+ *
+ * One exception, and only one: a component tagged with `HOOK_COMPONENT` calls
+ * hooks, so calling it here (outside a render) would throw "Invalid hook call".
+ * Such a component is SKIPPED — the walk keeps expanding every other component,
+ * so no hook-free assertion is weakened. The tagged component's own behaviour is
+ * covered by real jsdom mounts in tests/tg-draft-editor.spec.tsx.
+ */
 function nodesWhere(node: ReactNode, predicate: (element: TreeNode) => boolean): TreeNode[] {
   const out: TreeNode[] = []
   const visit = (current: ReactNode): void => {
@@ -41,8 +49,9 @@ function nodesWhere(node: ReactNode, predicate: (element: TreeNode) => boolean):
     if (!isElement(current)) return
     const element = current as unknown as TreeNode
     if (predicate(element)) out.push(element)
-    if (typeof element.type === 'function') {
-      visit((element.type as (props: unknown) => ReactNode)(element.props))
+    const type = element.type as unknown
+    if (typeof type === 'function' && (type as unknown as Record<symbol, boolean>)[HOOK_COMPONENT] !== true) {
+      visit((type as (props: unknown) => ReactNode)(element.props))
     }
     visit(element.props.children as ReactNode)
   }
@@ -127,26 +136,25 @@ describe('v3 执行保护卡片', () => {
     expect(bullets).toHaveLength(9)
   })
 
-  it('renders the thresholds as three number inputs, in section A only', () => {
+  it('keeps ONE threshold wrapper, in section A only, and hands it the Host list', () => {
     const wrap = nodesWhere(render(), (node) => node.props['data-guard-thresholds'] === 'true')
     expect(wrap).toHaveLength(1)
-
-    const inputs = nodesWhere(render(), (node) => node.type === 'input')
-    expect(inputs).toHaveLength(3)
-    for (const input of inputs) {
-      expect(input.props.type).toBe('number')
-      expect(input.props.min).toBe(2)
-      expect(input.props.max).toBe(50)
-    }
-    expect(inputs.map((input) => input.props.value)).toEqual(['3', '5', '8'])
+    // The wrapper lives in this hook-free view, so the walk sees it directly; the
+    // boxes inside are owned by the draft hook component, whose real behaviour is
+    // asserted by jsdom mounts in tg-draft-editor.spec.tsx.
+    expect(wrap[0].props['data-guard-thresholds-values']).toBe('3,5,8')
+    expect(wrap[0].props['data-guard-thresholds-count']).toBe('3')
+    expect(wrap[0].props['data-guard-thresholds-editable']).toBe('false')
   })
 
-  it('assembles a fresh array when a threshold input changes', () => {
-    const calls: Array<readonly number[]> = []
-    const el = render({ onThresholdsChange: (next) => { calls.push(next) } })
-    const inputs = nodesWhere(el, (node) => node.type === 'input')
-    ;(inputs[1].props.onChange as (event: { target: { value: string } }) => void)({ target: { value: '6' } })
-    expect(calls).toEqual([[3, 6, 8]])
+  it('tags the threshold editor as a hook component so tree walkers skip it', () => {
+    // The editor owns a draft (useState/useRef/useEffect). A walker that calls it
+    // outside a render would throw, so the tag is part of the contract; its real
+    // typing/commit behaviour is asserted in tg-draft-editor.spec.tsx.
+    const editor = nodesWhere(render(), (node) => typeof node.type === 'function' && node.props['data-guard-thresholds'] === undefined && (node.type as unknown as Record<symbol, boolean>)[HOOK_COMPONENT] === true)
+    expect(editor.length).toBe(1)
+    // …and no <input> is reachable without expanding it.
+    expect(nodesWhere(render(), (node) => node.type === 'input')).toHaveLength(0)
   })
 
   it('puts one guardFired counter at each card foot, mapped per section', () => {

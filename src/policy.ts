@@ -71,6 +71,34 @@ export interface CapabilitySetConfig {
   disabled?: string[]
 }
 
+/**
+ * TG-05: one intent-level tier move.
+ *
+ * The client names only what the operator decided (`kind`, the exact `ids`, and
+ * the destination `target`); it never sends the surrounding rule lists. The
+ * Host applies the move to its LATEST live state, so a second window's stale
+ * snapshot can no longer revert a first window's unrelated move. `kind` is
+ * mandatory because a bare id may name both a tool and a skill.
+ */
+export interface MoveCapabilitiesRequest {
+  readonly kind: CapabilityKind
+  readonly ids: readonly string[]
+  readonly target: CapabilityClass
+}
+
+/*
+ * TG-05 known limitation (documented, not silently shipped):
+ *
+ * An advanced "replace the whole rule set" API is intentionally NOT provided in
+ * this release. The v3 state file stores a per-id tier map and `writeTierState`
+ * can only set keys, not delete them, so a whole-set replacement that REMOVES a
+ * rule cannot be represented/persisted faithfully — doing it would report
+ * success while a remount restores the old rule. The settings UI needs only the
+ * intent-level move below; `updateConfig` remains the legacy, full-replace,
+ * last-write-wins API for programmatic callers (not promised cross-client safe).
+ * A durable whole-set replace needs a state-format change and is out of scope.
+ */
+
 /** Resident / On-demand / Disabled projection policy configuration. */
 export interface Config {
   /** Tool classification: `tools.resident` / `tools.on-demand` / `tools.disabled`. */
@@ -373,8 +401,25 @@ export interface CapabilityPolicyService {
   // — management surface (能力菜单) —
   /** Current (resolved) policy config. */
   getConfig(): Config
-  /** Replace a subset of the policy config and recompile rules immediately. */
+  /**
+   * Legacy whole-config replacement (last-write-wins).
+   *
+   * Kept for compatibility: it replaces the given lists wholesale and does NOT
+   * promise cross-client concurrency. The settings UI no longer uses it for tier
+   * moves; see {@link moveCapabilities} for the intent-level path.
+   */
   updateConfig(partial: Partial<Config>): Promise<void>
+  /**
+   * Apply one intent-level tier move to the latest live state.
+   *
+   * Only the named `ids` are moved and journaled; unrelated entries are left
+   * alone, so two clients moving different capabilities cannot revert each
+   * other. Same-id races resolve as last-write-wins at the Host. The returned
+   * promise rejects if the tier journal could not be written to disk, in which
+   * case ONLY the ids this call moved are rolled back — a concurrent move's ids
+   * and pending journal entries are preserved — and nothing is reported saved.
+   */
+  moveCapabilities(request: MoveCapabilitiesRequest): Promise<void>
   /**
    * Write any pending tier moves to the state file now, without waiting for the
    * debounce window, and resolve once that write has landed.
@@ -401,6 +446,35 @@ export interface CapabilityPolicyService {
    * would reload the plugin each time a switch is flipped.
    */
   updateGuard(change: Partial<GuardSwitches>): Promise<void>
+  /**
+   * Declare the Guard patch file's switch values as the base layer.
+   *
+   * Precedence is `shipped default < this base < persisted explicit override`.
+   * The Guard calls this when it mounts (and again whenever the policy service
+   * becomes available), and the returned function withdraws exactly this
+   * registration: a reloaded Guard must not leave a stale base behind, and a
+   * Guard unmounted before the policy existed must not keep the policy claiming
+   * a Guard is running. Registering twice from the same Guard is a no-op for the
+   * effective value but still tracked, so the last withdrawal wins.
+   */
+  registerGuardBase(base: Partial<GuardSwitches>): () => void
+  /**
+   * Record that a Guard instance failed to construct its hooks.
+   *
+   * The Guard calls this instead of throwing out of `apply`: an invalid patch
+   * disables only the Guard sub-plugin, and this is how the settings page learns
+   * why. Withdrawing the returned function clears the report, so a reload cannot
+   * inherit a dead instance's diagnosis.
+   */
+  noteGuardUnavailable(): () => void
+  /**
+   * Whether the Guard is really running, plus fixed-code failure reasons.
+   *
+   * Separate from {@link getGuardStats} on purpose: the counters keep their
+   * seven numeric fields and privacy contract untouched, while this answers
+   * "is it actually in effect" with a closed allowlist of codes.
+   */
+  getGuardDiagnostics(): GuardDiagnostics
   /**
    * Content-free counters proving whether the Guard ran and what it did.
    *
@@ -472,6 +546,29 @@ export interface GuardSwitches {
    * so lowering it makes the Guard act earlier and raising it makes it quieter.
    */
   readonly repeatThresholds: readonly number[]
+}
+
+/** Fixed diagnostic reasons; the wire never carries free-form text. */
+export type GuardDiagnosticReason = 'invalid-patch' | 'not-mounted'
+
+/**
+ * Why the Guard is (or is not) actually running, and whether pending writes are
+ * durable. Deliberately a closed allowlist: no exception text, no paths, no
+ * truncation tricks — a code is either in this union or it is not reported.
+ */
+export interface GuardDiagnostics {
+  /**
+   * True only when a Guard instance registered a valid base AND finished
+   * constructing its hooks. An empty `reasons` list is NOT the proof: a policy
+   * that never saw the Guard mount also has nothing to complain about.
+   */
+  readonly available: boolean
+  readonly reasons: readonly GuardDiagnosticReason[]
+  readonly persistence: {
+    readonly dirty: boolean
+    /** Present only after a real write failure; cleared by the next success. */
+    readonly lastErrorCode?: 'write-failed'
+  }
 }
 
 /** Shipped defaults for {@link GuardSwitches}. */
@@ -559,16 +656,43 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   }
 
   /**
-   * Live Guard switches: defaults, then persisted UI choices.
+   * Guard patch-file values, registered by the Guard itself.
    *
-   * A state file written before `repeatThresholds` existed simply has no such
-   * field, and the spread keeps the shipped default — that is the backward
-   * compatibility path, no migration step needed.
+   * Keyed by a monotonic token so a withdrawal removes exactly its own entry:
+   * a reloaded Guard cannot leave a stale base behind, and a Guard unmounted
+   * before the policy existed cannot keep the policy claiming a Guard runs.
+   * Several live Guards (tests, or a double mount) merge in registration order.
    */
-  let guardSwitches: GuardSwitches = {
-    ...DEFAULT_GUARD_SWITCHES,
-    ...savedGuard,
-    repeatThresholds: savedGuard.repeatThresholds ?? DEFAULT_GUARD_SWITCHES.repeatThresholds,
+  const guardBases = new Map<number, Partial<GuardSwitches>>()
+  let guardBaseToken = 0
+  /** `invalid-patch` reports from Guards that failed construction. */
+  const guardUnavailable = new Set<number>()
+  let guardUnavailableToken = 0
+  /** Set when a real disk write failed; cleared by the next successful write. */
+  let lastWriteErrorCode: 'write-failed' | undefined = undefined
+
+  /**
+   * Effective Guard switches: shipped default < Guard patch base < persisted
+   * explicit override.
+   *
+   * The persisted layer is a sparse map of keys the operator actually chose, so
+   * "saved value equals the default" stays distinguishable from "never set" —
+   * that is why the resolution reads `savedGuard` per key instead of comparing
+   * a whole snapshot against the defaults. A state file written before
+   * `repeatThresholds` existed simply has no such field, and the fallback chain
+   * covers it with no migration step.
+   */
+  const resolveGuardSwitches = (): GuardSwitches => {
+    let base: Partial<GuardSwitches> = {}
+    for (const value of guardBases.values()) base = { ...base, ...value }
+    return {
+      ...DEFAULT_GUARD_SWITCHES,
+      ...base,
+      ...savedGuard,
+      repeatThresholds: savedGuard.repeatThresholds
+        ?? base.repeatThresholds
+        ?? DEFAULT_GUARD_SWITCHES.repeatThresholds,
+    }
   }
   const locations = new LocationRegistry(ctx, {
     patchFile,
@@ -643,7 +767,49 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   /** Serialize writes so a later click cannot race an earlier state rewrite. */
   let persistInFlight: Promise<void> = Promise.resolve()
 
-  /** Write validated moves into the state file, when they differ from disk. */
+  /**
+   * Unified mutation queue: every tier mutation (intent move AND legacy
+   * `updateConfig`) runs to completion — including its disk write and any
+   * rollback — before the next starts.
+   *
+   * `persistInFlight` only serializes the WRITES; it cannot stop two mutations
+   * from interleaving at their `await` points. That is how a failed move used
+   * to revert a later same-id move: both saw the same `current`, and the
+   * first failure's rollback wiped the second's journal. Running the whole
+   * mutation here means `candidate`/`snapshot` are computed against the LATEST
+   * state with no concurrent mutation in between. The queue belongs to this
+   * policy instance: once it is disposed, queued work is rejected so a dead
+   * instance can never write to disk after unload.
+   */
+  let mutationTail: Promise<unknown> = Promise.resolve()
+  const runMutation = <T>(task: () => Promise<T>): Promise<T> => {
+    const run = mutationTail.then(() => {
+      // Check REAL fiber liveness, not only the effect flag: Cordis clears
+      // `ctx.fiber.uid` synchronously at unload, while `releaseOnDemandState`
+      // (which sets `policyDisposed`) runs later in the disposer. Without the
+      // uid check, a move enqueued then immediately disposed could start and
+      // write after unload. This does not block the legitimate teardown flush:
+      // that runs `persistTiers()` directly (outside this queue) for moves that
+      // were already accepted.
+      if (policyDisposed || ctx.fiber.uid === null) {
+        throw new Error('capabilityPolicy: instance disposed')
+      }
+      return task()
+    })
+    // Keep the tail settled regardless of this task's outcome so one rejected
+    // mutation never wedges the queue.
+    mutationTail = run.then(() => undefined, () => undefined)
+    return run
+  }
+
+  /**
+   * Write validated moves into the state file, when they differ from disk.
+   *
+   * A failure is recorded and rethrown: an explicit {@link flushPersistence} must
+   * be able to tell its caller the data did not land, while the journal stays
+   * intact so the next serialized attempt can retry the same moves. The message
+   * goes to the log; callers only ever see the fixed write-failed code.
+   */
   const writeTiers = async (): Promise<void> => {
     if (stateFile.length === 0) return
     const toolMoves = new Map(movedTiers.tool)
@@ -655,13 +821,21 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       // queued for the next serialized write.
       for (const [name, tier] of toolMoves) if (movedTiers.tool.get(name) === tier) movedTiers.tool.delete(name)
       for (const [name, tier] of skillMoves) if (movedTiers.skill.get(name) === tier) movedTiers.skill.delete(name)
+      lastWriteErrorCode = undefined
       if (written) ctx.logger.info(`capability-policy: persisted tier rules to ${stateFile}`)
     } catch (error) {
+      // Journal untouched on purpose: the moves are still pending, and dropping
+      // them here would silently lose an accepted tier change.
+      lastWriteErrorCode = 'write-failed'
       ctx.logger.warn(`capability-policy: cannot persist tier rules to ${stateFile}: ${String(error)}`)
+      throw error
     }
   }
 
   const persistTiers = (): Promise<void> => {
+    // The catch goes on the PREVIOUS link, not on this one: a failed write is
+    // reported to its own caller but never blocks the next attempt, so the
+    // serialized chain recovers on its own instead of staying rejected.
     persistInFlight = persistInFlight.catch(() => undefined).then(writeTiers)
     return persistInFlight
   }
@@ -671,19 +845,53 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     if (persistTimer !== undefined) persistClock.clear(persistTimer)
     persistTimer = persistClock.set(() => {
       persistTimer = undefined
-      void persistTiers()
+      // Run the debounced write through the mutation queue too, so it cannot
+      // snapshot a journal mid-mutation (which would persist a move that is
+      // about to roll back). The debounce has no caller to report to: failure is
+      // visible through getGuardDiagnostics (dirty + lastErrorCode) and the
+      // rejection is swallowed so it cannot become an unhandled rejection.
+      void runMutation(async () => { await persistTiers() }).catch(() => undefined)
     }, persistDebounceMs)
   }
+
+  /**
+   * Releases this instance's On-demand masks; assigned further down, once the
+   * On-demand state it needs exists.
+   *
+   * Declared here (as a no-op) because the teardown effect below is registered
+   * before that block: Cordis runs registered disposers even when `apply`
+   * throws later, and a `const` defined below would be in its temporal dead
+   * zone at that moment. A no-op default keeps such a failure from turning into
+   * a second, unrelated ReferenceError.
+   */
+  let releaseOnDemandState: () => void = () => {}
 
   // Flush a pending write on teardown, including when an unrelated patch edit
   // reloads the plugin. Cordis awaits the disposer before mounting its successor.
   ctx.effect(() => async () => {
-    if (persistTimer !== undefined) {
-      persistClock.clear(persistTimer)
-      persistTimer = undefined
-      await persistTiers()
-    } else await persistInFlight
-    if (movedTiers.tool.size > 0 || movedTiers.skill.size > 0) await persistTiers()
+    // Release the On-demand masks first: this disposer is registered before the
+    // listeners, so Cordis runs it last, after `agent/disposed` and
+    // `tools/change` are already gone. Nothing can re-enter while the masks
+    // this instance installed are lifted, and no queued callback can install a
+    // replacement afterwards (see `releaseOnDemandState`).
+    releaseOnDemandState()
+    // Wait for any in-flight mutation to finish (and roll back on failure)
+    // before the final flush. Queued-but-not-started mutations see the disposed
+    // flag in runMutation and are rejected, so a dead instance never writes.
+    await mutationTail.catch(() => undefined)
+    // A write failure here is already logged and recorded as
+    // persistence.lastErrorCode; rejecting the disposer would turn a disk
+    // problem into an unload error. The journal keeps the pending moves.
+    try {
+      if (persistTimer !== undefined) {
+        persistClock.clear(persistTimer)
+        persistTimer = undefined
+        await persistTiers()
+      } else await persistInFlight
+      if (movedTiers.tool.size > 0 || movedTiers.skill.size > 0) await persistTiers()
+    } catch {
+      // Already visible through getGuardDiagnostics().persistence.
+    }
   }, 'capability-menu-policy: flush tier persistence')
 
   /**
@@ -738,6 +946,115 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   }
   applyConfig(effective, [...(config.metaTools ?? DEFAULT_META_TOOLS)])
 
+  // ── TG-05 intent-level tier moves ──────────────────────────────────────────
+
+  /** Throw one of the fixed, machine-readable validation codes. */
+  const failMove = (code: string): never => {
+    throw new Error(`capabilityPolicy.moveCapabilities: ${code}`)
+  }
+
+  /** Validate a move request, dropping duplicate ids but never inferring `kind`. */
+  const normalizeMoveRequest = (request: MoveCapabilitiesRequest): {
+    kind: CapabilityKind
+    ids: string[]
+    target: CapabilityClass
+  } => {
+    if (request === null || typeof request !== 'object') failMove('invalid-request')
+    const { kind, target } = request
+    if (kind !== 'tool' && kind !== 'skill') failMove('invalid-kind')
+    if (!Array.isArray(request.ids) || request.ids.length === 0) failMove('empty-ids')
+    if (target !== 'resident' && target !== 'on-demand' && target !== 'disabled') failMove('invalid-target')
+    const ids: string[] = []
+    const seen = new Set<string>()
+    for (const raw of request.ids) {
+      if (typeof raw !== 'string' || raw.length === 0) failMove('invalid-id')
+      if (!seen.has(raw)) { seen.add(raw); ids.push(raw) }
+    }
+    return { kind, ids, target }
+  }
+
+  /** True when the id names a known capability of that kind (meta tools count). */
+  const capabilityExists = (id: string, kind: CapabilityKind): boolean => {
+    if (kind === 'tool' && metaToolSet.has(id)) return true
+    try {
+      return ctx.capability.get(id, kind) !== undefined
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Which tier explicitly lists `id` in one set config, or `undefined` when it
+   * is unlisted. `undefined` is kept distinct from `'resident'`: an unlisted id
+   * may still classify resident via a wildcard, and a rollback must remove it
+   * from every list rather than pin an exact resident rule that would override
+   * that wildcard.
+   */
+  const classInSet = (set: unknown, id: string): CapabilityClass | undefined => {
+    const lists = tierLists(set)
+    for (const tier of TIER_KEYS) if (lists[tier].includes(id)) return tier
+    return undefined
+  }
+
+  /**
+   * Commit an intent move and persist it synchronously.
+   *
+   * On a failed write ONLY the ids this call moved are reverted (memory + journal),
+   * and only while they still hold our target — another concurrent move's ids and
+   * pending journal entries are left intact, so one client's failure can never
+   * swallow another client's successful move. The legacy debounce timer is NOT
+   * cleared, so any pending legacy move keeps its own queued write.
+   */
+  const commitTierChange = async (
+    candidate: Config,
+    kind: CapabilityKind,
+    moves: ReadonlyMap<string, CapabilityClass>,
+  ): Promise<void> => {
+    const journal = movedTiers[kind]
+    const beforeSet = kind === 'skill' ? current.skills : current.tools
+    const prior: Array<{
+      id: string
+      previousClass: CapabilityClass | undefined
+      journalHad: boolean
+      journalPrior: CapabilityClass | undefined
+    }> = []
+    for (const id of moves.keys()) {
+      prior.push({
+        id,
+        previousClass: classInSet(beforeSet, id),
+        journalHad: journal.has(id),
+        journalPrior: journal.get(id),
+      })
+    }
+    applyConfig(candidate, metaTools)
+    for (const [id, target] of moves) journal.set(id, target)
+    try {
+      await persistTiers()
+    } catch (error) {
+      // The mutation queue guarantees no other mutation ran since our snapshot,
+      // so this is an EXACT rollback of our own transaction — not a value-
+      // equality guess about which writer owns an id.
+      const lists = tierLists(kind === 'skill' ? current.skills : current.tools)
+      for (const entry of prior) {
+        for (const tier of TIER_KEYS) {
+          const next = lists[tier].filter(name => name !== entry.id)
+          if (next.length !== lists[tier].length) lists[tier] = next
+        }
+        // Unlisted before the move: leave it unlisted so a wildcard still rules.
+        if (entry.previousClass !== undefined) {
+          lists[entry.previousClass] = [...lists[entry.previousClass], entry.id]
+        }
+        if (entry.journalHad) journal.set(entry.id, entry.journalPrior as CapabilityClass)
+        else journal.delete(entry.id)
+      }
+      if (prior.length > 0) {
+        const restored: Config = kind === 'skill' ? { ...current, skills: lists } : { ...current, tools: lists }
+        applyConfig(restored, metaTools)
+      }
+      throw error
+    }
+  }
+
   const service: CapabilityPolicyService = {
     classifyTool(name: string): CapabilityClass {
       const server = serverNameOf(name)
@@ -766,12 +1083,17 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       return service.classifyCapability(id, kind) === 'disabled'
     },
     isHiddenOnlyByPolicy(agent: object | undefined, name: string): boolean {
-      // Fail closed on every axis: no agent, no recorded proof, a name this
+      // Fail closed on every axis: no agent, no recorded proof, a proof from a
+      // tool-view generation that has since moved (a `tools/change` this policy
+      // did not emit invalidates it before any forward can read it), a name this
       // policy never denied, or a name that is currently visible (so there is
       // nothing to lift) all answer `false`.
       if (agent === undefined || agent === null) return false
-      const owned = policyOwnedHiddenNames.get(agent)
-      if (owned === undefined || !owned.has(name)) return false
+      // A disposed instance proves nothing: its masks are being released.
+      if (policyDisposed) return false
+      const proof = policyOwnedHiddenNames.get(agent)
+      if (proof === undefined || proof.epoch !== toolChangeEpoch) return false
+      if (!proof.owned.has(name)) return false
       if (service.classifyTool(name) !== 'on-demand') return false
       return !visibleTo(agent, name)
     },
@@ -787,43 +1109,117 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     getConfig(): Config {
       return { ...current }
     },
-    async updateConfig(partial: Partial<Config>): Promise<void> {
-      // Exposure is projected from current rules on every assemble. A tier
-      // change needs no tool or skill inventory rebuild.
-      const previousTools = current.tools
-      const previousSkills = current.skills
-      const merged: Config = { ...current, ...partial }
-      // Validate first, commit second (see `applyConfig`): a rejected update
-      // leaves the live policy exactly as it was.
-      applyConfig(
-        merged,
-        partial.metaTools !== undefined ? [...(partial.metaTools ?? DEFAULT_META_TOOLS)] : metaTools,
-      )
-      // Only a validated update can enter the pending disk journal. Diffing
-      // against the previous in-memory view excludes unrelated stale entries.
-      recordMoves(previousTools, merged.tools, movedTiers.tool)
-      recordMoves(previousSkills, merged.skills, movedTiers.skill)
-      schedulePersistTiers()
-      // A tier move changes which tools are On-demand; restrictions intersect,
-      // so every live agent gets its previous restriction disposed and the new
-      // deny list applied before its next assembly.
-      reapplyOnDemandRestrictions()
+    updateConfig(partial: Partial<Config>): Promise<void> {
+      // Legacy full-replace, but it participates in the same mutation queue so
+      // its current+journal change can never interleave with an intent move.
+      return runMutation(async () => {
+        // Exposure is projected from current rules on every assemble. A tier
+        // change needs no tool or skill inventory rebuild.
+        const previousTools = current.tools
+        const previousSkills = current.skills
+        const merged: Config = { ...current, ...partial }
+        // Validate first, commit second (see `applyConfig`): a rejected update
+        // leaves the live policy exactly as it was.
+        applyConfig(
+          merged,
+          partial.metaTools !== undefined ? [...(partial.metaTools ?? DEFAULT_META_TOOLS)] : metaTools,
+        )
+        // Only a validated update can enter the pending disk journal. Diffing
+        // against the previous in-memory view excludes unrelated stale entries.
+        recordMoves(previousTools, merged.tools, movedTiers.tool)
+        recordMoves(previousSkills, merged.skills, movedTiers.skill)
+        schedulePersistTiers()
+        // A tier move changes which tools are On-demand; restrictions intersect,
+        // so every live agent gets its previous restriction disposed and the new
+        // deny list applied before its next assembly.
+        if (!policyDisposed) reapplyOnDemandRestrictions()
+      })
+    },
+
+    moveCapabilities(request: MoveCapabilitiesRequest): Promise<void> {
+      // The whole move (validate → candidate from LATEST current → journal →
+      // persist → rollback) is one queued transaction. No other mutation can
+      // change current/journal between the candidate snapshot and its write,
+      // so a failure can never revert a later same-id intent.
+      return runMutation(async () => {
+        const { kind, ids, target } = normalizeMoveRequest(request)
+        for (const id of ids) {
+          // A control-plane (mandatory meta) tool may never be hidden.
+          if (kind === 'tool' && metaToolSet.has(id) && target !== 'resident') failMove('control-plane')
+          if (!capabilityExists(id, kind)) failMove('unknown-capability')
+        }
+        const set = kind === 'skill' ? current.skills : current.tools
+        const moves = new Map<string, CapabilityClass>()
+        for (const id of ids) moves.set(id, target)
+        const nextLists = replayMoves(set, moves)
+        const candidate: Config = kind === 'skill'
+          ? { ...current, skills: nextLists }
+          : { ...current, tools: nextLists }
+        await commitTierChange(candidate, kind, moves)
+        // A tier move changes which tools are On-demand; intersect restrictions.
+        // Never reinstall masks on an instance that unloaded mid-write.
+        if (!policyDisposed) reapplyOnDemandRestrictions()
+      })
     },
 
     flushPersistence(): Promise<void> {
-      // Drop the pending window so a later teardown cannot write the same moves
-      // twice, then join the serialized write queue: awaiting it covers both
-      // writes already in flight and the one just queued.
-      if (persistTimer !== undefined) {
-        persistClock.clear(persistTimer)
-        persistTimer = undefined
-      }
-      return persistTiers()
+      // Queued behind any in-flight mutation so an explicit flush never
+      // snapshots a journal mid-transaction. Deliberately NOT swallowed: a
+      // caller that asked for durability must learn the write failed.
+      return runMutation(async () => {
+        if (persistTimer !== undefined) {
+          persistClock.clear(persistTimer)
+          persistTimer = undefined
+        }
+        await persistTiers()
+      })
     },
 
     // — Guard switches (思考限制) —
     getGuard(): GuardSwitches {
-      return guardSwitches
+      // Effective value, never an error shape: the panel shows what is in
+      // force, while getGuardDiagnostics separately says whether the Guard
+      // actually runs. Keeping them apart lets the page render a usable
+      // config next to an explicit "not in effect" banner.
+      return resolveGuardSwitches()
+    },
+    registerGuardBase(base: Partial<GuardSwitches>): () => void {
+      guardBaseToken += 1
+      const token = guardBaseToken
+      guardBases.set(token, { ...base })
+      let withdrawn = false
+      return () => {
+        // Idempotent: a double withdrawal (unmount racing a reload) must not
+        // remove another registration.
+        if (withdrawn) return
+        withdrawn = true
+        guardBases.delete(token)
+      }
+    },
+    noteGuardUnavailable(): () => void {
+      guardUnavailableToken += 1
+      const token = guardUnavailableToken
+      guardUnavailable.add(token)
+      // Reported only while registered, so a dead Guard cannot keep the policy
+      // advertising a stale invalid-patch.
+      return () => { guardUnavailable.delete(token) }
+    },
+    getGuardDiagnostics(): GuardDiagnostics {
+      // available is proven by a live registration, never by an empty reason
+      // list: a policy whose Guard never mounted has no reasons to report and
+      // yet must not claim the Guard is running.
+      const reasons: GuardDiagnosticReason[] = []
+      if (guardUnavailable.size > 0) reasons.push('invalid-patch')
+      if (guardBases.size === 0) reasons.push('not-mounted')
+      const dirty = movedTiers.tool.size > 0 || movedTiers.skill.size > 0
+      return {
+        available: reasons.length === 0,
+        reasons,
+        persistence: {
+          dirty,
+          ...(lastWriteErrorCode !== undefined ? { lastErrorCode: lastWriteErrorCode } : {}),
+        },
+      }
     },
     async updateGuard(change: Partial<GuardSwitches>): Promise<void> {
       // Persist ONLY the keys this call actually changes. Passing a full snapshot
@@ -855,7 +1251,10 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
           throw new Error(`cannot persist Guard switches to ${stateFile}: ${String(error)}`)
         }
       }
-      guardSwitches = { ...guardSwitches, ...patch }
+      // Only the explicit override layer moves. The Guard patch base stays
+      // whatever the Guard registered, so one edited key cannot silently reset
+      // the other keys the operator never touched.
+      savedGuard = { ...savedGuard, ...patch }
       ctx.logger.info(`capability-policy: Guard switches updated: ${JSON.stringify(patch)}`)
     },
     getGuardStats(): GuardStatsSnapshot {
@@ -961,12 +1360,56 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
    * the apply threw) reads as "not ours", and the post-install re-check drops
    * any name this deny list demonstrably does not hide.
    *
-   * Staleness is not possible at read time, because the set is recomputed
-   * synchronously from every `tools/change` — including the one a third-party
-   * `tools.restrict()` emits after its filter is already live — while a forward
-   * always runs in a later task than the change that could affect it.
+   * A proof is bound to `toolChangeEpoch`: any `tools/change` this policy did
+   * not itself produce invalidates every proof before the handler returns, so
+   * a forward that runs while the deferred recompute is still pending sees no
+   * attribution at all (fail closed) instead of a sample from an older view.
    */
-  const policyOwnedHiddenNames = new WeakMap<object, ReadonlySet<string>>()
+  const policyOwnedHiddenNames = new WeakMap<object, { owned: ReadonlySet<string>; epoch: number }>()
+
+  /**
+   * Tool-restriction generation. Incremented by EVERY `tools/change`.
+   *
+   * A proof is only readable while its `epoch` equals this value. Any event
+   * that this policy cannot attribute to its own synchronous apply pass clears
+   * every proof immediately, so `meta_invoke` fails closed until the deferred
+   * recompute has rebuilt them.
+   */
+  let toolChangeEpoch = 0
+
+  /**
+   * Depth of this policy's own `restrict()`/`dispose()` calls.
+   *
+   * Those calls emit `tools/change` synchronously. While the depth is above
+   * zero the event belongs to the current apply pass; treating it as foreign
+   * would re-enter the pass and dispose the mask the outer pass just installed
+   * (the original TG-01 loop). The pass still counts every event and compares
+   * the total against the exact number its own calls should produce: an extra
+   * event means a third party mutated the view inside the window, and that
+   * whole pass is retried against the new view.
+   */
+  let ownMutationDepth = 0
+
+  const withOwnMutation = <T>(mutation: () => T): T => {
+    ownMutationDepth += 1
+    try {
+      return mutation()
+    } finally {
+      ownMutationDepth -= 1
+    }
+  }
+
+  /**
+   * Whether this policy instance may still mutate the tool views.
+   *
+   * Two independent conditions, both required: the fiber was not disposed (its
+   * `uid` is cleared as soon as unload begins) and this module's own teardown
+   * has not run. A deferred callback — the recovery microtask in particular —
+   * is scheduled while the instance is alive but may run after it is gone; it
+   * must never install a restriction nobody owns.
+   */
+  let policyDisposed = false
+  const isPolicyActive = (): boolean => !policyDisposed && ctx.fiber.uid !== null
 
   /**
    * Install one agent's deny list, recording the disposer it produced.
@@ -982,10 +1425,13 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     agent: { ctx: Context; id?: unknown },
     deny: readonly string[],
   ): { dispose: () => void; deny: readonly string[] } | undefined => {
+    // A disposed instance must never add a restriction: nobody would own its
+    // disposer, so it would mask the agent forever.
+    if (!isPolicyActive()) return undefined
     const scopedTools = agent.ctx.get('tools')
     if (scopedTools === undefined) return undefined
     try {
-      const entry = { dispose: scopedTools.restrict({ deny }), deny }
+      const entry = { dispose: withOwnMutation(() => scopedTools.restrict({ deny })), deny }
       onDemandRestrictions.set(agent, entry)
       return entry
     } catch (error) {
@@ -1019,21 +1465,28 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   }
 
   /**
-   * Count of `tools/change` broadcasts observed so far.
+   * Agents waiting for a deferred recompute, and whether the next pass must
+   * cover every live agent.
    *
-   * The attribution window is only trustworthy while nothing else changes the
-   * tool view inside it. `installOnDemandRestriction()` calls `restrict()`, which
-   * emits `tools/change` SYNCHRONOUSLY, and a third-party listener registered
-   * after this policy runs inside that same emit — it can append its own
-   * restriction while our sample is still being evaluated. The sample would then
-   * wrongly credit that name to us. Comparing this counter across the window
-   * detects exactly that.
-   *
-   * Incremented by the existing `tools/change` listener below (which also
-   * re-applies the restriction) rather than by a listener of its own, so the
-   * plugin keeps one subscription per event.
+   * `tools/change` marks all live agents dirty; a tier move sets `reapplyAll`.
+   * The pass is drained by `runReapply` after the outermost listener returns,
+   * not recursively inside the emitting `restrict()` call.
    */
-  let toolsChangeCount = 0
+  const dirtyAgents = new Set<{ ctx: Context; id?: unknown }>()
+  let reapplyAll = false
+  let reapplying = false
+  /**
+   * Deferred recovery after the synchronous retry budget was exhausted.
+   *
+   * A storm that our own emits keep re-triggering cannot be resolved inside the
+   * emitting stack, so one pass is deferred until it settles. `recoveries`
+   * bounds how many consecutive deferred passes may run before the policy
+   * simply stays fail-closed until the next external `tools/change`, which
+   * keeps a pathological third party from turning the retry into a microtask
+   * loop.
+   */
+  let recoveryScheduled = false
+  let recoveries = 0
 
   /**
    * Agents this policy has seen created and not yet disposed.
@@ -1065,94 +1518,159 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   }
 
   /**
-   * Replace one agent's On-demand restriction with the current policy.
+   * Recompute one agent's On-demand restriction and attribution proof.
    *
-   * Intersecting restrictions cannot be lifted selectively, so the previous
-   * disposer always runs first; an empty deny list simply leaves the agent
-   * unrestricted. Applying is skipped when the deny list is unchanged, because
-   * a restriction append emits `tools/change` and reapplying on every emit
-   * would loop.
-   *
-   * Both `dispose()` and `restrict()` emit `tools/change`, which re-enters this
-   * function through the listener below. `applying` makes that re-entry a no-op:
-   * without it the nested pass would dispose the restriction the outer pass just
-   * installed and leave two intersecting masks live, permanently hiding tools
-   * the current policy considers Resident.
-   *
-   * This is also the only place attribution is decided. Between
-   * `previous.dispose()` and `installOnDemandRestriction()` the caller's view
-   * carries every restriction except this policy's own, so a name visible there
-   * is hidden by this policy alone, and a name still hidden there is hidden by
-   * somebody else too.
-   *
-   * The window is NOT immune to concurrent changes, despite running inside one
-   * synchronous listener invocation: `installOnDemandRestriction()` calls
-   * `restrict()`, which emits `tools/change` synchronously, and a third-party
-   * listener mounted after this policy runs inside that emit and can append its
-   * own restriction right then. So the sample is bracketed by a `tools/change`
-   * counter; if the count moved, somebody else touched the view mid-window and
-   * the attribution is discarded wholesale (fail closed) instead of trusted.
+   * Returns the names this policy demonstrably hides on its own, plus how many
+   * `tools/change` events its own disposal/install produced. The caller sums
+   * that number over the whole pass and compares it with the observed event
+   * count: a surplus means somebody else mutated the view mid-pass, so the
+   * sample was taken from a moving view and the whole pass must be discarded
+   * and rerun. An install failure yields an empty proof, the fail-closed answer
+   * (nothing may be lifted that this policy did not hide).
    */
-  let applying = false
-  const applyOnDemandRestriction = (agent: { ctx: Context; id?: unknown }, force = false): void => {
-    if (applying) return
-    applying = true
+  const applyOnDemandRestriction = (
+    agent: { ctx: Context; id?: unknown },
+  ): { owned: Set<string>; emits: number } => {
+    const deny = onDemandDenyNames()
+    const previous = onDemandRestrictions.get(agent)
+    // No proof may be read while its deny list is being replaced.
+    policyOwnedHiddenNames.delete(agent)
+
+    let emits = 0
+    if (previous !== undefined) {
+      // Retire the entry before disposing so a re-entry cannot dispose twice.
+      onDemandRestrictions.delete(agent)
+      emits += 1
+      try {
+        withOwnMutation(() => { previous.dispose() })
+      } catch (error) {
+        // A throwing disposer must not abort the pass for every other agent.
+        // Nothing is attributable while the old mask may still be live.
+        ctx.logger.warn(`capability-policy: cannot lift On-demand restriction for agent ${String(agent.id)}: ${String(error)}`)
+        return { owned: new Set<string>(), emits }
+      }
+    }
+    // Attribution window: this policy's mask is off, so a name still visible
+    // here is hidden by this policy alone; a name already absent is hidden by a
+    // third party too and must not be recorded.
+    const owned = deny.length === 0 ? new Set<string>() : namesHiddenOnlyByPolicy(agent, deny)
+    if (deny.length === 0) return { owned, emits }
+
+    const entry = withOwnMutation(() => installOnDemandRestriction(agent, deny))
+    // A failed install appended nothing, so it produced no event of its own.
+    if (entry === undefined) return { owned: new Set(), emits }
+    emits += 1
+    // Post-install re-check: a name this list claims to hide but which is still
+    // visible cannot be attributed to it.
+    for (const name of owned) {
+      if (visibleTo(agent, name)) owned.delete(name)
+    }
+    return { owned, emits }
+  }
+
+  /** Upper bound on synchronous apply passes for one dirty batch. */
+  const MAX_REAPPLY_PASSES = 8
+
+  /** Upper bound on consecutive deferred recovery passes for one storm. */
+  const MAX_RECOVERIES = 2
+
+  /** Drop every attribution proof; the next forward must fail closed. */
+  const invalidateAllProofs = (): void => {
+    for (const agent of restrictedAgents) policyOwnedHiddenNames.delete(agent)
+  }
+
+  /**
+   * Stamp every surviving proof with the settled generation of a clean pass.
+   *
+   * Own applies for one agent do not change another agent's view, so proofs
+   * that were not recomputed in this pass stay meaningful; re-stamping them
+   * keeps them readable instead of failing them on the pass's own emits.
+   */
+  const stampProofEpochs = (): void => {
+    for (const agent of restrictedAgents) {
+      const proof = policyOwnedHiddenNames.get(agent)
+      if (proof !== undefined) proof.epoch = toolChangeEpoch
+    }
+  }
+
+  /**
+   * Drain the dirty set, separating reentrancy from recompute.
+   *
+   * `tools/change` handlers only mark work; this function owns the actual
+   * disposal/install pass and is never re-entered. A foreign event observed
+   * mid-pass makes the pass retry against the new view; after
+   * `MAX_REAPPLY_PASSES` the attribution is dropped wholesale (fail closed)
+   * rather than allowing an unbounded `tools/change` loop.
+   */
+  const runReapply = (): void => {
+    if (reapplying) return
+    // A pass that starts after teardown must not touch any view.
+    if (!isPolicyActive()) return
+    reapplying = true
     try {
-      const deny = onDemandDenyNames()
-      const previous = onDemandRestrictions.get(agent)
-      if (!force && previous !== undefined
-        && previous.deny.length === deny.length
-        && previous.deny.every((name, index) => name === deny[index])) return
-      // Retire the entry before disposing: the dispose emits `tools/change`, and
-      // a re-entry must not observe a stale record it could dispose twice.
-      if (previous !== undefined) {
-        onDemandRestrictions.delete(agent)
-        previous.dispose()
+      let passes = 0
+      while ((reapplyAll || dirtyAgents.size > 0) && passes < MAX_REAPPLY_PASSES) {
+        passes += 1
+        const batch = reapplyAll ? new Set(restrictedAgents) : new Set(dirtyAgents)
+        reapplyAll = false
+        dirtyAgents.clear()
+        const baseline = toolChangeEpoch
+        const results = new Map<object, Set<string>>()
+        let expectedEmits = 0
+        for (const agent of batch) {
+          if (!restrictedAgents.has(agent)) continue
+          const result = applyOnDemandRestriction(agent)
+          expectedEmits += result.emits
+          results.set(agent, result.owned)
+        }
+        // Surplus events mean a third party mutated the view while this pass was
+        // sampling it, and a dirty mark means a queued agent still needs work:
+        // either way the pass is not committable. Rebuild from scratch.
+        if (toolChangeEpoch - baseline !== expectedEmits
+          || reapplyAll || dirtyAgents.size > 0) {
+          invalidateAllProofs()
+          reapplyAll = true
+          continue
+        }
+        for (const [agent, owned] of results) {
+          policyOwnedHiddenNames.set(agent, { owned, epoch: toolChangeEpoch })
+        }
+        stampProofEpochs()
+        // A committed pass proves the view is quiet again; the recovery budget
+        // is per storm, not per process lifetime.
+        recoveries = 0
       }
-      // Attribution window: this policy's mask is off, so this sample proves
-      // which of `deny` are invisible only because of a third party.
-      //
-      // Bracket the sample with the `tools/change` counter. Installing the new
-      // restriction emits `tools/change` synchronously, and a third-party
-      // listener mounted after this policy runs inside that emit — it can append
-      // its own deny while we are still holding the sample, which would make us
-      // credit a name we do not actually hide. The count must therefore move by
-      // EXACTLY the one emit our own install produces; anything more means
-      // somebody else touched the view, so the attribution is dropped wholesale
-      // rather than partially trusted.
-      const changeBaseline = toolsChangeCount
-      const owned = deny.length === 0 ? new Set<string>() : namesHiddenOnlyByPolicy(agent, deny)
-      policyOwnedHiddenNames.set(agent, owned)
-      if (deny.length === 0) return
-      if (installOnDemandRestriction(agent, deny) === undefined) {
-        // Nothing was installed, so nothing is hidden by this policy: an entry
-        // here would let the forward lift a mask that does not exist.
-        policyOwnedHiddenNames.set(agent, new Set())
-        return
-      }
-      // Our own `restrict()` contributes exactly one emit. More than that means a
-      // third party appended a restriction inside our install emit, so the
-      // sample no longer proves anything: clear it and let the forward fail
-      // closed. The next `tools/change` recomputes it from a clean window.
-      if (toolsChangeCount - changeBaseline > 1) {
-        policyOwnedHiddenNames.set(agent, new Set())
-        return
-      }
-      // Post-install re-check: a name this list claims to hide but which is
-      // still visible cannot be attributed to it. `restrict()` only masks the
-      // names it was given, so this can only fire on a view that disagrees —
-      // fail closed rather than forward an unproven name.
-      for (const name of owned) {
-        if (visibleTo(agent, name)) owned.delete(name)
+      if (reapplyAll || dirtyAgents.size > 0) {
+        // Bounded retries exhausted: no attribution may survive this storm, so
+        // every forward fails closed. The dirty state is cleared to stop the
+        // synchronous retry loop; one deferred attempt then rebuilds the masks
+        // once the emitting stack (and whoever reacted to it) has settled, so a
+        // transient storm cannot leave On-demand permanently unusable.
+        reapplyAll = false
+        dirtyAgents.clear()
+        invalidateAllProofs()
+        if (!recoveryScheduled && recoveries < MAX_RECOVERIES) {
+          recoveryScheduled = true
+          recoveries += 1
+          queueMicrotask(() => {
+            recoveryScheduled = false
+            // Teardown may have happened while this callback was queued: drop
+            // it instead of installing a mask nobody can dispose.
+            if (reapplying || !isPolicyActive()) return
+            reapplyAll = true
+            runReapply()
+          })
+        }
       }
     } finally {
-      applying = false
+      reapplying = false
     }
   }
 
   /** Re-apply the current policy to every live agent after a tier move. */
   const reapplyOnDemandRestrictions = (): void => {
-    for (const agent of restrictedAgents) applyOnDemandRestriction(agent, true)
+    reapplyAll = true
+    runReapply()
   }
 
   // `agent/created` is awaited and runs before the first prompt assembly
@@ -1161,30 +1679,76 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   // restriction is in place for step 1.
   ctx.on('agent/created', async ({ agent }) => {
     restrictedAgents.add(agent)
-    applyOnDemandRestriction(agent)
+    dirtyAgents.add(agent)
+    runReapply()
   })
 
   ctx.on('agent/disposed', ({ agent }) => {
     restrictedAgents.delete(agent)
+    dirtyAgents.delete(agent)
     // Drop the attribution before anything else: once this policy's mask is
     // gone, a name still hidden here is hidden by a third party, and a stale
     // entry must never authorise a forward on its behalf.
     policyOwnedHiddenNames.delete(agent)
     const entry = onDemandRestrictions.get(agent)
     if (entry === undefined) return
-    entry.dispose()
     onDemandRestrictions.delete(agent)
+    // The disposal emits `tools/change`. It normally only lifts this agent's own
+    // mask, but a listener may append something for a *surviving* agent inside
+    // that emit, and this path has no per-pass emit budget to detect it. Drop
+    // every remaining proof and rebuild them from a clean view instead.
+    withOwnMutation(() => { entry.dispose() })
+    invalidateAllProofs()
+    for (const other of restrictedAgents) dirtyAgents.add(other)
+    runReapply()
   })
+
+  /**
+   * Release every mask this instance installed, on teardown.
+   *
+   * Cordis disposes a fiber's effects in reverse registration order, so this
+   * runs while `tools` is still reachable. Three things must happen before the
+   * fiber goes inactive:
+   *
+   *  1. the queued recovery microtask is cancelled and the dirty state cleared,
+   *     so no deferred callback installs anything afterwards;
+   *  2. every attribution proof is dropped, so nothing can be lifted on behalf
+   *     of an instance that no longer exists;
+   *  3. every restriction this instance appended to a surviving agent's scope
+   *     is disposed. Restriction layers intersect, so this lifts exactly this
+   *     policy's own mask and leaves third-party restrictions in place; without
+   *     it a reloaded policy could never restore a name the dead instance hid.
+   */
+  releaseOnDemandState = (): void => {
+    policyDisposed = true
+    recoveryScheduled = false
+    reapplyAll = false
+    dirtyAgents.clear()
+    invalidateAllProofs()
+    for (const agent of restrictedAgents) {
+      const entry = onDemandRestrictions.get(agent)
+      if (entry === undefined) continue
+      onDemandRestrictions.delete(agent)
+      try {
+        withOwnMutation(() => { entry.dispose() })
+      } catch (error) {
+        ctx.logger.warn(`capability-policy: cannot release On-demand restriction for agent ${String(agent.id)}: ${String(error)}`)
+      }
+    }
+    restrictedAgents.clear()
+  }
 
   // A tool registered AFTER the agent was created is not covered by the
   // restriction applied at creation time, so re-derive the deny list whenever
-  // the global tool set changes. The unchanged-list guard keeps this from
-  // looping on the `tools/change` that `restrict()` itself emits.
+  // the global tool set changes. Every event this policy did not emit itself
+  // invalidates all proofs first; the actual recompute is deferred to the
+  // outermost pass so a re-entry can never leave a stale proof readable.
   ctx.on('tools/change', () => {
-    // Count first: the attribution window compares this across its own install,
-    // and a third-party listener may run after this one inside the same emit.
-    toolsChangeCount += 1
-    reapplyOnDemandRestrictions()
+    toolChangeEpoch += 1
+    if (ownMutationDepth > 0) return
+    invalidateAllProofs()
+    for (const agent of restrictedAgents) dirtyAgents.add(agent)
+    runReapply()
   })
 
   // Disabled capabilities are a hard deny at the execution surface, not just a

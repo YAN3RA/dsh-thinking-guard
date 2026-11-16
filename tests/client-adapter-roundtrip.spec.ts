@@ -112,3 +112,104 @@ describe('wire output is accepted by the client adapter', () => {
     }
   })
 })
+describe('TG-09: the new progress and scheduler fields survive the real wire', () => {
+  const STATUS_BASE = {
+    ...META,
+    censusGeneration: 1,
+    phase: 'partial' as const,
+    eventCoverage: 'partial' as const,
+    enumerationCoverage: 'complete' as const,
+    listedSessions: 2, visibleSessions: 2, completedSessions: 1,
+    pendingSessions: 1, failedSessions: 0, pendingLive: 0,
+    estimatedBytes: 4096, reasons: ['scan-budget'], totals: SUMMARY,
+    scope: { status: 'ready', mode: 'host-visible', scope: 'host-visible', includesOtherProfiles: true, epoch: 1 },
+  }
+
+  it('round-trips per-pass progress, capacity pause and the scheduler state', () => {
+    const wire = roundTrip('status', {
+      ...STATUS_BASE,
+      passReadEvents: 57344, passReadSessions: 28, passPages: 28, passCut: 2048,
+      scannedEvents: 57344, paused: true,
+      auto: { state: 'scheduled', round: 7 },
+    })
+    const mapped = mapIndexStatus(wire)
+    expect(mapped.ok, mapped.ok ? '' : JSON.stringify(mapped.error)).toBe(true)
+    if (!mapped.ok) return
+    expect(mapped.value.passReadEvents).toBe(57344)
+    expect(mapped.value.passReadSessions).toBe(28)
+    expect(mapped.value.passPages).toBe(28)
+    expect(mapped.value.passCut).toBe(2048)
+    expect(mapped.value.scannedEvents).toBe(57344)
+    expect(mapped.value.paused).toBe(true)
+    expect(mapped.value.auto).toEqual({ state: 'scheduled', round: 7 })
+  })
+
+  it('keeps an old Host readable when every new field is absent', () => {
+    const wire = roundTrip('status', STATUS_BASE)
+    const mapped = mapIndexStatus(wire)
+    expect(mapped.ok).toBe(true)
+    if (!mapped.ok) return
+    // Absent must stay absent: a fabricated 0 would claim "this pass read nothing".
+    expect(mapped.value.passReadEvents).toBeUndefined()
+    expect(mapped.value.scannedEvents).toBeUndefined()
+    expect(mapped.value.paused).toBeUndefined()
+    expect(mapped.value.auto).toBeUndefined()
+  })
+
+  it('accepts every automatic-scheduler state the wire can emit', () => {
+    for (const state of ['idle', 'scheduled', 'running', 'stopped'] as const) {
+      const wire = roundTrip('status', { ...STATUS_BASE, auto: { state, round: 1 } })
+      const mapped = mapIndexStatus(wire)
+      expect(mapped.ok, 'adapter rejected auto.state=' + state).toBe(true)
+      if (mapped.ok) expect(mapped.value.auto?.state).toBe(state)
+    }
+  })
+
+  it('never lets the new fields carry scope, backend or token identity', () => {
+    const wire = roundTrip('status', {
+      ...STATUS_BASE,
+      passReadEvents: 1, passReadSessions: 1, passPages: 1, passCut: 1, scannedEvents: 1, paused: false,
+      auto: { state: 'running', round: 1 },
+    })
+    const text = JSON.stringify(wire)
+    // The only scope identity on the wire is the numeric epoch the status schema
+    // already declares; the new progress fields must add none of their own.
+    expect(text).not.toMatch(/backend|token|secret/i)
+    expect(JSON.stringify(wire.data?.auto)).toBe('{"state":"running","round":1}')
+    expect(Object.keys((wire.data ?? {}) as Record<string, unknown>).sort()).toEqual(
+      expect.arrayContaining(['passReadEvents', 'scannedEvents', 'auto', 'paused']),
+    )
+  })
+})
+
+describe('rework roundtrip: exhaustion and per-revision progress survive the wire', () => {
+  const BASE = {
+    ...META, censusGeneration: 1, phase: 'partial' as const,
+    eventCoverage: 'partial' as const, enumerationCoverage: 'complete' as const,
+    listedSessions: 1, visibleSessions: 1, completedSessions: 0,
+    pendingSessions: 0, failedSessions: 0, pendingLive: 0,
+    estimatedBytes: 512, reasons: ['event-count-underreported'], totals: SUMMARY,
+    scope: { status: 'ready', mode: 'host-visible', scope: 'host-visible', includesOtherProfiles: true, epoch: 1 },
+  }
+
+  it('carries exhaustedSessions and progressEvents into the view', () => {
+    const wire = roundTrip('status', { ...BASE, exhaustedSessions: 1, progressEvents: 25 })
+    const mapped = mapIndexStatus(wire)
+    expect(mapped.ok).toBe(true)
+    if (!mapped.ok) return
+    expect(mapped.value.exhaustedSessions).toBe(1)
+    expect(mapped.value.progressEvents).toBe(25)
+    // The census mirrors it so the page can tell read-complete from unfinished.
+    expect(mapped.value.sessions.exhausted).toBe(1)
+  })
+
+  it('keeps them absent on an older Host instead of inventing a read-complete claim', () => {
+    const wire = roundTrip('status', BASE)
+    const mapped = mapIndexStatus(wire)
+    expect(mapped.ok).toBe(true)
+    if (!mapped.ok) return
+    expect(mapped.value.exhaustedSessions).toBeUndefined()
+    expect(mapped.value.progressEvents).toBeUndefined()
+    expect(mapped.value.sessions.exhausted).toBeUndefined()
+  })
+})

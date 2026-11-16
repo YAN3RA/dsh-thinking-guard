@@ -357,3 +357,100 @@ describe('formal call-index Host runtime', () => {
     await h.dispose()
   })
 })
+
+// ---------------------------------------------------------------------------
+// TG-09: the automatic scheduler must be observable BETWEEN passes
+// ---------------------------------------------------------------------------
+describe('TG-09: automatic scheduler state and real progress', () => {
+  it('exposes a scheduled follow-up pass instead of a terminal-looking gap', async () => {
+    const h = host(), f = fixture()
+    f.add()
+    f.add()
+    h.services.set('sessionPersistence', f.backend)
+    // A budget smaller than one Session forces a partial pass and a follow-up.
+    const runtime = installCallIndexRuntime(h.ctx, { autoIndexDelayMs: 0, maxEventsPerRun: 2 }, h.options)
+    // Between passes the scheduler is 'scheduled' or 'running', never silently idle.
+    await vi.waitFor(() => {
+      const status = data(runtime.getIndexStatus())
+      const auto = status.auto as { state: string } | undefined
+      expect(auto === undefined ? 'missing' : auto.state).not.toBe('missing')
+    }, { timeout: 4000 })
+    await h.dispose()
+  })
+
+  it('marks the task partial, not complete, when a pass stops on its budget', async () => {
+    const h = host(), f = fixture()
+    f.add(); f.add(); f.add()
+    h.services.set('sessionPersistence', f.backend)
+    const runtime = installCallIndexRuntime(h.ctx, { autoIndex: false, maxEventsPerRun: 2 }, h.options)
+    const reply = runtime.startIndex()
+    expect(reply.ok).toBe(true)
+    await runtime.whenIdle()
+    const status = data(runtime.getIndexStatus())
+    const task = status.task as { phase: string }
+    // The pass really did stop early: calling it 'complete' is the false-complete
+    // that hid owed work from the operator.
+    expect(task.phase).toBe('partial')
+    expect(status.pendingSessions as number).toBeGreaterThan(0)
+    await h.dispose()
+  })
+
+  it('publishes what a bounded pass read instead of reporting a silent zero', async () => {
+    const h = host(), f = fixture()
+    for (let i = 0; i < 5; i++) f.add()
+    h.services.set('sessionPersistence', f.backend)
+    const runtime = installCallIndexRuntime(h.ctx, { autoIndex: false, maxEventsPerRun: 2 }, h.options)
+    runtime.startIndex({ mode: 'full' })
+    await runtime.whenIdle()
+    const status = data(runtime.getIndexStatus())
+    expect(status.passReadEvents as number).toBeGreaterThan(0)
+    expect(status.scannedEvents as number).toBeGreaterThan(0)
+    // And the rows that were read are actually servable.
+    const page = data(runtime.listCalls({ limit: 5 }))
+    expect((page.items as unknown[]).length).toBeGreaterThan(0)
+    await h.dispose()
+  })
+})
+
+describe('rework 4: the scheduler never lies about being scheduled', () => {
+  it('stops when the scope is disabled mid-flight instead of staying scheduled', async () => {
+    const h = host(), f = fixture()
+    h.services.set('sessionPersistence', f.backend)
+    const config: CallIndexRuntimeConfig = { autoIndexDelayMs: 0 }
+    const runtime = installCallIndexRuntime(h.ctx, config, h.options)
+    await vi.waitFor(() => expect(f.backend.list).toHaveBeenCalled(), { timeout: 4000 })
+    await runtime.whenIdle()
+    config.scope = 'disabled'
+    // Reading the status resolves the new scope; the scheduler must terminate.
+    const status = data(runtime.getIndexStatus())
+    const auto = status.auto as { state: string }
+    expect(auto.state).toBe('stopped')
+    expect(h.timers.size).toBe(0)
+    await h.dispose()
+  })
+
+  it('reaches a terminal stopped state once the corpus is fully indexed', async () => {
+    const h = host(), f = fixture()
+    h.services.set('sessionPersistence', f.backend)
+    const runtime = installCallIndexRuntime(h.ctx, { autoIndexDelayMs: 0 }, h.options)
+    await vi.waitFor(() => expect(f.backend.list).toHaveBeenCalled(), { timeout: 4000 })
+    await runtime.whenIdle()
+    // Give the follow-up decision one turn to run.
+    await vi.waitFor(() => {
+      const auto = data(runtime.getIndexStatus()).auto as { state: string }
+      expect(auto.state).toBe('stopped')
+    }, { timeout: 4000 })
+    expect(h.timers.size).toBe(0)
+    await h.dispose()
+  })
+
+  it('does not leave a scheduled state behind when autoIndex is turned off', async () => {
+    const h = host(), f = fixture()
+    h.services.set('sessionPersistence', f.backend)
+    const runtime = installCallIndexRuntime(h.ctx, { autoIndex: false }, h.options)
+    const auto = data(runtime.getIndexStatus()).auto as { state: string }
+    expect(auto.state).toBe('idle')
+    expect(h.timers.size).toBe(0)
+    await h.dispose()
+  })
+})

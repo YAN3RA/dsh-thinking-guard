@@ -112,6 +112,32 @@ const guardSwitchesPatch$schema = z.object({
   repeatThresholds: z.array(z.number()).optional(),
 })
 
+/**
+ * Fixed diagnostic codes. The wire carries codes only: an exception message
+ * could contain a path, a tool argument or a result fragment, and none of that
+ * belongs in a settings-page payload.
+ */
+export type GuardDiagnosticReason = 'invalid-patch' | 'not-mounted'
+
+/** Mirror of `GuardDiagnostics` in policy.ts. */
+export interface GuardDiagnostics {
+  readonly available: boolean
+  readonly reasons: readonly GuardDiagnosticReason[]
+  readonly persistence: {
+    readonly dirty: boolean
+    readonly lastErrorCode?: 'write-failed'
+  }
+}
+
+const guardDiagnostics$schema = z.object({
+  available: z.boolean(),
+  reasons: z.array(z.union([z.literal('invalid-patch'), z.literal('not-mounted')])),
+  persistence: z.object({
+    dirty: z.boolean(),
+    lastErrorCode: z.union([z.literal('write-failed')]).optional(),
+  }),
+})
+
 const guardStats$schema = z.object({
   observations: z.number(),
   reminders: z.object({ repeat: z.number(), cycle: z.number() }),
@@ -339,6 +365,13 @@ const searchMetadataUpdate$schema = z.object({
   description: z.string(),
 })
 
+const capabilityClass$schema = z.union([z.literal('resident'), z.literal('on-demand'), z.literal('disabled')])
+const moveCapabilities$schema = z.object({
+  kind: z.union([z.literal('tool'), z.literal('skill')]),
+  ids: z.array(z.string()),
+  target: capabilityClass$schema,
+})
+
 declare module '@deepseek-ai/dsh-typert-protocol' {
   interface TypertRemoteNamespace$6361706162696c697479506f6c696379 {
     checkSelfUpdate: () => Promise<RemoteResult<SelfUpdateStatus>>
@@ -346,6 +379,11 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
     switchSelfToNpm: (version: string) => Promise<RemoteResult<void>>
     getConfig: () => Promise<RemoteResult<Record<string, unknown>>>
     updateConfig: (partial: Record<string, unknown>) => Promise<RemoteResult<void>>
+    moveCapabilities: (request: {
+      kind: 'tool' | 'skill'
+      ids: readonly string[]
+      target: 'resident' | 'on-demand' | 'disabled'
+    }) => Promise<RemoteResult<void>>
     classifyAll: () => Promise<RemoteResult<CapabilityRow[]>>
     getDiagnostics: () => Promise<RemoteResult<CapabilityDiagnostics>>
     refresh: () => Promise<RemoteResult<void>>
@@ -374,6 +412,11 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
     'capabilityPolicy/switchSelfToNpm': (version: string) => Promise<RemoteResult<void>>
     'capabilityPolicy/getConfig': () => Promise<RemoteResult<Record<string, unknown>>>
     'capabilityPolicy/updateConfig': (partial: Record<string, unknown>) => Promise<RemoteResult<void>>
+    'capabilityPolicy/moveCapabilities': (request: {
+      kind: 'tool' | 'skill'
+      ids: readonly string[]
+      target: 'resident' | 'on-demand' | 'disabled'
+    }) => Promise<RemoteResult<void>>
     'capabilityPolicy/classifyAll': () => Promise<RemoteResult<CapabilityRow[]>>
     'capabilityPolicy/getDiagnostics': () => Promise<RemoteResult<CapabilityDiagnostics>>
     'capabilityPolicy/refresh': () => Promise<RemoteResult<void>>
@@ -447,6 +490,16 @@ export const TYPERT_REMOTE: TypertRemoteContribution = {
       sourceLocation: { file: 'src/server/remote.ts', line: 67, column: 3 },
     },
     {
+      id: 'dsh-thinking-guard#capabilityPolicy/moveCapabilities',
+      service: 'capabilityPolicy', namespace: 'capabilityPolicy', method: 'moveCapabilities',
+      invocation: { kind: 'direct' },
+      parameters: [{
+        name: 'request', wire: 'request', source: 'json',
+        codec: strictCodec('MoveCapabilitiesRequest', moveCapabilities$schema),
+      }],
+      result: strictCodec('void', z.undefined()),
+    },
+    {
       id: 'dsh-thinking-guard#capabilityPolicy/getGuard',
       service: 'capabilityPolicy', namespace: 'capabilityPolicy', method: 'getGuard',
       invocation: { kind: 'direct' }, parameters: [],
@@ -457,6 +510,12 @@ export const TYPERT_REMOTE: TypertRemoteContribution = {
       service: 'capabilityPolicy', namespace: 'capabilityPolicy', method: 'getGuardStats',
       invocation: { kind: 'direct' }, parameters: [],
       result: strictCodec('GuardStatsSnapshot', guardStats$schema),
+    },
+    {
+      id: 'dsh-thinking-guard#capabilityPolicy/getGuardDiagnostics',
+      service: 'capabilityPolicy', namespace: 'capabilityPolicy', method: 'getGuardDiagnostics',
+      invocation: { kind: 'direct' }, parameters: [],
+      result: strictCodec('GuardDiagnostics', guardDiagnostics$schema),
     },
     {
       id: 'dsh-thinking-guard#capabilityPolicy/updateGuard',

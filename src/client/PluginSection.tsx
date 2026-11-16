@@ -24,9 +24,9 @@ import {
   CallIndexDetailPanel,
   CallIndexDiagnostics,
   CallIndexOverviewPanel,
-  MAX_AUTO_PAGES,
-  callIndexToolRows,
+  callIndexScanActive,
   createCallIndexPanelApi,
+  type CallIndexCallPageView,
   type CallIndexPanelApi,
   type CallIndexPanelFailure,
   type CallIndexRemoteFace,
@@ -129,6 +129,8 @@ export type PluginSectionKey =
   | 'guardStatsSince'
   | 'guardThresholdsEditableHint'
   | 'guardThresholdsFixedHint'
+  | 'guardThresholdSave'
+  | 'guardThresholdDraftHint'
   | 'recentCalls'
   | 'tierSummary'
   | 'attention'
@@ -185,6 +187,156 @@ const CATEGORY_KEYS: Readonly<Record<PluginCategory, PluginSectionKey>> = {
   usage: 'tabUsage',
 }
 
+// ── TG-10: 工具目录调用统计（有界读取也要如实） ──────────────────
+//
+// The catalog shows a per-tool call count beside each capability. The count is
+// built by paging the call index, but a bounded read is NOT a complete census:
+// stopping on a page cap (or reading a partial corpus, or dropping rows) must
+// never be rendered as an exact zero for the tools that were simply never
+// reached. Because the catalog prop can only carry observed counts, an
+// incomplete read is published as `undefined` (the page's honest 「—」), never as
+// a zero-filled map.
+
+/** Hard safety cap on catalog usage pages (page size 50 → 10k calls). */
+export const CATALOG_USAGE_MAX_PAGES = 200
+
+/** Completeness facts for one catalog usage read; kept for tests/diagnostics. */
+export interface CatalogUsageCompleteness {
+  readonly complete: boolean
+  readonly readCalls: number
+  readonly total?: number
+  readonly hasMore: boolean
+  readonly truncated: boolean
+  readonly dropped: number
+}
+
+export interface CatalogUsageAggregation {
+  /** Observed per-tool counts, or `undefined` when the read is not complete. */
+  readonly usage?: ReadonlyMap<string, CatalogUsage>
+  readonly completeness: CatalogUsageCompleteness
+}
+
+/**
+ * Aggregate the successfully read pages of one catalog usage pass.
+ *
+ * Only a read that is complete in EVERY sense is published as exact per-tool
+ * counts: the cursor was exhausted, every page reported `complete` coverage,
+ * no page admitted a dropped (allowlist-rejected) row, `totalExact` was never
+ * `false`, and the rows read equal the Host's `total`. Anything less stays
+ * unknown — a missing entry means "not observed", not "zero calls".
+ */
+export function summarizeCatalogUsage(
+  pages: readonly CallIndexCallPageView[],
+  options: { readonly truncated?: boolean } = {},
+): CatalogUsageAggregation {
+  const truncated = options.truncated === true
+  let readCalls = 0
+  let dropped = 0
+  let coverageComplete = true
+  let exact = true
+  let last: CallIndexCallPageView | undefined
+  const totals = new Map<string, { uses: number; failures: number }>()
+  for (const page of pages) {
+    last = page
+    readCalls += page.items.length
+    dropped += page.droppedItems
+    if (page.coverage !== 'complete') coverageComplete = false
+    if (page.totalExact === false) exact = false
+    for (const row of page.items) {
+      const entry = totals.get(row.toolName) ?? { uses: 0, failures: 0 }
+      entry.uses += 1
+      if (row.outcome === 'error') entry.failures += 1
+      totals.set(row.toolName, entry)
+    }
+  }
+  const total = last?.total
+  const hasMore = truncated || (last !== undefined && last.nextCursor !== undefined)
+  const totalConsistent = total === undefined || readCalls === total
+  const complete = pages.length > 0 && !hasMore && coverageComplete && exact && dropped === 0 && totalConsistent
+  const usage = complete
+    ? new Map<string, CatalogUsage>(
+        [...totals.entries()].map(([toolName, entry]) => [toolName, {
+          uses: entry.uses,
+          ...(entry.failures > 0 ? { failures: entry.failures } : {}),
+        }]),
+      )
+    : undefined
+  return {
+    usage,
+    completeness: {
+      complete,
+      readCalls,
+      ...(total === undefined ? {} : { total }),
+      hasMore,
+      truncated,
+      dropped,
+    },
+  }
+}
+
+// ── TG-12: 共享索引状态轮询（单飞 + 失败恢复 + 终态降频） ──────────
+//
+// One shell timer polls index health for the shared diagnostic box. It must
+// never start a second overlapping request, must keep polling after a failure
+// (bounded backoff) and after the scan reaches a terminal state (slower, so a
+// later task / live event is still noticed) — the old version stopped forever
+// on the first failure or the first non-scanning tick.
+
+export const INDEX_STATUS_POLL_SCANNING_MS = 3000
+export const INDEX_STATUS_POLL_IDLE_MS = 15000
+export const INDEX_STATUS_POLL_ERROR_BASE_MS = 3000
+export const INDEX_STATUS_POLL_ERROR_MAX_MS = 30000
+
+/**
+ * Is the index ACTUALLY working right now? (Seventh batch: one definition.)
+ *
+ * This used to be a second, private definition —
+ * `phase === 'running' || pending > 0 || pendingLive > 0` — while 调用明细 used
+ * `callIndexScanActive`. The two disagreed exactly where it hurt: under a
+ * capacity pause (`paused: true`) or with only a leftover backlog the detail
+ * page had already settled into its terminal story (「可恢复」, 15s cadence) while
+ * this shared diagnostic box kept a 3s timer spinning forever, re-reading a
+ * status that could not change.
+ *
+ * There is now ONE predicate, owned by the call-index surface: a backlog is owed
+ * work, not activity; a pause is terminal-but-resumable; without a readable
+ * scope there is no corpus to scan; and when the Host reports a scheduler its
+ * state is the whole answer (`scheduled`/`running` = active, `idle`/`stopped` =
+ * not). An older Host that sends no `auto` keeps the conservative reading: only
+ * `phase: 'running'` may claim activity — so a live queue alone slows the shared
+ * timer to 15s instead of pretending a scan is running. That delay is the
+ * accepted cost: a scan that starts on such a Host is noticed on the next
+ * terminal tick (≤15s), never never.
+ *
+ * The name is kept (and exported) because it is the poll policy's vocabulary and
+ * the suite drives it directly; the SIGNATURE is widened to accept `undefined`
+ * because the container's first tick may have no status yet.
+ */
+export function isIndexScanning(status: CallIndexStatusView | undefined): boolean {
+  return callIndexScanActive(status)
+}
+
+/**
+ * Delay before the next shared status poll.
+ *
+ * Scanning → fast cadence; terminal → slow cadence (keep watching, never stop);
+ * failure → capped exponential backoff so a broken Host is retried instead of
+ * being abandoned.
+ */
+export function indexStatusPollDelay(
+  result: { ok: true; value: CallIndexStatusView } | { ok: false },
+  consecutiveErrors: number,
+): number {
+  if (result.ok) return isIndexScanning(result.value) ? INDEX_STATUS_POLL_SCANNING_MS : INDEX_STATUS_POLL_IDLE_MS
+  const exponent = Math.max(0, consecutiveErrors - 1)
+  return Math.min(INDEX_STATUS_POLL_ERROR_MAX_MS, INDEX_STATUS_POLL_ERROR_BASE_MS * 2 ** exponent)
+}
+
+/** Whether a scan→terminal transition should re-read the catalog usage once. */
+export function shouldReloadCatalog(previousScanning: boolean | undefined, nextScanning: boolean): boolean {
+  return previousScanning === true && nextScanning === false
+}
+
 /**
  * Memo of `createCallIndexPanelApi` keyed by provider identity.
  *
@@ -230,53 +382,70 @@ export function PluginSection(props: PluginSectionProps): ReactElement {
   /** Bumped when a scan finishes, so the catalog's usage map is re-read once. */
   const [usageToken, setUsageToken] = useState(0)
   useEffect(() => {
-    // Poll while a scan is running and re-read the catalog usage when it ends.
-    // A single mount-time read (the previous behaviour) froze BOTH the shared
-    // diagnostic box and the catalog counts at whatever the index held 1.5s
-    // after mount — so a later scan failure looked healthy and every "N 次"
-    // stayed at its first-page value.
+    // One single-flight status stream for the shared diagnostic box.
+    //
+    // TG-12: the previous version returned on the first failure and stopped
+    // forever after the first terminal tick, so a later scan failure looked
+    // healthy and the catalog never refreshed again. Now the timer is only
+    // re-armed AFTER an awaited tick (single-flight, never overlapping), a
+    // failure retries with capped backoff, and a terminal scan slows down but
+    // keeps watching for a next task / live event.
     let live = true
     let timer: ReturnType<typeof setTimeout> | undefined
+    let consecutiveErrors = 0
+    let previousScanning: boolean | undefined
+    const schedule = (delay: number): void => {
+      if (!live) return
+      if (timer !== undefined) clearTimeout(timer)
+      timer = setTimeout(() => { void tick() }, delay)
+    }
     const tick = async (): Promise<void> => {
       const result = await callIndexApi.getStatus()
       if (!live) return
-      setDiagnostics(result.ok ? { status: result.value } : { failure: result })
-      if (!result.ok) return
-      const scanning = result.value.phase === 'running'
-        || (result.value.sessions?.pending ?? 0) > 0
-        || (result.value.sessions?.pendingLive ?? 0) > 0
-      if (scanning) { timer = setTimeout(() => { void tick() }, 3000); return }
-      setUsageToken(value => value + 1)
+      if (result.ok) {
+        consecutiveErrors = 0
+        const scanning = isIndexScanning(result.value)
+        setDiagnostics({ status: result.value })
+        // Re-read the catalog exactly once, on the scan→terminal edge.
+        if (shouldReloadCatalog(previousScanning, scanning)) setUsageToken(value => value + 1)
+        previousScanning = scanning
+      } else {
+        consecutiveErrors += 1
+        setDiagnostics({ failure: result })
+      }
+      schedule(indexStatusPollDelay(result, consecutiveErrors))
     }
     void tick()
     return () => { live = false; if (timer !== undefined) clearTimeout(timer) }
   }, [callIndexApi])
   useEffect(() => {
-    // Read EVERY page of the same pinned window, not just the first 50 calls:
+    // Read EVERY page of the same pinned window, never just the first 50 calls:
     // a first-page-only map under-counts large corpora and reports "0 calls" for
-    // tools that simply fell off page one. Bounded by MAX_AUTO_PAGES like the
-    // detail table; a failure leaves the map undefined, which the catalog renders
-    // as `—`, never as a fabricated zero.
+    // tools that simply fell off page one.
+    //
+    // TG-10: a bounded read is not a census. If the pass hits the safety page
+    // cap, reads a partially-scanned corpus, drops an allowlist-rejected row, or
+    // cannot reconcile the row count with the Host total, `summarizeCatalogUsage`
+    // returns NO map, so the catalog shows 「—」 for every row instead of a
+    // fabricated zero for tools that were never reached. A read failure likewise
+    // clears the map rather than leaving stale counts.
     let live = true
     const anchor = Date.now()
     void (async () => {
-      const map = new Map<string, CatalogUsage>()
+      const pages: CallIndexCallPageView[] = []
       let cursor: string | undefined
-      for (let pages = 0; pages < MAX_AUTO_PAGES; pages += 1) {
+      let truncated = false
+      for (let index = 0; index < CATALOG_USAGE_MAX_PAGES; index += 1) {
         const result = await callIndexApi.listCalls({ range: 'all' }, cursor, anchor)
         if (!live) return
-        if (!result.ok) return
-        for (const row of callIndexToolRows(result.value)) {
-          const previous = map.get(row.toolName)
-          map.set(row.toolName, {
-            uses: (previous?.uses ?? 0) + row.calls,
-            failures: (previous?.failures ?? 0) + row.error,
-          })
-        }
+        if (!result.ok) { setCatalogUsage(undefined); return }
+        pages.push(result.value)
         cursor = result.value.nextCursor
         if (cursor === undefined) break
+        if (index === CATALOG_USAGE_MAX_PAGES - 1) truncated = true
       }
-      setCatalogUsage(map)
+      if (!live) return
+      setCatalogUsage(summarizeCatalogUsage(pages, { truncated }).usage)
     })()
     return () => { live = false }
   }, [callIndexApi, usageToken])
@@ -382,7 +551,9 @@ export function PluginSectionView(props: PluginSectionViewProps): ReactElement {
     panel('overview', callIndexRemote === undefined && usageApi !== undefined
       ? createElement(OverviewContainer, { t, usageApi, guardRemote, policyRemote: guardRemote })
       : createElement(CallIndexOverviewPanel, { api: callIndexApi })),
-    panel('guard', createElement(GuardContainer, { t, remote: guardRemote, duplicateThresholds: [3, 5, 8] })),
+    // Only the visible 执行保护 tab polls its counters; the other tabs tell the
+    // container to stay quiet so no timer runs while it is hidden.
+    panel('guard', createElement(GuardContainer, { t, remote: guardRemote, duplicateThresholds: [3, 5, 8], active: active === 'guard' })),
     panel('catalog', createElement(CapabilitySection, {
       ...capability,
       ...(catalogUsage === undefined ? {} : { usage: catalogUsage }),

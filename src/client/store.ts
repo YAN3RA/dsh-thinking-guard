@@ -50,8 +50,20 @@ export interface CapabilityPolicyRemote {
   switchSelfToNpm(version: string): Promise<{ ok: true; value: void } | { ok: false; error: { code: string; message: string } }>
   getConfig(): Promise<{ ok: true; value: Record<string, unknown> } | { ok: false; error: { code: string; message: string } }>
   updateConfig(partial: Record<string, unknown>): Promise<{ ok: true; value: void } | { ok: false; error: { code: string; message: string } }>
+  /**
+   * Optional TG-05 intent move. An older Host has no such method; the section
+   * then makes tier editing read-only instead of falling back to a whole-table
+   * `updateConfig` write.
+   */
+  moveCapabilities?(request: {
+    kind: 'tool' | 'skill'
+    ids: readonly string[]
+    target: 'resident' | 'on-demand' | 'disabled'
+  }): Promise<{ ok: true; value: void } | { ok: false; error: { code: string; message: string } }>
   getGuard?(): Promise<{ ok: true; value: import('./remote.ts').GuardSwitches } | { ok: false; error: { code: string; message: string } }>
   updateGuard?(change: Partial<import('./remote.ts').GuardSwitches>): Promise<{ ok: true; value: void } | { ok: false; error: { code: string; message: string } }>
+  /** Optional: an older Host has no Guard diagnostics, and the page then omits the banner. */
+  getGuardDiagnostics?(): Promise<{ ok: true; value: import('./remote.ts').GuardDiagnostics } | { ok: false; error: { code: string; message: string } }>
   classifyAll(): Promise<{ ok: true; value: CapabilityRow[] } | { ok: false; error: { code: string; message: string } }>
   getDiagnostics?(): Promise<{ ok: true; value: CapabilityDiagnostics } | { ok: false; error: { code: string; message: string } }>
   refresh(): Promise<{ ok: true; value: void } | { ok: false; error: { code: string; message: string } }>

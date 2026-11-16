@@ -446,6 +446,50 @@ const statusDataSchema = z.object({
    */
   declaredEvents: z.number().int().min(0).optional(),
   readEvents: z.number().int().min(0).optional(),
+  /**
+   * Per-pass progress, kept apart from the cumulative pair above.
+   *
+   * TG-08's report was "read 57344 events / published 0 / readEvents: 0": the
+   * cumulative counters cannot describe a pass, so "we are working" and "we have
+   * retained nothing yet" were indistinguishable. These are plain counters — no
+   * ids, no content, no scope/backend identity — and every one is optional so an
+   * older Host still answers.
+   */
+  passReadEvents: z.number().int().min(0).optional(),
+  passReadSessions: z.number().int().min(0).optional(),
+  passPages: z.number().int().min(0).optional(),
+  /** Highest verified cut this pass reached, in events. */
+  passCut: z.number().int().min(0).optional(),
+  /**
+   * Monotone forward-scanned events across the whole index (published cuts +
+   * in-flight stage cursors). The scheduler's progress signal.
+   */
+  scannedEvents: z.number().int().min(0).optional(),
+  /** True when the last pass stopped on a capacity reservation (resumable). */
+  paused: z.boolean().optional(),
+  /**
+   * Sessions read through EOF, INDEPENDENT of coverage.
+   *
+   * A backend that under-reports its event count produces a legitimate partial
+   * coverage while the log really was read to its end. Without this field that
+   * Session counts as never-complete, and a fully read corpus reports
+   * no-indexable-session with pending 0.
+   */
+  exhaustedSessions: z.number().int().min(0).optional(),
+  /**
+   * Verified forward progress of the last pass, in events, within a stable
+   * revision. A Host-internal comparison result: no revision, scope or backend
+   * identity is exposed.
+   */
+  progressEvents: z.number().int().min(0).optional(),
+  /**
+   * Automatic scheduler state: whether a follow-up pass is queued right now.
+   * Distinct from `phase` (the scan) and `coverage` (the data).
+   */
+  auto: z.object({
+    state: z.enum(['idle', 'scheduled', 'running', 'stopped']),
+    round: z.number().int().min(0),
+  }).optional(),
   visibleSessions: z.number().int().min(0),
   completedSessions: z.number().int().min(0),
   pendingSessions: z.number().int().min(0),

@@ -564,3 +564,125 @@ describe('callIndex summary aggregates (A0-1)', () => {
     expect(handle.snapshotCalls()).toBe(1)
   })
 })
+
+// ── TG-12：查询成本、详情复用与长数据边界 ──────────────────────────
+describe('callIndex query cost and detail generation (TG-12)', () => {
+  it('reuses the caller calls view for a detail read instead of capturing a fifth (no V5)', () => {
+    return (async () => {
+      const rows = Array.from({ length: 4 }, (_, i) => callRow({ callSeq: i + 1, startedAt: 4000 - i }))
+      const handle = makeSource(snapshot({ rows }))
+      const queries = new CallIndexQueries(handle.source)
+      const page = queries.listCalls({ limit: 2 })
+      const snapshotId = (page.data as Dict).snapshotId as string
+      const afterList = handle.snapshotCalls()
+
+      // Three more captures fill the default 4-view pool without touching the calls view.
+      queries.getSummary({ query: { outcome: 'success' } })
+      queries.getSummary({ query: { outcome: 'success' } })
+      queries.getSummary({ query: { outcome: 'success' } })
+      const beforeDetail = handle.snapshotCalls()
+      expect(beforeDetail).toBe(afterList + 3)
+
+      handle.visible.add('s1')
+      const detail = await queries.getCallDetail({ sessionId: 's1', callSeq: 1 })
+      expect(detail.ok).toBe(true)
+      // The detail reuses the same frozen calls snapshot — no new capture.
+      expect((detail.data as Dict).snapshotId).toBe(snapshotId)
+      expect(handle.snapshotCalls()).toBe(beforeDetail)
+
+      // The original page cursor still resolves: the calls view was not evicted.
+      const cursor = (page.data as Dict).nextCursor as string
+      expect(queries.listCalls({ snapshotId, cursor }).ok).toBe(true)
+    })()
+  })
+
+  it('serves a narrow filter on a 10k corpus without the full-corpus capacity error', () => {
+    const rows = Array.from({ length: 10000 }, (_, i) => callRow({
+      sessionId: i === 0 ? 'hot' : 'cold' + i,
+      callSeq: i + 1,
+      startedAt: 1_000_000 - i,
+      toolName: 't' + 'x'.repeat(80),
+    }))
+    const handle = makeSource(snapshot({ rows }))
+    const queries = new CallIndexQueries(handle.source, { maxBytes: 200_000 })
+    // The whole corpus cannot be retained as one view …
+    expect(queries.getSummary({}).reason).toBe('query-capacity')
+    // … but a narrow query only pays for its matched rows, so it succeeds.
+    const narrow = queries.getSummary({ query: { sessionId: 'hot' } })
+    expect(narrow.ok).toBe(true)
+    expect((narrow.data as Dict).total).toBe(1)
+    expect(((narrow.data as Dict).summary as Dict).total).toBe(1)
+  })
+
+  it('paginates 10k rows from one ordered capture without re-sorting the corpus per page', () => {
+    const total = 10000
+    const rows = Array.from({ length: total }, (_, i) => callRow({ callSeq: i + 1, startedAt: 1_000_000 - i }))
+    const handle = makeSource(snapshot({ rows }))
+    const queries = new CallIndexQueries(handle.source, { maxBytes: 64 * 1024 * 1024 })
+
+    const originalSort = Array.prototype.sort
+    let largeSorts = 0
+    const patched = function patchedSort(this: unknown[], compareFn?: (a: unknown, b: unknown) => number): unknown[] {
+      if (this.length >= 5000) largeSorts += 1
+      return originalSort.call(this as unknown[], compareFn as never) as unknown[]
+    }
+    Array.prototype.sort = patched as typeof Array.prototype.sort
+    try {
+      const seen = new Set<number>()
+      let cursor: string | undefined
+      let snapshotId: string | undefined
+      let pages = 0
+      do {
+        const page = cursor === undefined
+          ? queries.listCalls({ limit: 200 })
+          : queries.listCalls({ cursor, limit: 200 })
+        expect(page.ok).toBe(true)
+        const data = page.data as Dict
+        if (snapshotId === undefined) snapshotId = data.snapshotId as string
+        expect(data.snapshotId).toBe(snapshotId)
+        expect(data.total).toBe(total)
+        for (const item of data.items as Dict[]) seen.add(item.callSeq as number)
+        cursor = data.nextCursor as string | undefined
+        pages += 1
+      } while (cursor !== undefined && pages < 200)
+      expect(seen.size).toBe(total)
+      expect(pages).toBe(50)
+      expect(handle.snapshotCalls()).toBe(1)
+      // Exactly one full-corpus sort: at capture. Pages are pure slices.
+      expect(largeSorts).toBe(1)
+    } finally {
+      Array.prototype.sort = originalSort
+    }
+  })
+
+  it('keeps a narrow query working with maximum-length identifiers', () => {
+    const longSession = 's'.repeat(512)
+    const rows = [
+      callRow({ sessionId: longSession, callSeq: 1, toolName: 't'.repeat(512), startedAt: 1000 }),
+      ...Array.from({ length: 50 }, (_, i) => callRow({ sessionId: 'other' + i, callSeq: 1, startedAt: 2000 - i })),
+    ]
+    const queries = new CallIndexQueries(makeSource(snapshot({ rows })).source)
+    const reply = queries.getSummary({ query: { sessionId: longSession } })
+    expect(reply.ok).toBe(true)
+    expect((reply.data as Dict).total).toBe(1)
+  })
+
+  it('reads a single detail on an oversized corpus by capturing only the Session view', () => {
+    return (async () => {
+      const rows = Array.from({ length: 10000 }, (_, i) => callRow({
+        sessionId: i === 0 ? 'hot' : 'cold' + i,
+        callSeq: i + 1,
+        startedAt: 1_000_000 - i,
+        toolName: 't' + 'x'.repeat(80),
+      }))
+      const handle = makeSource(snapshot({ rows }))
+      handle.visible.add('hot')
+      const queries = new CallIndexQueries(handle.source, { maxBytes: 200_000 })
+      // No prior page captured a view; the detail captures just this Session.
+      const detail = await queries.getCallDetail({ sessionId: 'hot', callSeq: 1 })
+      expect(detail.ok).toBe(true)
+      expect(((detail.data as Dict).detail as Dict).callSeq).toBe(1)
+      expect(handle.snapshotCalls()).toBe(1)
+    })()
+  })
+})

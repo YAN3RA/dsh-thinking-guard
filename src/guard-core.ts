@@ -372,13 +372,39 @@ export class GuardStateStore {
   }
 }
 
+/** Options that are live rather than fixed at construction time. */
+export interface EfficiencyGuardOptions {
+  /**
+   * Reads the live master switch on every call.
+   *
+   * The settings page can flip `enabled` without reloading the plugin, so a
+   * value captured at construction time splits the Guard in two: the hooks would
+   * honour the live switch while state creation kept honouring the stale patch
+   * value. Passing this makes `admitStep`/`observeTool` use the same switch the
+   * hooks use, so "off" really means no state and no reminders anywhere.
+   */
+  readonly isEnabled?: () => boolean
+}
+
 export class EfficiencyGuard {
   readonly config: GuardConfig
   readonly states: GuardStateStore
+  private readonly isEnabled?: () => boolean
 
-  constructor(config: Partial<GuardConfig> = {}, states = new GuardStateStore()) {
+  constructor(
+    config: Partial<GuardConfig> = {},
+    states = new GuardStateStore(),
+    options: EfficiencyGuardOptions = {},
+  ) {
     this.config = validateGuardConfig(config)
     this.states = states
+    this.isEnabled = options.isEnabled
+  }
+
+  /** The one master switch every entry point must consult. */
+  private get enabled(): boolean {
+    // A live reader wins; without one the constructed config is the only truth.
+    return this.isEnabled === undefined ? this.config.enabled : this.isEnabled()
   }
 
   resetLoopState(agent: object): void {
@@ -399,14 +425,14 @@ export class EfficiencyGuard {
   }
 
   admitStep(agent: object, turn: number, now = Date.now()): GuardDecision {
-    if (!this.config.enabled) return { kind: 'allow' }
+    if (!this.enabled) return { kind: 'allow' }
     const state = this.states.getOrBegin(agent, turn, now)
     state.modelSteps += 1
     state.lastActivityAt = now
     return { kind: 'allow' }
   }
   observeTool(agent: object, turn: number, observation: ToolCallObservation, now = Date.now()): void {
-    if (!this.config.enabled) return
+    if (!this.enabled) return
     const state = this.states.getOrBegin(agent, turn, now)
     if (observation.denied || observation.controlPlane) return
     state.businessToolCalls += 1

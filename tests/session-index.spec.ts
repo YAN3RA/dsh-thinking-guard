@@ -83,7 +83,12 @@ describe('new session call-index scanner', () => {
     expect(result.coverage).toBe('complete')
     expect(result.totals.calls).toBe(4)
     expect(f.reads.map(row => row.offset)).toEqual([0, 3, 6, 8])
-    expect(f.close).toHaveBeenCalledTimes(4)
+    // TG-07: ONE handle per Session slice, not one open/close per page. Rotating
+    // open/close per page is the documented root cause — it evicts the Host's
+    // two-entry log cache between multi-page logs and re-decodes the whole log
+    // (3x9 at page 4 measured 12 decodes instead of 3). The four page reads
+    // above are unchanged; only the handle count is.
+    expect(f.close).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(result)).not.toMatch(/argument-canary|output-canary/)
   })
 

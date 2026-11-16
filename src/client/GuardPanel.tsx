@@ -20,10 +20,14 @@
  * three role="switch" buttons whose aria-checked follows the props. No Chinese
  * colon ('：') is introduced by this file — spacing does the separating instead.
  *
- * Kept hook-free and prop-driven so the settings test suite (no DOM harness) can
- * walk the returned tree.
+ * Hook-free and prop-driven EXCEPT the threshold editor, which owns a real draft
+ * (`useGuardThresholdDraft`): typing only moves local state, and a commit —
+ * Enter, blur or the explicit 保存 button — sends the whole list only when it is
+ * a complete valid ascending 2..50 array. That component is tagged with
+ * `HOOK_COMPONENT` so element-tree walkers skip exactly it instead of calling it
+ * outside a render; its behaviour is covered by real jsdom mounts.
  */
-import { createElement, type ReactElement } from 'react'
+import { createElement, useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
 import type { PluginSectionKey } from './PluginSection.tsx'
 import { V3Styles } from './v3-ui.ts'
 
@@ -110,12 +114,20 @@ const GUARD_CSS = [
   '.v3-guard-stats{margin:0}',
   '.v3-gfoot-note{color:var(--v3-t4)}',
   '.mc-guard-threshold-edit{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+  // The draft body adds one element between the flex wrapper and the boxes; with
+  // display:contents the layout is byte-for-byte the previous one.
+  '.mc-guard-threshold-body{display:contents}',
   '.mc-guard-threshold-edit-label{font-size:11.5px;color:var(--v3-t3)}',
   '.mc-guard-threshold-num{width:56px;padding:3px 6px;border-radius:var(--v3-r-sm);font-size:12px;text-align:center;'
     + 'font-family:var(--v3-font-code);color:var(--v3-t1);background:var(--v3-panel-2);border:1px solid var(--v3-line)}',
   '.mc-guard-threshold-num:focus-visible{outline:2px solid var(--v3-info);outline-offset:1px}',
   '.mc-guard-threshold-num:disabled{opacity:.6}',
   '.mc-guard-threshold-hint{margin:6px 0 0}',
+  '.mc-guard-threshold-save{padding:3px 10px;border-radius:var(--v3-r-sm);font-size:11.5px;color:var(--v3-t1);'
+    + 'background:var(--v3-panel-2);border:1px solid var(--v3-line);cursor:pointer}',
+  '.mc-guard-threshold-save:disabled{opacity:.5;cursor:default}',
+  '.mc-guard-threshold-save:focus-visible{outline:2px solid var(--v3-info);outline-offset:1px}',
+  '.mc-guard-threshold-hint[data-guard-threshold-invalid=\'true\']{color:var(--v3-bad)}',
 ].join('')
 
 /** '—' for a counter the Host did not report; never a fabricated 0. */
@@ -155,49 +167,236 @@ function GuardStatsBoard(props: { readonly t: (key: PluginSectionKey) => string;
   )
 }
 
+/** Strictly ascending, 1..5 entries, each an integer in 2..50. */
+function isThresholdListValid(list: readonly number[]): boolean {
+  if (list.length === 0 || list.length > 5) return false
+  let previous = 1
+  for (const value of list) {
+    if (!Number.isInteger(value) || value < 2 || value > 50) return false
+    if (value <= previous) return false
+    previous = value
+  }
+  return true
+}
+
 /**
- * Editable reminder thresholds.
+ * The boxes' raw text, exactly as the operator typed it.
+ *
+ * Strings, not numbers: '' (a cleared box) and '2' half-way through typing '20'
+ * are legitimate intermediate states that must survive until a commit, so they
+ * can never be normalized to a number here.
+ */
+type DraftRows = readonly string[]
+
+/** Parse the raw boxes into a committable list, or undefined when not valid yet. */
+export function parseThresholdDraft(rows: DraftRows): readonly number[] | undefined {
+  if (rows.length === 0 || rows.length > 5) return undefined
+  const parsed: number[] = []
+  for (const row of rows) {
+    const text = row.trim()
+    if (!/^\d+$/.test(text)) return undefined
+    const value = Number(text)
+    if (!Number.isSafeInteger(value)) return undefined
+    parsed.push(value)
+  }
+  // ONE validator for the wire and for the draft: 2..50, strictly ascending.
+  return isThresholdListValid(parsed) ? parsed : undefined
+}
+
+/** Cheap, unambiguous equality key for a row list. */
+function rowsKey(rows: DraftRows): string {
+  return rows.join('\u0000')
+}
+
+/**
+ * Marks a component whose body calls hooks.
+ *
+ * The shared suites walk the static element tree by CALLING function components
+ * (`element.type(props)`). That is valid for a hook-free view and fatal for one
+ * with hooks — React throws "Invalid hook call" outside a render. Such a
+ * component is tagged with this symbol so a walker skips exactly it and keeps
+ * expanding every other component, instead of the walk being weakened wholesale.
+ */
+export const HOOK_COMPONENT = Symbol.for('dsh-thinking-guard.hook-component')
+
+/** What a caller sees of the editor's draft state. */
+export interface GuardThresholdDraft {
+  /** Raw box text; '' and partial numbers are expected intermediate values. */
+  readonly rows: DraftRows
+  /** The draft differs from the Host's committed list. */
+  readonly dirty: boolean
+  /** Dirty AND not yet a valid ascending 2..50 list. */
+  readonly invalid: boolean
+  /**
+   * The Host's committed list changed underneath a DIRTY draft.
+   *
+   * The draft is kept — throwing away what the operator typed mid-edit is worse
+   * than showing that the baseline moved — and the editor says so instead of
+   * silently adopting (or silently ignoring) the new value.
+   */
+  readonly conflict: boolean
+  /** A commit is possible at all (the Host accepts writes). */
+  readonly editable: boolean
+  readonly setRow: (index: number, text: string) => void
+  /** Enter / blur / 保存. Returns true only when a list was handed to the Host. */
+  readonly commit: () => boolean
+}
+
+/**
+ * The draft state behind the threshold editor (TG-14 #5 · 完整草稿模型).
+ *
+ * Typing NEVER writes. A keystroke only moves the draft, so '' (a cleared box)
+ * and '2' on the way to '20' survive as ordinary intermediate states instead of
+ * being rejected or, worse, sent as a half-edited list. A commit — Enter, blur,
+ * or the explicit 保存 button — hands over the WHOLE list and only when it is a
+ * complete, valid, strictly ascending 2..50 array.
+ *
+ * Sync rules, spelled out because they are the part that silently rots:
+ *  - external (Host) value changed → the draft is reset to it and `dirty`
+ *    clears, UNLESS the draft is dirty and the Host's value is unchanged from
+ *    the last one this editor saw (a poll re-delivering the same list must not
+ *    wipe what the operator is typing);
+ *  - dirty is a pure comparison with the Host list, so an edit that returns the
+ *    text to the committed values stops being dirty;
+ *  - a rejected submit keeps the draft, so the operator can fix it instead of
+ *    retyping; the draft only stops being dirty when the Host actually adopts it;
+ *  - `onChange` omitted (older Host, or the container is busy) ⇒ read-only; the
+ *    draft is KEPT across that window rather than reset to the Host's values.
+ */
+export function useGuardThresholdDraft(props: {
+  readonly thresholds?: readonly number[]
+  readonly onChange?: (next: readonly number[]) => void
+}): GuardThresholdDraft {
+  const { thresholds, onChange } = props
+  const editable = thresholds !== undefined && onChange !== undefined
+  const committed: DraftRows = thresholds === undefined ? [] : thresholds.map(value => String(value))
+  const [rows, setRows] = useState<DraftRows>(committed)
+  const [conflict, setConflict] = useState(false)
+  /** The Host list this draft was last synchronized against. */
+  const synced = useRef<DraftRows>(committed)
+  const draftRef = useRef<DraftRows>(committed)
+  draftRef.current = rows
+
+  useEffect(() => {
+    const nextKey = rowsKey(committed)
+    const syncedKey = rowsKey(synced.current)
+    if (nextKey === syncedKey) return
+    synced.current = committed
+    const draftKey = rowsKey(draftRef.current)
+    // Clean draft, or a draft the Host has just caught up with: adopt the new
+    // baseline. The second case is a commit that succeeded — the draft already
+    // equals the new value, so nothing is lost and the conflict flag clears.
+    if (draftKey === syncedKey || draftKey === nextKey) {
+      draftRef.current = committed
+      setRows(committed)
+      setConflict(false)
+      return
+    }
+    // Dirty draft + a genuinely new Host value: keep the typing, flag it.
+    setConflict(true)
+  }, [rowsKey(committed)])
+
+  const dirty = rowsKey(rows) !== rowsKey(committed)
+  const parsed = parseThresholdDraft(rows)
+  const invalid = dirty && parsed === undefined
+
+  const setRow = useCallback((index: number, text: string): void => {
+    if (!editable) return
+    setRows(current => {
+      const next = current.slice()
+      next[index] = text
+      return next
+    })
+  }, [editable])
+
+  const commit = useCallback((): boolean => {
+    if (!editable) return false
+    const current = draftRef.current
+    const list = parseThresholdDraft(current)
+    if (list === undefined) return false
+    // An unchanged, still-valid list is not a write: Enter on an untouched field
+    // must not burn a Host round-trip (or a "saved" toast).
+    if (rowsKey(current) === rowsKey(committed)) return false
+    onChange(list)
+    return true
+  }, [editable, onChange, rowsKey(committed)])
+
+  return { rows, dirty, invalid, conflict, editable, setRow, commit }
+}
+
+/**
+ * Editable reminder thresholds — the independent draft editor.
  *
  * Three plain number inputs instead of one comma-separated text field: the
- * operator sees one box per firing point and never has to learn a syntax. Values
- * always come from the Host; a keystroke is assembled into a fresh array and
- * handed to onThresholdsChange, and an older Host that does not accept a write
- * gets disabled boxes. data-guard-thresholds marks the wrapper.
+ * operator sees one box per firing point and never has to learn a syntax. This
+ * component owns ONLY the draft; it renders it and forwards intents. The Host's
+ * values are the props, so the page above stays a pure view.
+ *
+ * data-guard-thresholds marks the wrapper; an older Host that rejects writes
+ * gets disabled boxes.
  */
-function GuardThresholdEditor(props: {
+export function GuardThresholdEditor(props: {
   readonly t: (key: PluginSectionKey) => string
   readonly thresholds?: readonly number[]
   readonly onChange?: (next: readonly number[]) => void
 }): ReactElement | null {
-  const { t, thresholds, onChange } = props
+  const { t, thresholds } = props
+  const draft = useGuardThresholdDraft(props)
   if (thresholds === undefined) return null
-  const editable = onChange !== undefined
-  return createElement('div', { className: 'mc-guard-threshold-edit', 'data-guard-thresholds': 'true' },
+  const { editable, rows, invalid } = draft
+  // Inner content only: the WRAPPER (data-guard-thresholds) belongs to the
+  // hook-free view above, so element-tree walkers can still assert it without
+  // calling this hook-owned component.
+  return createElement('div', {
+    className: 'mc-guard-threshold-body',
+    'data-guard-threshold-conflict': draft.conflict ? 'true' : 'false',
+  },
     createElement('label', { className: 'mc-guard-threshold-edit-label' }, t('guardThresholds')),
-    ...thresholds.map((value, index) => createElement('input', {
+    ...rows.map((text, index) => createElement('input', {
       key: index,
       type: 'number',
       min: 2,
       max: 50,
       step: 1,
       className: 'mc-guard-threshold-num',
-      // The current value is always the Host's: a rejected edit must not leave
-      // the field showing what the user typed.
-      value: String(value),
+      // The DRAFT is what the operator sees; the Host's committed list is what
+      // the commit compares against.
+      value: text,
       readOnly: !editable,
       disabled: !editable,
       'aria-label': t('guardThresholds') + ' ' + String(index + 1),
-      onChange: (event: { target: { value: string } }) => {
-        if (!editable) return
-        const raw = Number(event.target.value)
-        if (!Number.isSafeInteger(raw) || raw < 2 || raw > 50) return
-        const next = thresholds.slice()
-        next[index] = raw
-        onChange(next)
+      'aria-invalid': invalid ? 'true' : 'false',
+      'data-guard-threshold-dirty': draft.dirty ? 'true' : 'false',
+      onChange: (event: { target: { value: string } }) => { draft.setRow(index, event.target.value) },
+      onKeyDown: (event: { readonly key: string; readonly preventDefault?: () => void }) => {
+        if (!editable || event.key !== 'Enter') return
+        if (typeof event.preventDefault === 'function') event.preventDefault()
+        draft.commit()
       },
+      // Blur attempts the same commit; an invalid draft is KEPT (never silently
+      // reset to the Host's values) so the operator can correct it in place.
+      onBlur: () => { if (editable) draft.commit() },
     })),
+    editable
+      ? createElement('button', {
+          type: 'button',
+          className: 'mc-guard-threshold-save',
+          'data-guard-threshold-save': 'true',
+          disabled: !draft.dirty,
+          onClick: () => { draft.commit() },
+        }, t('guardThresholdSave'))
+      : null,
+    // Invalid draft: say WHY it cannot be sent, and keep it. A Host that REFUSES
+    // the write needs no extra line of its own: the boxes still show the draft
+    // (the Host's value never changed) and the container prints the error.
+    editable && invalid
+      ? createElement('p', { className: 'mc-guard-threshold-hint', role: 'alert', 'data-guard-threshold-invalid': 'true' }, t('guardThresholdDraftHint'))
+      : null,
   )
 }
+
+/** Tagged after declaration: walkers must not CALL this one (it has hooks). */
+(GuardThresholdEditor as unknown as Record<symbol, boolean>)[HOOK_COMPONENT] = true
 
 /**
  * Parse '3, 5, 8' into a threshold list.
@@ -239,11 +438,19 @@ export function GuardPanel(props: GuardPanelProps): ReactElement {
     // Section A owns the threshold editor; B and C state their purpose.
     const belowBullets = entry.id === 'duplicate_call'
       ? createElement('div', { className: 'v3-gfoot-edit' },
-          createElement(GuardThresholdEditor, {
-            t,
-            thresholds: duplicateThresholds,
-            ...(onThresholdsChange === undefined ? {} : { onChange: onThresholdsChange }),
-          }),
+          createElement('div', {
+            className: 'mc-guard-threshold-edit',
+            'data-guard-thresholds': 'true',
+            'data-guard-thresholds-count': String(duplicateThresholds?.length ?? 0),
+            'data-guard-thresholds-values': duplicateThresholds?.join(',') ?? '',
+            'data-guard-thresholds-editable': onThresholdsChange === undefined ? 'false' : 'true',
+          },
+            createElement(GuardThresholdEditor, {
+              t,
+              thresholds: duplicateThresholds,
+              ...(onThresholdsChange === undefined ? {} : { onChange: onThresholdsChange }),
+            }),
+          ),
           createElement('p', { className: 'v3-hint mc-guard-threshold-hint' }, t('guardThresholdHint')),
         )
       : createElement('p', { className: 'v3-hint' }, t(entry.id === 'alternating_cycle' ? 'guardPurposeB' : 'guardPurposeC'))

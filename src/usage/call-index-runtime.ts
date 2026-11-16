@@ -28,6 +28,24 @@ export interface CallIndexRuntimeConfig {
   autoIndexMode?: 'full' | 'incremental'
   /** Delay before the automatic scan, so the mount and scope resolve first. */
   autoIndexDelayMs?: number
+  /**
+   * OPT-IN warm cache directory.
+   *
+   * Off unless BOTH this and {@link CallIndexRuntimeConfig.sourceRoot} are set: a
+   * cache without an authorized artifact root could only speak for files this
+   * process cannot verify, so the feature stays disabled instead of guessing.
+   */
+  cacheDir?: string
+  /**
+   * Explicitly authorized Session artifact root for warm-cache fingerprints.
+   *
+   * This is a separate, deliberate grant: it does not widen the configured
+   * scope, does not enumerate anything by itself, and is only ever used to read a
+   * path the Host's own public snapshot already named.
+   */
+  sourceRoot?: string
+  /** Refuse to hash artifacts larger than this when verifying the cache. */
+  cacheMaxBytes?: number
 }
 export const CallIndexConfig: z<CallIndexRuntimeConfig> = z.object({
   /**
@@ -63,6 +81,13 @@ export const CallIndexConfig: z<CallIndexRuntimeConfig> = z.object({
   autoIndex: z.boolean().default(true),
   autoIndexMode: z.union(['full', 'incremental']).default('incremental'),
   autoIndexDelayMs: z.number().min(0).max(600_000).default(1_500),
+  /**
+   * Warm cache is OPT-IN and DEFAULT OFF: an empty string means "not configured",
+   * and the cache only activates when this AND sourceRoot are both non-empty.
+   */
+  cacheDir: z.string().max(4096).default(''),
+  sourceRoot: z.string().max(4096).default(''),
+  cacheMaxBytes: z.number().min(1024).max(1024 * 1024 * 1024).default(256 * 1024 * 1024),
 })
 interface RuntimeTask {
   taskId: string
@@ -81,6 +106,12 @@ export interface CallIndexRuntime {
   listCalls(request?: unknown): CallIndexReply
   getCallDetail(request: unknown): Promise<CallIndexReply>
   whenIdle(): Promise<void>
+  /**
+   * Barrier for a real shutdown: wait for the running pass AND for every queued
+   * warm-cache write to settle, so a cold scan is durably cached before the Host
+   * goes away. Never rejects.
+   */
+  flushCache(): Promise<void>
   dispose(): Promise<void>
 }
 export interface CallIndexRuntimeOptions {
@@ -165,6 +196,24 @@ export function installCallIndexRuntime(ctx: Context, config: CallIndexRuntimeCo
    * Every check below goes through this one function.
    */
   const scopeMode = (): 'disabled' | 'host-visible' => config.scope ?? 'host-visible'
+  /**
+   * Warm cache wiring.
+   *
+   * Both halves must be non-empty, so a Host config document that predates this
+   * option (or a partial one) leaves the feature off — the default stays "no
+   * disk state". `cacheMaxBytes` bounds how much a verification may hash.
+   */
+  const warmCache = (): { dir: string; sourceRoot: string; maxBytes?: number } | undefined => {
+    const dir = typeof config.cacheDir === 'string' ? config.cacheDir.trim() : ''
+    const sourceRoot = typeof config.sourceRoot === 'string' ? config.sourceRoot.trim() : ''
+    if (dir.length === 0 || sourceRoot.length === 0) return undefined
+    const maxBytes = config.cacheMaxBytes
+    return {
+      dir, sourceRoot,
+      ...(typeof maxBytes === 'number' && Number.isSafeInteger(maxBytes) && maxBytes > 0 ? { maxBytes } : {}),
+    }
+  }
+  const warm = warmCache()
   const index = new SessionCallIndex({
     getMode: () => disposed ? 'disabled' : scopeMode(),
     getBackend: backend, now,
@@ -172,6 +221,7 @@ export function installCallIndexRuntime(ctx: Context, config: CallIndexRuntimeCo
     pageSize: config.pageSize, maxBytes: config.maxBytes, maxCalls: config.maxCalls,
     maxSessions: config.maxSessions, maxLiveQueue: config.maxLiveQueue,
     ...(resolveSource === undefined ? {} : { resolveSource }),
+    ...(warm === undefined ? {} : { warmCache: warm }),
   })
   const stamp = () => {
     const current = index.stamp()
@@ -258,7 +308,14 @@ export function installCallIndexRuntime(ctx: Context, config: CallIndexRuntimeCo
     const owner = task
     active = index.start({ full: mode === 'full', maxEvents: config.maxEventsPerRun }).then(result => {
       if (disposed || task !== owner) return
-      owner.phase = result.phase === 'cancelled' ? 'cancelled' : result.phase === 'failed' ? 'failed' : result.coverage === 'complete' ? 'complete' : 'partial'
+      // Honour the index's own terminal phase. It now distinguishes
+      // "everything read" (complete) from "stopped on budget/capacity with work
+      // left" (partial); collapsing partial into complete is what let the page
+      // claim completion while Sessions were still unread.
+      owner.phase = result.phase === 'cancelled' ? 'cancelled'
+        : result.phase === 'failed' ? 'failed'
+          : result.phase === 'partial' ? 'partial'
+            : result.coverage === 'complete' ? 'complete' : 'partial'
       owner.finishedAt = now()
     }).catch(() => { if (!disposed && task === owner) { owner.phase = 'failed'; owner.finishedAt = now() } }).finally(() => {
       active = undefined
@@ -277,9 +334,18 @@ export function installCallIndexRuntime(ctx: Context, config: CallIndexRuntimeCo
         enumerationCoverage: value.enumerationCoverage, semanticCoverage: value.semanticCoverage,
         listedSessions: value.listedSessions, visibleSessions: value.visibleSessions, completedSessions: value.completedSessions,
         declaredEvents: value.declaredEvents, readEvents: value.readEvents,
+        // Per-pass progress and the capacity-pause flag travel with the status so
+        // the page can distinguish "working, nothing retained yet" from "dead".
+        passReadEvents: value.passReadEvents, passReadSessions: value.passReadSessions,
+        passPages: value.passPages, passCut: value.passCut, scannedEvents: value.scannedEvents,
+        paused: value.paused, exhaustedSessions: value.exhaustedSessions, progressEvents: value.progressEvents,
         pendingSessions: value.pendingSessions, failedSessions: value.failedSessions, pendingLive: value.pendingLive,
         estimatedBytes: value.estimatedBytes, reasons: value.reasons,
         totals: value.totals,
+        // Real scheduler state, separate from the index's own phase and coverage:
+        // "a pass is queued right now" is not the same fact as "the scan is
+        // running" and not the same as "the index is complete".
+        auto: { ...auto },
         ...(task ? { task: { ...task } } : {}),
       })
     },
@@ -305,13 +371,34 @@ export function installCallIndexRuntime(ctx: Context, config: CallIndexRuntimeCo
     listCalls(request) { const error = ready(); return error ?? queries.listCalls(request) },
     async getCallDetail(request) { const error = ready(); return error ?? queries.getCallDetail(request) },
     async whenIdle() { await active },
+    /**
+     * Durability barrier for the warm cache.
+     *
+     * A cold scan writes its shards asynchronously; a Host that exits immediately
+     * after the pass would lose them. This waits for the in-flight pass (so its
+     * writes are queued) and then for the queue itself. Safe to call after
+     * disposal: it then simply resolves.
+     */
+    async flushCache() {
+      if (!disposed) await active?.catch(() => {})
+      await index.flushCache()
+    },
     async dispose() {
       if (disposed) return
+      // Mark disposed FIRST: cancellation must not wait behind a cache drain, or
+      // an unload during an active read would leave the handle open.
       disposed = true; queryVersion++; queries.invalidate()
       try { cancelTimer?.() } catch { /* Continue teardown even if a scheduler fails. */ }
       cancelTimer = undefined
       try { listenerDispose?.() } catch { /* The owning fiber also releases its subscription. */ }
       listenerDispose = undefined
+      // Cancel SYNCHRONOUSLY: an unload must abort the in-flight read in this
+      // tick, not after the cache drain below yields.
+      index.cancel()
+      // Drain queued cache writes while the index still owns the cache, so a
+      // clean shutdown publishes the cold pass's entries; a failure cannot block
+      // teardown.
+      try { await index.flushCache() } catch { /* Cache failure never blocks teardown. */ }
       index.dispose()
       await active
     },
@@ -342,41 +429,97 @@ export function installCallIndexRuntime(ctx: Context, config: CallIndexRuntimeCo
    * single-flight guard, so this can never overlap a manual start.
    */
   const AUTO_ROUNDS_MAX = 500
+  /**
+   * Consecutive follow-up rounds allowed without ANY forward progress.
+   *
+   * TG-09's old guard compared the backlog COUNT: a Session that is read one
+   * page at a time keeps `pendingSessions = 1` for its whole log, so the guard
+   * declared "no progress" on round 4 and stopped a scan that had genuinely
+   * advanced offset 0 -> 5 -> 10 -> 15. Progress is now forward-scanned events
+   * (`scannedEvents`), which only moves when a read really advanced. The count
+   * is a small RETRY allowance for transient failures, not the pass criterion.
+   */
+  const AUTO_STALL_ROUNDS = 3
   let autoTimer: ReturnType<typeof setTimeout> | undefined
-  /** Progress guard: three rounds without a smaller backlog stop the loop. */
-  let lastPending = -1
+  /** Last observed forward progress (events) and consecutive rounds without it. */
+  let lastProgress = -1
   let stagnantRounds = 0
+  /**
+   * Observable automatic-scheduler state.
+   *
+   * The scheduler sleeps 250 ms BETWEEN passes. Without this, a status poll taken
+   * in that gap sees `task.phase: 'partial'` and no active run, so the client
+   * stopped polling — and then missed the next round entirely, leaving the page
+   * on a stale "partial" forever while the scan was actually still working
+   * (TG-09's "phase partial 停轮询后错过下一轮"). `scheduled` closes that gap.
+   */
+  const auto: { state: 'idle' | 'scheduled' | 'running' | 'stopped'; round: number } = { state: 'idle', round: 0 }
+  /**
+   * Terminate the automatic scheduler honestly.
+   *
+   * EVERY early exit must come through here. Leaving `auto.state` at 'scheduled'
+   * or 'running' while no timer and no task exist tells the browser a scan is
+   * still working, so the page polls forever and the operator waits for progress
+   * that will never come. Clearing the timer as well is what makes "stopped" a
+   * real terminal state rather than a label.
+   */
+  const autoStop = (): void => {
+    auto.state = 'stopped'
+    try { if (autoTimer !== undefined) clearTimeout(autoTimer) } catch { /* Teardown continues. */ }
+    autoTimer = undefined
+  }
   const autoPass = (round: number): void => {
     autoTimer = undefined
-    if (disposed || config.autoIndex === false) return
-    if (scopeMode() !== 'host-visible') return
-    if (round > AUTO_ROUNDS_MAX) return
+    if (disposed || config.autoIndex === false) { autoStop(); return }
+    if (scopeMode() !== 'host-visible') { autoStop(); return }
+    if (round > AUTO_ROUNDS_MAX) { autoStop(); return }
     try {
       const started = begin(round === 0 && config.autoIndexMode === 'full' ? 'full' : 'incremental', false)
       if (started.ok === false) {
         // Never silent: a refused automatic scan is the exact failure that made
         // the page show a permanent zero with no explanation.
         console.error('[capability-menu] callIndex auto-index refused:', started.reason)
+        autoStop()
         return
       }
     } catch (error) {
       console.error('[capability-menu] callIndex auto-index failed:', error instanceof Error ? error.name : 'unknown')
+      autoStop()
       return
     }
+    // The scheduled/active state is real and observable even between rounds: the
+    // round is recorded before the pass resolves, so a UI polling between passes
+    // never sees "idle" while another pass is already queued.
+    auto.state = 'running'
+    auto.round = round
     const pass = active
-    if (pass === undefined) return
+    if (pass === undefined) { autoStop(); return }
     void pass.then(() => {
-      if (disposed || config.autoIndex === false) return
+      if (disposed || config.autoIndex === false) { autoStop(); return }
       let snapshot: ReturnType<typeof index.snapshot>
-      try { snapshot = index.snapshot(false) } catch { return }
-      if (snapshot.scope.status !== 'ready') return
-      if (snapshot.phase === 'cancelled' || snapshot.phase === 'failed') return
-      if (snapshot.pendingSessions <= 0) return
-      // A live session can stay "pending" without its history moving, so three
-      // rounds without a smaller backlog stop the loop instead of spinning.
-      stagnantRounds = snapshot.pendingSessions < lastPending ? 0 : stagnantRounds + 1
-      lastPending = snapshot.pendingSessions
-      if (stagnantRounds > 3) return
+      try { snapshot = index.snapshot(false) } catch { autoStop(); return }
+      // A backend/scope that went away mid-pass is a real terminal condition: the
+      // follow-up must not be left looking scheduled.
+      if (snapshot.scope.status !== 'ready') { autoStop(); return }
+      if (snapshot.phase === 'cancelled' || snapshot.phase === 'failed') { autoStop(); return }
+      // Work is owed when some Session was never read, or one was only partly read
+      // (a checkpointed/resumable stage). `pendingSessions` alone cannot express
+      // the second case, so both are consulted.
+      const owed = snapshot.pendingSessions > 0 || snapshot.phase === 'partial'
+      if (!owed) { autoStop(); return }
+      // Capacity pause: continuing would only re-read and fail to retain. Stop
+      // with a stated, recoverable reason instead of spinning.
+      if (snapshot.reasons.includes('scan-paused-capacity')) { autoStop(); return }
+      // Per-revision verified progress, NOT the cumulative scanned total: a
+      // re-listed Session restarts its own cut at 0, so the cumulative figure can
+      // advance on pure revision churn and can also mask a new revision's real
+      // work. `progressEvents` only counts advance within an unchanged revision.
+      const progress = snapshot.progressEvents ?? 0
+      if (progress > lastProgress) stagnantRounds = 0
+      else stagnantRounds += 1
+      lastProgress = progress
+      if (stagnantRounds > AUTO_STALL_ROUNDS) { autoStop(); return }
+      auto.state = 'scheduled'
       autoTimer = setTimeout(() => autoPass(round + 1), 250)
     })
   }
@@ -384,6 +527,7 @@ export function installCallIndexRuntime(ctx: Context, config: CallIndexRuntimeCo
   ctx.effect(() => {
     // Defer so the mount finishes and the scope controller has resolved; running
     // inside the effect body would race the first syncScope().
+    if (config.autoIndex !== false && scopeMode() === 'host-visible') auto.state = 'scheduled'
     const timer = setTimeout(() => autoPass(0), Math.max(0, config.autoIndexDelayMs ?? 1500))
     return () => {
       try { clearTimeout(timer) } catch { /* Teardown continues regardless. */ }

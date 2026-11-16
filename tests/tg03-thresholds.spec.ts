@@ -239,11 +239,16 @@ describe('TG-03: high thresholds through the live Guard hooks', () => {
     await host.hooks.get('agent/pre-step')!({ agent, turn: 1 }, vi.fn(async () => ({ kind: 'continue' })))
 
     const denials: string[] = []
+    // The denial index is asserted, not just its count: a regression that denies
+    // the wrong occurrence (e.g. the 20th or the 60th) still yields one denial and
+    // would slip through a length-only assertion.
+    const denialIndexes: number[] = []
     for (let index = 0; index < 60; index += 1) {
       const call: Execution = { agent, name: 'write', arguments: { same: true }, callId: `same-${index}` }
       const denial = host.guard()(call)
       if (denial !== undefined) {
         denials.push(denial)
+        denialIndexes.push(index)
         result(call, { isError: true, error: { message: denial }, content: [{ type: 'text', text: denial }] })
         continue
       }
@@ -252,6 +257,9 @@ describe('TG-03: high thresholds through the live Guard hooks', () => {
     }
 
     expect(denials).toHaveLength(1)
+    // The candidate forms at the highest threshold (the 50th identical call), so the
+    // single denial lands on the next matching call: zero-based index 50, i.e. the 51st.
+    expect(denialIndexes).toEqual([50])
     const text = injectedText(agent)
     expect(text).toContain('第 20 次')
     expect(text).toContain('第 30 次')

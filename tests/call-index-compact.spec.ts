@@ -15,6 +15,16 @@ import { CallIndexSeqStore } from '../src/usage/call-index-seq-store.ts'
 const T0 = Date.UTC(2026, 10, 8, 12, 0, 0)
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
+/**
+ * The commit that introduced the compact seq ledger. The differential baseline
+ * must stay pinned to the code *before* that change, so this constant is
+ * deliberately a fixed SHA and not `HEAD`: after the change is committed, HEAD
+ * already contains the new core and would silently turn the differential into a
+ * self-comparison. It is also the last commit that used the old whole-corpus
+ * `seqMeta` layout this store is meant to reproduce.
+ */
+const BASELINE_COMMIT = '0de7610'
+
 function makePartition(overrides: Partial<CallIndexPartitionOptions> = {}): CallIndexPartition {
   return new CallIndexPartition({
     sessionId: overrides.sessionId ?? 'compact-1',
@@ -54,7 +64,7 @@ interface BaselineModule {
 let baselinePromise: Promise<BaselineModule> | undefined
 
 /**
- * Load the *actual* pre-change CallIndexPartition from git HEAD.
+ * Load the *actual* pre-change CallIndexPartition from the pinned baseline commit.
  *
  * It must be the baseline code, not a hand-written approximation: the whole
  * point of the differential test is that the compact store preserves every
@@ -65,7 +75,7 @@ let baselinePromise: Promise<BaselineModule> | undefined
  */
 function loadBaselineCore(): Promise<BaselineModule> {
   baselinePromise ??= (async () => {
-    const source = execFileSync('git', ['show', 'HEAD:src/usage/call-index-core.ts'], {
+    const source = execFileSync('git', ['show', `${BASELINE_COMMIT}:src/usage/call-index-core.ts`], {
       cwd: repoRoot,
       encoding: 'utf8',
     })
@@ -75,6 +85,13 @@ function loadBaselineCore(): Promise<BaselineModule> {
     const patched = source
       .replace("'@deepseek-ai/dsh-session'", JSON.stringify(sessionUrl))
       .replace("'@deepseek-ai/dsh-tools'", JSON.stringify(toolsUrl))
+      // The baseline source imports sibling modules relative to its own directory;
+      // the temp copy sits elsewhere, so rewrite every relative specifier to a
+      // file URL of the same repo file. Absolute paths keep the temp module
+      // resolving the project's real sources, not a stale duplicate.
+      .replace(/(['"])(\.\/[A-Za-z0-9._-]+?)(\.ts)?\1/g, (_m, _q, rel: string) =>
+        JSON.stringify(pathToFileURL(join(repoRoot, 'src', 'usage', rel.endsWith('.ts') ? rel : `${rel}.ts`)).href),
+      )
     const dir = mkdtempSync(join(tmpdir(), 'call-index-baseline-'))
     const file = join(dir, 'call-index-core-baseline.ts')
     writeFileSync(file, patched)
@@ -368,7 +385,7 @@ describe('compact capacity accounting', () => {
   })
 })
 
-describe('old/new differential with the real HEAD baseline', () => {
+describe('old/new differential with the pinned pre-change baseline', () => {
   it('matches every projected-field conflict variant against the old signature', async () => {
     const baseline = await loadBaselineCore()
     const base: CallIndexEvent = { seq: 0, time: 0, kind: 'other' }

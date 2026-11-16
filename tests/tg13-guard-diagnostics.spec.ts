@@ -58,12 +58,36 @@ async function tempDir(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'dsh-tg13-'))
 }
 
-/** A state file path whose parent is a regular file: every write fails ENOTDIR. */
+/**
+ * A state file that mounts fine and then refuses every write.
+ *
+ * The write must fail AFTER apply has read the (empty) state: making the parent a
+ * regular file up front fails earlier and for a different reason - apply throws
+ * `ENOTDIR` out of the state read, which is not the write-failure path TG-13 is
+ * about. So the file starts as a valid, empty state and the *directory* is
+ * replaced by a regular file, which makes every later write and atomic rename
+ * fail with ENOTDIR on every platform (a read-only directory would not: POSIX
+ * lets root ignore the mode bits, and the Windows CI job has no such bits).
+ */
 async function blockedStateFile(): Promise<{ dir: string; blocker: string; stateFile: string }> {
   const dir = await tempDir()
   const blocker = join(dir, 'blocked')
+  await mkdir(blocker, { recursive: true })
+  const stateFile = join(blocker, 'capability-menu-policy.json')
+  await writeFile(stateFile, JSON.stringify({ version: 3 }))
+  return { dir, blocker, stateFile }
+}
+
+/** Replace the state file's directory with a regular file: writes now fail ENOTDIR. */
+async function blockWrites(blocker: string): Promise<void> {
+  await rm(blocker, { recursive: true, force: true })
   await writeFile(blocker, 'not a directory')
-  return { dir, blocker, stateFile: join(blocker, 'capability-menu-policy.json') }
+}
+
+/** Turn the blocker back into a writable directory. */
+async function unblockWrites(blocker: string): Promise<void> {
+  await unlink(blocker)
+  await mkdir(blocker, { recursive: true })
 }
 
 // - 1. illegal patch: only the Guard sub-plugin is disabled -------------------
@@ -123,6 +147,7 @@ describe('TG-13 - explicit flush reports a real write failure', () => {
     const { dir, blocker, stateFile } = await blockedStateFile()
     const clock = new ManualClock()
     const ctx = await mountPolicy({ stateFile, patchFile: '', persistDebounceMs: 50, timer: clock })
+    await blockWrites(blocker)
 
     await ctx.capabilityPolicy.updateConfig({ skills: { 'on-demand': ['pending-skill'] } })
     // A real flush must reject: the caller asked for durability and did not get it.
@@ -132,8 +157,7 @@ describe('TG-13 - explicit flush reports a real write failure', () => {
     })
 
     // Recover the filesystem: replace the blocking file with a directory.
-    await unlink(blocker)
-    await mkdir(blocker, { recursive: true })
+    await unblockWrites(blocker)
     await ctx.capabilityPolicy.flushPersistence()
     expect(ctx.capabilityPolicy.getGuardDiagnostics().persistence).toEqual({ dirty: false })
     const saved = JSON.parse(await (await import('node:fs/promises')).readFile(stateFile, 'utf8')) as {
@@ -147,6 +171,7 @@ describe('TG-13 - explicit flush reports a real write failure', () => {
     const { dir, blocker, stateFile } = await blockedStateFile()
     const clock = new ManualClock()
     const ctx = await mountPolicy({ stateFile, patchFile: '', persistDebounceMs: 50, timer: clock })
+    await blockWrites(blocker)
 
     await ctx.capabilityPolicy.updateConfig({ skills: { 'on-demand': ['debounced-skill'] } })
     // Drive the debounce; the failure happens inside a fire-and-forget write.
@@ -157,8 +182,7 @@ describe('TG-13 - explicit flush reports a real write failure', () => {
       dirty: true, lastErrorCode: 'write-failed',
     })
     // No unhandled rejection, and the journal is preserved for a later retry.
-    await unlink(blocker)
-    await mkdir(blocker, { recursive: true })
+    await unblockWrites(blocker)
     await ctx.capabilityPolicy.flushPersistence()
     expect(ctx.capabilityPolicy.getGuardDiagnostics().persistence).toEqual({ dirty: false })
     await rm(dir, { recursive: true, force: true })
@@ -169,9 +193,10 @@ describe('TG-13 - explicit flush reports a real write failure', () => {
 
 describe('TG-13 - getGuardDiagnostics remote roundtrip', () => {
   it('serves a value the browser descriptor decodes, and both faces agree', async () => {
-    const { dir, stateFile } = await blockedStateFile()
+    const { dir, blocker, stateFile } = await blockedStateFile()
     const ctx = await mountPolicy({ stateFile, patchFile: '' })
     await ctx.plugin(guardPlugin, {})
+    await blockWrites(blocker)
     await ctx.capabilityPolicy.updateConfig({ skills: { 'on-demand': ['rt-skill'] } })
     await expect(ctx.capabilityPolicy.flushPersistence()).rejects.toThrow()
 

@@ -73,12 +73,52 @@ let baselinePromise: Promise<BaselineModule> | undefined
  * package imports are rewritten to absolute file URLs so the temp module still
  * resolves the project's existing dependencies without adding any.
  */
+/**
+ * Read the pre-change core out of git.
+ *
+ * CI checks out a shallow clone by default, where the pinned commit is simply
+ * absent; without the explicit fetch below the differential would fail there for
+ * a reason that has nothing to do with the code under test. If the commit still
+ * cannot be fetched the error says exactly what to do instead of degrading into
+ * a comparison of the new code with itself.
+ */
+function readBaselineSource(): string {
+  const spec = `${BASELINE_COMMIT}:src/usage/call-index-core.ts`
+  const show = (): string | undefined => {
+    try {
+      return execFileSync('git', ['show', spec], { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    } catch {
+      return undefined
+    }
+  }
+  const direct = show()
+  if (direct !== undefined) return direct
+  // Shallow clone: try to obtain the baseline commit, then retry once. Fetching a
+  // bare SHA is not accepted by every transport, so fall back to deepening the
+  // history of the current branch.
+  for (const args of [
+    ['fetch', '--depth=1', '--quiet', 'origin', BASELINE_COMMIT],
+    ['fetch', '--unshallow', '--quiet', 'origin'],
+  ]) {
+    try {
+      execFileSync('git', args, { cwd: repoRoot, stdio: ['ignore', 'ignore', 'ignore'] })
+      if (show() !== undefined) return show() as string
+    } catch {
+      // try the next strategy
+    }
+  }
+  const fetched = show()
+  if (fetched !== undefined) return fetched
+  throw new Error(
+    `The pre-change baseline ${BASELINE_COMMIT} is not in this checkout. The differential test needs that commit: ` +
+      'run with a full clone (CI uses fetch-depth: 0) or fetch it with ' +
+      `\`git fetch --depth=1 origin ${BASELINE_COMMIT}\`.`,
+  )
+}
+
 function loadBaselineCore(): Promise<BaselineModule> {
   baselinePromise ??= (async () => {
-    const source = execFileSync('git', ['show', `${BASELINE_COMMIT}:src/usage/call-index-core.ts`], {
-      cwd: repoRoot,
-      encoding: 'utf8',
-    })
+    const source = readBaselineSource()
     const require = createRequire(join(repoRoot, 'package.json'))
     const sessionUrl = pathToFileURL(require.resolve('@deepseek-ai/dsh-session')).href
     const toolsUrl = pathToFileURL(require.resolve('@deepseek-ai/dsh-tools')).href

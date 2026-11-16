@@ -10,7 +10,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # The call-index differential test reads its pre-change baseline out of git
+      # history; a depth-1 checkout does not contain that commit, so the whole
+      # suite would fail for a reason unrelated to the code under test.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
         with:
           version: 9
@@ -28,6 +33,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
         with:
           version: 9

@@ -25,7 +25,33 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
-      - run: pnpm test
+      # Emit the machine-readable report as well as the human one, so a failure
+      # can be turned into a check-run annotation (readable without admin rights).
+      - run: pnpm exec vitest run --reporter=default --reporter=json --outputFile=vitest-report.json
+        continue-on-error: true
+        id: tests
+      - name: Surface test failures as annotations
+        if: steps.tests.outcome == 'failure'
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, existsSync } from 'node:fs';
+          if (!existsSync('vitest-report.json')) {
+            console.log('::error::vitest produced no JSON report');
+            process.exit(1);
+          }
+          const report = JSON.parse(readFileSync('vitest-report.json', 'utf8'));
+          let shown = 0;
+          for (const file of report.testResults ?? []) {
+            for (const assertion of file.assertionResults ?? []) {
+              if (assertion.status !== 'failed') continue;
+              const message = (assertion.failureMessages ?? []).join('\n').split('\n').slice(0, 6).join(' ');
+              console.log(`::error file=${file.name},title=${assertion.fullName}::${message.replace(/\r?\n/g, ' ').slice(0, 900)}`);
+              if (++shown >= 40) break;
+            }
+          }
+          console.log(`::error::${shown} failing test(s); see annotations above`);
+          process.exit(1);
+          NODE
       - run: pnpm build
       - run: npm pack --dry-run
 

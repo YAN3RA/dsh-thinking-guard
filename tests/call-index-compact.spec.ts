@@ -1,5 +1,5 @@
-import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -16,14 +16,16 @@ const T0 = Date.UTC(2026, 10, 8, 12, 0, 0)
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 /**
- * The commit that introduced the compact seq ledger. The differential baseline
- * must stay pinned to the code *before* that change, so this constant is
- * deliberately a fixed SHA and not `HEAD`: after the change is committed, HEAD
- * already contains the new core and would silently turn the differential into a
- * self-comparison. It is also the last commit that used the old whole-corpus
- * `seqMeta` layout this store is meant to reproduce.
+ * The commit whose core the differential compares against: the last commit
+ * before the compact seq ledger landed. Its source is vendored as a fixture
+ * (tests/fixtures/call-index-core-baseline-0de7610.ts) instead of being read
+ * with `git show`, so the comparison works in a shallow CI clone and can never
+ * silently degrade into comparing the new code with itself.
  */
 const BASELINE_COMMIT = '0de7610'
+
+/** SHA-256 of the fixture's upstream content (commit bytes, before import rewrite). */
+const BASELINE_SHA256 = '818AB270DE874F43623D09B44A4E01371EFE4E87C88EC78C50FEBD0EE2279BE4'
 
 function makePartition(overrides: Partial<CallIndexPartitionOptions> = {}): CallIndexPartition {
   return new CallIndexPartition({
@@ -74,63 +76,43 @@ let baselinePromise: Promise<BaselineModule> | undefined
  * resolves the project's existing dependencies without adding any.
  */
 /**
- * Read the pre-change core out of git.
+ * Load the *actual* pre-change CallIndexPartition.
  *
- * CI checks out a shallow clone by default, where the pinned commit is simply
- * absent; without the explicit fetch below the differential would fail there for
- * a reason that has nothing to do with the code under test. If the commit still
- * cannot be fetched the error says exactly what to do instead of degrading into
- * a comparison of the new code with itself.
+ * It must be the baseline code, not a hand-written approximation: the whole point
+ * of the differential test is that the compact store preserves every
+ * row/outcome/gap/count the old implementation produced. The fixture carries the
+ * commit's bytes verbatim; only sibling import specifiers were rewritten so the
+ * file resolves inside the repo. That rewrite is re-verified here, so editing the
+ * fixture to make a case pass cannot go unnoticed.
  */
-function readBaselineSource(): string {
-  const spec = `${BASELINE_COMMIT}:src/usage/call-index-core.ts`
-  const show = (): string | undefined => {
-    try {
-      return execFileSync('git', ['show', spec], { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-    } catch {
-      return undefined
-    }
-  }
-  const direct = show()
-  if (direct !== undefined) return direct
-  // Shallow clone: try to obtain the baseline commit, then retry once. Fetching a
-  // bare SHA is not accepted by every transport, so fall back to deepening the
-  // history of the current branch.
-  for (const args of [
-    ['fetch', '--depth=1', '--quiet', 'origin', BASELINE_COMMIT],
-    ['fetch', '--unshallow', '--quiet', 'origin'],
-  ]) {
-    try {
-      execFileSync('git', args, { cwd: repoRoot, stdio: ['ignore', 'ignore', 'ignore'] })
-      if (show() !== undefined) return show() as string
-    } catch {
-      // try the next strategy
-    }
-  }
-  const fetched = show()
-  if (fetched !== undefined) return fetched
-  throw new Error(
-    `The pre-change baseline ${BASELINE_COMMIT} is not in this checkout. The differential test needs that commit: ` +
-      'run with a full clone (CI uses fetch-depth: 0) or fetch it with ' +
-      `\`git fetch --depth=1 origin ${BASELINE_COMMIT}\`.`,
-  )
-}
-
 function loadBaselineCore(): Promise<BaselineModule> {
   baselinePromise ??= (async () => {
-    const source = readBaselineSource()
+    const fixturePath = join(repoRoot, 'tests', 'fixtures', `call-index-core-baseline-${BASELINE_COMMIT}.ts`)
+    const fixture = readFileSync(fixturePath, 'utf8')
+    const body = fixture.slice(fixture.indexOf('*/') + 2).replace(/^\s*\n/, '')
+
+    const unrewritten = body.replace(
+      /from '\.\.\/\.\.\/src\/usage\/([A-Za-z0-9._-]+?)\.ts'/g,
+      "from './$1.ts'",
+    )
+    const actual = createHash('sha256').update(unrewritten).digest('hex').toUpperCase()
+    if (actual !== BASELINE_SHA256) {
+      throw new Error(
+        `The baseline fixture was edited: sha256 ${actual} != ${BASELINE_SHA256}. ` +
+          `Restore tests/fixtures/call-index-core-baseline-${BASELINE_COMMIT}.ts from commit ${BASELINE_COMMIT}.`,
+      )
+    }
+
     const require = createRequire(join(repoRoot, 'package.json'))
     const sessionUrl = pathToFileURL(require.resolve('@deepseek-ai/dsh-session')).href
     const toolsUrl = pathToFileURL(require.resolve('@deepseek-ai/dsh-tools')).href
-    const patched = source
+    const patched = body
       .replace("'@deepseek-ai/dsh-session'", JSON.stringify(sessionUrl))
       .replace("'@deepseek-ai/dsh-tools'", JSON.stringify(toolsUrl))
-      // The baseline source imports sibling modules relative to its own directory;
-      // the temp copy sits elsewhere, so rewrite every relative specifier to a
-      // file URL of the same repo file. Absolute paths keep the temp module
-      // resolving the project's real sources, not a stale duplicate.
-      .replace(/(['"])(\.\/[A-Za-z0-9._-]+?)(\.ts)?\1/g, (_m, _q, rel: string) =>
-        JSON.stringify(pathToFileURL(join(repoRoot, 'src', 'usage', rel.endsWith('.ts') ? rel : `${rel}.ts`)).href),
+      .replace(
+        /(['"])\.\.\/\.\.\/src\/usage\/([A-Za-z0-9._-]+?)\.ts\1/g,
+        (_match, _quote, name: string) =>
+          JSON.stringify(pathToFileURL(join(repoRoot, 'src', 'usage', `${name}.ts`)).href),
       )
     const dir = mkdtempSync(join(tmpdir(), 'call-index-baseline-'))
     const file = join(dir, 'call-index-core-baseline.ts')

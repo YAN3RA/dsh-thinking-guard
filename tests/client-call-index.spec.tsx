@@ -2327,4 +2327,39 @@ describe('TG-11 (mounted): a failed cross-query read never shows the old query',
     expect(el.textContent).toContain('bash')
     expect(el.textContent).toContain('grep')
   })
+
+  it('keeps filling after repeated stale cursors instead of freezing at page one', async () => {
+    // Every auto-fill cursor is invalidated when a scan pass lands, and a finishing
+    // scan can invalidate several in a row. With a single restart the fill gave up
+    // and the table kept page one forever, which on a 20k-call corpus meant exactly
+    // one tool row even though the index reported complete.
+    const stale: CallIndexPanelResult<CallIndexCallPageView> = {
+      ok: false, code: 'cursor-stale', messageKey: 'callIndex.error.cursorStale', retryable: true, disconnected: false,
+    }
+    let stales = 0
+    const api = baseApi({
+      listCalls: async (_query, cursor) => {
+        if (cursor === undefined) {
+          return okPage(callPage({
+            items: [{ ...ROW, callSeq: 3, callId: 'call-3', toolName: 'read', resultSeq: 4 }],
+            snapshotId: 'snap-' + stales,
+            nextCursor: 'cur-' + stales,
+          }))
+        }
+        // Two passes land back to back, so the first two cursors are already dead.
+        if (stales < 2) { stales += 1; return stale }
+        return okPage(callPage({
+          items: [{ ...ROW, callSeq: 9, callId: 'call-9', toolName: 'grep', resultSeq: 10 }],
+          snapshotId: 'snap-final',
+          nextCursor: undefined,
+        }))
+      },
+    })
+    const el = await mountDetail(api, { initialQuery: { scope: 'all' } })
+    await flush(40)
+    // Page one survived the churn...
+    expect(el.textContent).toContain('read')
+    // ...and the fill resumed instead of stopping at the first stale answer.
+    expect(el.textContent).toContain('grep')
+  })
 })

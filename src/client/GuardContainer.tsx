@@ -478,31 +478,6 @@ export function GuardContainer(props: GuardContainerProps): ReactElement {
     })
   }, [nextGen, commit, runWrite, enqueueWrite])
 
-  const reset = useCallback((): void => {
-    const epoch = epochRef.current
-    enqueueWrite(epoch, async () => {
-      if (epoch.cancelled) return
-      const previous = stateRef.current.switches
-      if (previous === undefined || epoch.source.updateGuard === undefined) return
-      const defaults: GuardSwitches = {
-        enabled: true,
-        duplicateDetection: true,
-        alternatingCycleDetection: true,
-        noProgressProtection: true,
-        repeatThresholds: [3, 5, 8],
-      }
-      const gen = nextGen()
-      commit(gen, current => ({ ...current, switches: defaults, busy: true }))
-      await runWrite(gen, epoch, () => epoch.source.updateGuard!(defaults), current => ({ ...current, switches: previous }))
-    })
-  }, [nextGen, commit, runWrite, enqueueWrite])
-
-  /** Event-based refresh behind the 刷新 button (reuses the existing label key). */
-  const refresh = useCallback((): void => {
-    const epoch = epochRef.current
-    void readAll(nextGen(), epoch)
-  }, [readAll, nextGen])
-
   /**
    * Bounded single-flight refresh, only while the page is visible.
    *
@@ -565,18 +540,10 @@ export function GuardContainer(props: GuardContainerProps): ReactElement {
       t: translate,
       ...(diagnostics === undefined ? {} : { diagnostics }),
     }),
-    // A manual refresh beside the automatic poll: same read path, same bounded
-    // generation, so a click and a timer tick can never corrupt each other. The
-    // label reuses the existing 'overviewRefresh' string (no copy change here).
-    createElement('div', { className: 'mc-guard-actions', style: { display: 'flex', justifyContent: 'flex-end' } },
-      createElement('button', {
-        type: 'button',
-        className: 'mc-count mc-count--action',
-        'data-guard-refresh': 'true',
-        disabled: state.busy || switches === undefined,
-        onClick: () => { refresh() },
-      }, translate('overviewRefresh')),
-    ),
+    // No manual refresh and no "restore defaults" control here: the counters
+    // already refresh themselves on the bounded timer, and the three switches
+    // keep the operator's own values. Two extra buttons only stole space from
+    // the A/B/C cards and wrapped onto a second row.
     createElement(GuardPanel, {
       t,
       // Prefer the LIVE thresholds from the Host over the shell's constant: the
@@ -594,7 +561,6 @@ export function GuardContainer(props: GuardContainerProps): ReactElement {
             no_progress: switches.noProgressProtection,
           },
       onToggle: switches === undefined || state.busy ? undefined : (id: GuardSectionId, next: boolean) => { toggle(id, next) },
-      onReset: switches === undefined || state.busy ? undefined : () => { reset() },
     }),
   )
 }

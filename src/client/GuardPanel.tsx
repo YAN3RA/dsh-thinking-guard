@@ -55,8 +55,6 @@ export interface GuardPanelProps {
    * anything — the "black box" the operator reported.
    */
   readonly stats?: GuardStatsSnapshotView
-  /** Restore the shipped defaults. */
-  readonly onReset?: () => void
 }
 
 /**
@@ -427,7 +425,7 @@ function firedValue(id: GuardSectionId, stats: GuardStatsSnapshotView | undefine
 }
 
 export function GuardPanel(props: GuardPanelProps): ReactElement {
-  const { t, enabled, duplicateThresholds, onToggle, onThresholdsChange, stats, onReset } = props
+  const { t, enabled, duplicateThresholds, onToggle, onThresholdsChange, stats } = props
 
   const section = (entry: typeof SECTIONS[number]): ReactElement => {
     const isOn = enabled?.[entry.id] ?? false
@@ -501,16 +499,9 @@ export function GuardPanel(props: GuardPanelProps): ReactElement {
   return createElement('section', { className: 'mc-section v3-root' },
     V3Styles(),
     createElement('style', { 'data-guard-style': 'true' }, GUARD_CSS),
-    // A single small action row (no title), then the counters, then one short
-    // boundary hint. No page title, no activity sub-title, no "counting since".
-    onReset === undefined
-      ? null
-      : createElement('div', { style: { display: 'flex', justifyContent: 'flex-end' } },
-          createElement('button', {
-            type: 'button',
-            className: 'mc-count mc-count--action',
-            onClick: onReset,
-          }, t('guardReset'))),
+    // No action row, no page title, no activity sub-title, no "counting since":
+    // the counters come first. The switches keep whatever the operator set, so a
+    // "restore defaults" button would only be a way to lose that by accident.
     createElement(GuardStatsBoard, { t, ...(stats === undefined ? {} : { stats }) }),
     createElement('p', { className: 'v3-hint' }, t('guardBoundaryShort')),
     createElement('div', { className: 'v3-gpanel' },

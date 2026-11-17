@@ -180,6 +180,7 @@ describe('TG-04 · counters survive every save path', () => {
         return { ok: true as const, value: unavailable }
       },
     }
+    vi.useFakeTimers()
     const el = await mount(remote)
     expect(observationsText(el)).toContain('5')
     expect(el.querySelector('.mc-guard-diag')).not.toBeNull()
@@ -187,7 +188,7 @@ describe('TG-04 · counters survive every save path', () => {
     // Same remote, transient failure: the last-known values must survive rather
     // than collapsing to a fabricated zero / disappearing banner.
     fail = true
-    await act(async () => { (el.querySelector('[data-guard-refresh="true"]') as HTMLButtonElement).click() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
     expect(observationsText(el)).toContain('5')
     expect(observationsText(el)).not.toContain('—')
     expect(el.querySelector('.mc-guard-diag')).not.toBeNull()
@@ -232,28 +233,22 @@ describe('TG-04 · bounded single-flight refresh while active', () => {
     expect(statsCalls).toBe(afterActive)
   })
 
-  it('re-reads the counters from the 刷新 button, reusing the existing label key', async () => {
-    let statsCalls = 0
+  it('renders no manual refresh and no restore-defaults control', async () => {
     const remote: GuardSwitchRemote = {
       getGuard: async () => ({ ok: true as const, value: switches }),
       updateGuard: async () => ({ ok: true as const, value: undefined }),
-      getGuardStats: async () => {
-        statsCalls += 1
-        return { ok: true as const, value: { ...stats, observations: 5 + statsCalls } }
-      },
+      getGuardStats: async () => ({ ok: true as const, value: stats }),
       getGuardDiagnostics: async () => ({ ok: true as const, value: available }),
     }
     const el = await mount(remote)
-    const button = el.querySelector('[data-guard-refresh="true"]') as HTMLButtonElement | null
-    expect(button).not.toBeNull()
-    // The manual refresh reuses the existing 'overviewRefresh' copy; no new key.
-    expect(button!.textContent).toBe('overviewRefresh')
-    expect(button!.disabled).toBe(false)
-
-    const before = statsCalls
-    await act(async () => { button!.click() })
-    expect(statsCalls).toBeGreaterThan(before)
-    expect(observationsText(el)).toContain(String(5 + statsCalls))
+    // The counters already refresh themselves on a bounded timer, and the three
+    // switches keep whatever the operator set. Two extra buttons only wrapped onto
+    // a second row and stole width from the A/B/C cards, so both are gone by
+    // design — this pins that they stay gone.
+    expect(el.querySelector('[data-guard-refresh="true"]')).toBeNull()
+    const labels = [...el.querySelectorAll('button')].map(button => (button.textContent || '').trim())
+    expect(labels).not.toContain('overviewRefresh')
+    expect(labels).not.toContain('guardReset')
   })
 
   it('cancels the timer on unmount and ignores any late response', async () => {
@@ -529,11 +524,12 @@ describe('TG-04 · per-source epoch isolation (R1/R2)', () => {
       getGuardStats: async () => ({ ok: true as const, value: stats }),
       getGuardDiagnostics: async () => ({ ok: true as const, value: available }),
     }
+    vi.useFakeTimers()
     const el = await mount(remote)
     expect(switchButtons(el).map(button => button.getAttribute('aria-checked'))).toEqual(['true', 'true', 'true'])
 
     fail = true
-    await act(async () => { (el.querySelector('[data-guard-refresh="true"]') as HTMLButtonElement).click() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
     expect(el.querySelector('.mc-error-hint')?.textContent).toContain('guard transient')
     // Same source: the last-known switches survive and stay editable.
     expect(switchButtons(el).map(button => button.getAttribute('aria-checked'))).toEqual(['true', 'true', 'true'])

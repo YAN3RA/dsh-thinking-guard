@@ -63,15 +63,28 @@ function parseSearch(value: unknown): SearchState {
   return { ...(limit !== undefined ? { summaryMaxChars: limit as number } : {}), descriptions }
 }
 
+/**
+ * Accept every state-file version this plugin has ever written.
+ *
+ * WHY v3: the 0.1.x line wrote `version: 3` (tiers + search + a `guard` section).
+ * An upgrade from 0.1.x therefore meets a file this upstream-derived reader would
+ * otherwise reject with "unsupported menu state version", which makes the policy
+ * entry fail to activate — measured on a real desktop profile as
+ * `1 entry did not activate capability-menu-policy ... cannot load capability tier state`.
+ * v3 carries the same `tools`/`skills`/`search` shape as v2; the `guard` section is
+ * owned by `guard-state.ts` (its own file now), so it is simply not read here.
+ * Writes stay on the v2 shape, which both lines can read.
+ */
 function parseMenuState(source: string): MenuState {
   const record = object(JSON.parse(source) as unknown, 'menu state')
-  if (record['version'] !== 1 && record['version'] !== 2) throw new Error('unsupported menu state version')
+  const version = record['version']
+  if (version !== 1 && version !== 2 && version !== 3) throw new Error('unsupported menu state version')
   return {
     tiers: {
       tool: parseTierMap(record['tools'], 'tools'),
       skill: parseTierMap(record['skills'], 'skills'),
     },
-    search: record['version'] === 2 ? parseSearch(record['search']) : { descriptions: new Map() },
+    search: version === 1 ? { descriptions: new Map() } : parseSearch(record['search']),
   }
 }
 

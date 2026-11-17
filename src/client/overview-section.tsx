@@ -274,29 +274,7 @@ function StatCell(props: {
   )
 }
 
-/** One labeled switch state chip. */
-function SwitchChip(props: {
-  readonly t: (key: OverviewKey) => string
-  readonly label: string
-  readonly on: boolean | undefined
-  readonly name: string
-}): ReactElement {
-  const { t, label, on, name } = props
-  const text = on === undefined ? t('overviewUnknown') : on ? t('overviewSwitchOn') : t('overviewSwitchOff')
-  return (
-    <div className="mc-overview-kv">
-      <span className="mc-overview-k">{label}</span>
-      <span className="v3-tag" data-tone={on === undefined ? undefined : on ? 'ok' : undefined} data-overview-switch={name}>{text}</span>
-    </div>
-  )
-}
-
-/** Join at most `limit` names for a diagnostic line. */
-function namesText(names: readonly string[], limit: number): string {
-  return names.slice(0, limit).join(' · ')
-}
-
-/**
+ /**
  * The 总览 page: 执行保护记录 + 能力菜单记录.
  *
  * Reads once on mount and again on 刷新; each card owns its own error line, so a
@@ -412,16 +390,9 @@ export interface OverviewViewProps {
  */
 export function OverviewView(props: OverviewViewProps): ReactElement {
   const { t, guard, catalog, busy, onRefresh } = props
-  const { switches: guardSwitches, stats: guardStats, diagnostics: guardDiagnostics, error: guardError } = guard
-  const { rows: catalogRows, version: catalogVersion, diagnostics: catalogDiagnostics, error: catalogError, observedAt } = catalog
+  const { stats: guardStats, error: guardError } = guard
+  const { rows: catalogRows, error: catalogError } = catalog
   const counts = countRows(catalogRows)
-  const guardReasons = guardDiagnostics?.reasons ?? []
-  const guardPersistence = guardDiagnostics?.persistence
-  const catalogUnavailable = catalogDiagnostics?.unavailableSkills.length
-  const catalogShadowed = catalogDiagnostics?.shadowedSkills.length
-  const catalogBroken = catalogDiagnostics?.brokenPresets.length
-  const catalogClean = catalogDiagnostics !== undefined
-    && catalogUnavailable === 0 && catalogShadowed === 0 && catalogBroken === 0
 
   const source = (kind: string, text: string): ReactElement => (
     <p className="v3-hint mc-overview-source" data-overview-source={kind}>{text}</p>
@@ -432,7 +403,6 @@ export function OverviewView(props: OverviewViewProps): ReactElement {
       <V3Styles />
       <style data-overview-style="true">{OVERVIEW_CSS}</style>
       <div className="mc-overview-bar">
-        <p className="v3-hint">{t('desc')}</p>
         <button
           type="button"
           className="mc-overview-refresh"
@@ -445,7 +415,7 @@ export function OverviewView(props: OverviewViewProps): ReactElement {
       {/* 执行保护记录 ------------------------------------------------------ */}
       <div className="v3-panel mc-overview-card" data-overview-card="guard">
         <h3 className="mc-overview-title">{t('overviewGuardTitle')}</h3>
-        {guardSwitches === undefined && guardStats === undefined && guardDiagnostics === undefined && guardError === undefined
+        {guardStats === undefined && guardError === undefined
           ? <p className="v3-hint" data-overview-loading="guard">{t('overviewLoading')}</p>
           : null}
         {guardError === undefined
@@ -462,49 +432,13 @@ export function OverviewView(props: OverviewViewProps): ReactElement {
           <StatCell stat="cycle" label={t('overviewGuardCycle')} value={dash(guardStats?.reminders.cycle)} hint="进程内计数" />
           <StatCell stat="denials" label={t('overviewGuardDenials')} value={dash(guardStats?.denials)} hint="进程内计数" />
         </div>
-        <div className="mc-overview-diag" data-overview-switches="guard">
-          <span className="mc-overview-k">{t('overviewGuardSwitches')}</span>
-          <SwitchChip t={t} label={t('overviewGuardMaster')} on={guardSwitches?.enabled} name="enabled" />
-          <SwitchChip t={t} label={t('overviewGuardDuplicate')} on={guardSwitches?.duplicateDetection} name="duplicateDetection" />
-          <SwitchChip t={t} label={t('overviewGuardCycleSwitch')} on={guardSwitches?.alternatingCycleDetection} name="alternatingCycleDetection" />
-          <SwitchChip t={t} label={t('overviewGuardNoProgress')} on={guardSwitches?.noProgressProtection} name="noProgressProtection" />
-        </div>
-        <div className="mc-overview-diag" data-overview-diag="guard">
-          <span className="mc-overview-k">{t('overviewGuardDiag')}</span>
-          {guardDiagnostics === undefined
-            ? <span className="v3-tag" data-overview-available="unknown">{t('overviewUnknown')}</span>
-            : (
-              <span
-                className="v3-tag"
-                data-tone={guardDiagnostics.available ? 'ok' : 'bad'}
-                data-overview-available={guardDiagnostics.available ? 'true' : 'false'}
-              >{t(guardDiagnostics.available ? 'overviewGuardEffective' : 'overviewGuardNotEffective')}</span>
-            )}
-          {/* Reasons are fixed wire codes; the page maps them, never echoes them. */}
-          {guardReasons.includes('invalid-patch')
-            ? <span className="v3-tag" data-tone="bad" data-overview-reason="invalid-patch">{t('overviewDiagInvalidPatch')}</span>
-            : null}
-          {guardReasons.includes('not-mounted')
-            ? <span className="v3-tag" data-tone="bad" data-overview-reason="not-mounted">{t('overviewDiagNotMounted')}</span>
-            : null}
-          {guardPersistence?.dirty === true
-            ? (
-              <span className="v3-tag" data-tone="warn" data-overview-persistence={guardPersistence.lastErrorCode ?? 'pending'}>
-                {t('overviewDiagPersistenceDirty')}
-              </span>
-            )
-            : null}
-          {guardPersistence?.lastErrorCode === 'write-failed'
-            ? <span className="v3-tag" data-tone="bad" data-overview-write-failed="true">{t('overviewDiagWriteFailed')}</span>
-            : null}
-        </div>
         {source('guard', t('overviewGuardSource'))}
       </div>
 
       {/* 能力菜单记录 ------------------------------------------------------ */}
       <div className="v3-panel mc-overview-card" data-overview-card="catalog">
         <h3 className="mc-overview-title">{t('overviewCatalogTitle')}</h3>
-        {catalogRows === undefined && catalogVersion === undefined && catalogDiagnostics === undefined && catalogError === undefined
+        {catalogRows === undefined && catalogError === undefined
           ? <p className="v3-hint" data-overview-loading="catalog">{t('overviewLoading')}</p>
           : null}
         {catalogError === undefined
@@ -521,70 +455,6 @@ export function OverviewView(props: OverviewViewProps): ReactElement {
           <StatCell stat="disabled" label={t('overviewCatalogDisabled')} value={dash(counts.disabled)} hint="目录快照" />
           <StatCell stat="total" label={t('overviewCatalogTotal')} value={dash(counts.total)} hint="目录快照" />
         </div>
-        <p className="mc-overview-meta">
-          <span className="mc-overview-k">{t('overviewCatalogVersion')}</span>
-          <b data-overview-version>{dash(catalogVersion)}</b>
-          <span className="mc-overview-k">{t('overviewCatalogObservedAt')}</span>
-          <b data-overview-observed-at>{observedAt ?? '—'}</b>
-          <span className="mc-overview-k">{t('overviewCatalogTools')}</span>
-          <b data-overview-tools>{dash(counts.tools)}</b>
-          <span className="mc-overview-k">{t('overviewCatalogSkills')}</span>
-          <b data-overview-skills>{dash(counts.skills)}</b>
-        </p>
-        {/* 技能口径说明：这一格含项目/预设来源，因此可能多于能力菜单 Skills 页 */}
-        <p className="v3-hint" data-overview-skills-hint="true">{t('overviewCatalogSkillsHint')}</p>
-        <div className="mc-overview-diag" data-overview-diag="catalog">
-          <span className="mc-overview-k">{t('overviewCatalogDiag')}</span>
-          {catalogDiagnostics === undefined
-            ? <span className="v3-tag" data-overview-catalog-diag="unknown">{t('overviewUnknown')}</span>
-            : (
-              <>
-                <span className="mc-overview-k">{t('overviewCatalogState')}</span>
-                <span
-                  className="v3-tag"
-                  data-tone={catalogDiagnostics.catalog.state === 'ready' ? 'ok' : undefined}
-                  data-overview-catalog-state={catalogDiagnostics.catalog.state}
-                >{t(catalogDiagnostics.catalog.state === 'empty' ? 'overviewCatalogStateEmpty' : 'overviewCatalogStateReady')}</span>
-                <span className="v3-tag" data-tone={catalogUnavailable === 0 ? undefined : 'warn'} data-overview-diag-unavailable={String(catalogUnavailable)}>
-                  {t('overviewCatalogDiagUnavailable') + ' ' + String(catalogUnavailable)}
-                </span>
-                <span className="v3-tag" data-tone={catalogShadowed === 0 ? undefined : 'warn'} data-overview-diag-shadowed={String(catalogShadowed)}>
-                  {t('overviewCatalogDiagShadowed') + ' ' + String(catalogShadowed)}
-                </span>
-                <span className="v3-tag" data-tone={catalogBroken === 0 ? undefined : 'bad'} data-overview-diag-broken={String(catalogBroken)}>
-                  {t('overviewCatalogDiagBrokenPreset') + ' ' + String(catalogBroken)}
-                </span>
-                {catalogClean ? <span className="v3-tag">{t('overviewDiagNone')}</span> : null}
-              </>
-            )}
-        </div>
-        {/* 目录扫描状态与能力条目是两套口径，这里说清楚以免同屏矛盾 */}
-        {catalogDiagnostics === undefined
-          ? null
-          : <p className="v3-hint" data-overview-state-hint="true">{t('overviewCatalogStateHint')}</p>}
-        {/* Names, not just counts: a count alone cannot be acted on. Bounded to
-            keep a large broken catalog from pushing the 来源 line off screen. */}
-        {catalogDiagnostics !== undefined && (catalogUnavailable ?? 0) > 0
-          ? (
-            <p className="v3-hint mc-overview-hint-names" data-overview-names="unavailable">
-              {namesText(catalogDiagnostics.unavailableSkills.map(item => item.name), 4)}
-            </p>
-          )
-          : null}
-        {catalogDiagnostics !== undefined && (catalogShadowed ?? 0) > 0
-          ? (
-            <p className="v3-hint mc-overview-hint-names" data-overview-names="shadowed">
-              {namesText(catalogDiagnostics.shadowedSkills.map(item => item.name), 4)}
-            </p>
-          )
-          : null}
-        {catalogDiagnostics !== undefined && (catalogBroken ?? 0) > 0
-          ? (
-            <p className="v3-hint mc-overview-hint-names" data-overview-names="broken">
-              {namesText(catalogDiagnostics.brokenPresets.map(item => item.id), 4)}
-            </p>
-          )
-          : null}
         {source('catalog', t('overviewCatalogSource'))}
       </div>
     </section>

@@ -21,7 +21,7 @@
  */
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import type { GuardDiagnostics, GuardRemote, GuardSwitches } from './guard-remote.ts'
+import type { GuardRemote, GuardSwitches } from './guard-remote.ts'
 import { GuardPanel, isGuardThresholdListValid, type GuardPanelKey, type GuardSectionId } from './GuardPanel.tsx'
 import { V3Styles, V3_ROOT_CLASS } from './v3-ui.ts'
 
@@ -138,7 +138,6 @@ export function GuardSavedTag(props: {
 
 interface ViewState {
   readonly switches?: GuardSwitches
-  readonly diagnostics?: GuardDiagnostics
   readonly error?: GuardSectionError
   readonly busy: boolean
 }
@@ -196,22 +195,6 @@ function failureText(error: { readonly code: string; readonly message: string })
   return error.code + ': ' + error.message
 }
 
-/**
- * Run one OPTIONAL remote call and collapse every failure to `undefined`.
- *
- * Diagnostics and counters are diagnostic, not load-bearing: a rejected call, a
- * synchronous throw from a malformed stub or a non-ok result must not blank the
- * page the switch surface exists to show.
- */
-async function readOptional<T>(call: () => Promise<RemoteResult<T>>): Promise<T | undefined> {
-  try {
-    const result = await call()
-    return result.ok ? result.value : undefined
-  } catch {
-    return undefined
-  }
-}
-
 /** Read the switches, keeping the failure reason instead of throwing. */
 async function readSwitches(
   remote: GuardRemote,
@@ -222,60 +205,6 @@ async function readSwitches(
   } catch (error) {
     return { ok: false, detail: errorText(error) }
   }
-}
-
-/** Copy for one wire diagnostic reason. Never free-form text off the wire. */
-function reasonText(t: (key: GuardSectionKey) => string, reason: GuardDiagnostics['reasons'][number]): string {
-  return reason === 'invalid-patch' ? t('guardDiagInvalidPatch') : t('guardDiagNotMounted')
-}
-
-/**
- * The top status line: whether the Guard is actually in effect right now.
- *
- * Hook-free so it can be rendered (and asserted) on its own. The three "cannot
- * know" states are distinct on purpose: still loading is not the same as a
- * failed read, and neither may be shown as 「已生效」 or as 「未生效」.
- */
-export function GuardStatusLine(props: {
-  readonly t: (key: GuardSectionKey) => string
-  readonly diagnostics?: GuardDiagnostics | undefined
-  readonly error?: GuardSectionError | undefined
-}): ReactElement {
-  const { t, diagnostics, error } = props
-  const status = diagnostics === undefined
-    ? (error === undefined ? 'pending' : 'unknown')
-    : diagnostics.available ? 'ok' : 'bad'
-  const summary = status === 'ok'
-    ? t('guardStatusAvailable')
-    : status === 'bad'
-      ? t('guardStatusUnavailable')
-      : status === 'unknown'
-        ? t('guardStatusUnknown')
-        : t('guardStatusLoading')
-  const tone = status === 'ok' ? 'ok' : status === 'bad' ? 'bad' : undefined
-  const persistence = diagnostics?.persistence
-  return (
-    <div className="v3-statusline mc-guard-statusline" data-guard-status={status} role="status">
-      <span className="v3-dot" data-tone={tone} aria-hidden="true" />
-      <b>{summary}</b>
-      {status === 'bad' && diagnostics !== undefined
-        ? diagnostics.reasons.map(reason => (
-          <span key={reason} className="mc-guard-status-why" data-guard-reason={reason}>{reasonText(t, reason)}</span>
-        ))
-        : null}
-      {persistence?.dirty === true
-        ? (
-          <span
-            className="mc-guard-status-why"
-            data-guard-persistence={persistence.lastErrorCode ?? 'pending'}
-          >{t('guardDiagPersistenceDirty')}</span>
-        )
-        : null}
-      {persistence?.lastErrorCode === 'write-failed'
-        ? <span className="mc-guard-status-why" data-guard-write-failed="true">{t('guardDiagWriteFailed')}</span>
-        : null}
-    </div>
-  )
 }
 
 /**
@@ -333,15 +262,8 @@ export function GuardSection(props: GuardSectionProps): ReactElement {
       commit(at, current => ({ ...current, busy: false, error: { kind: 'read', detail: switches.detail } }))
       return undefined
     }
-    const diagnostics = await readOptional(() => remote.getGuardDiagnostics())
     if (!alive.current || at !== gen.current) return undefined
-    // A missing fresh value is dropped rather than fabricated: the counters read
-    // '—' and the status line says 「未知」 instead of inventing an answer.
-    commit(at, () => ({
-      switches: switches.value,
-      busy: false,
-      ...(diagnostics === undefined ? {} : { diagnostics }),
-    }))
+    commit(at, () => ({ switches: switches.value, busy: false }))
     return switches.value
   }, [remote, commit])
 
@@ -459,7 +381,7 @@ export function GuardSection(props: GuardSectionProps): ReactElement {
     void write(change, change, { kind: 'thresholds' })
   }, [write, commit, nextGen, clearSaved])
 
-  const { switches, diagnostics, error, busy } = state
+  const { switches, error, busy } = state
   const enabled = switches === undefined
     ? undefined
     : {
@@ -482,14 +404,12 @@ export function GuardSection(props: GuardSectionProps): ReactElement {
     <section className={V3_ROOT_CLASS + ' mc-guard-section'} data-guard-busy={busy ? 'true' : 'false'}>
       <V3Styles />
       <style data-guard-section-style="true">{SECTION_CSS}</style>
-      {/* The status line answers 「它现在到底生效了吗」 before any switch, because
-          a Guard that is off must never look like a Guard quietly working. */}
-      <div className="mc-guard-top">
-        <GuardStatusLine t={t} diagnostics={diagnostics} error={error} />
-        {/* Visible, assertable save feedback. It only ever appears after the Host
-            was re-read and its value matches the write's intent. */}
-        {saved === null ? null : <GuardSavedTag key={saved.seq} t={t} notice={saved} />}
-      </div>
+      {/* 顶部状态栏已按需求移除；保存反馈仍保留，只在读回确认后出现。 */}
+      {saved === null ? null : (
+        <div className="mc-guard-top">
+          <GuardSavedTag key={saved.seq} t={t} notice={saved} />
+        </div>
+      )}
       {error === undefined
         ? null
         : (

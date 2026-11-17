@@ -16,15 +16,18 @@ import { createRemoteMount, type RemoteMount } from './remote-mount.ts'
 import { installSettingsNavIcon } from './settings-nav-icon.ts'
 import { TYPERT_REMOTE } from './remote.ts'
 import { TYPERT_GUARD_REMOTE, type GuardRemote } from './guard-remote.ts'
-import { GuardSection, guardDictionaries, type GuardSectionKey } from './guard-section.tsx'
-import { OverviewSection, overviewDictionaries, type OverviewKey } from './overview-section.tsx'
+import { guardDictionaries, type GuardSectionKey } from './guard-section.tsx'
+import { overviewDictionaries, type OverviewKey } from './overview-section.tsx'
 // 字典键仍以上游节面的类型为准：同一份 185 键字典同时喂给我们的 v3 视图，
 // 视图本身换成独立实现（任务项 6：`CapabilitySection.tsx` 一字不改）。
 import type { CapabilityKey } from './CapabilitySection.tsx'
+import type { CapabilitySectionInjected } from './capability-v3/section.tsx'
 import {
-  CapabilitySection,
-  type CapabilitySectionInjected,
-} from './capability-v3/section.tsx'
+  ThinkingThrottleSection,
+  thinkingThrottleDictionaries,
+  type ThinkingThrottleInjected,
+  type ThinkingThrottleKey,
+} from './thinking-throttle.tsx'
 import type { CapabilityPolicyRemote } from './store.ts'
 
 export type { CapabilitySectionInjected, CapabilitySectionProps } from './capability-v3/section.tsx'
@@ -38,6 +41,7 @@ export type { OverviewSectionInjected, OverviewKey } from './overview-section.ts
 const NS = 'settings.capability'
 const GUARD_NS = 'settings.thinking-guard'
 const OVERVIEW_NS = 'settings.thinking-guard-overview'
+const SHELL_NS = 'settings.thinking-throttle'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -47,6 +51,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
     'settings.thinking-guard': Record<GuardSectionKey, string>
     /** 总览 tab copy. */
     'settings.thinking-guard-overview': Record<OverviewKey, string>
+    /** 思考节流外壳 copy. */
+    'settings.thinking-throttle': Record<ThinkingThrottleKey, string>
   }
 }
 
@@ -426,6 +432,7 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'capability-menu: dictionaries')
   ctx.effect(() => ctx.locale.register(GUARD_NS, guardDictionaries()), 'thinking-guard: dictionaries')
   ctx.effect(() => ctx.locale.register(OVERVIEW_NS, overviewDictionaries()), 'thinking-guard: overview dictionaries')
+  ctx.effect(() => ctx.locale.register(SHELL_NS, thinkingThrottleDictionaries()), 'thinking-throttle: dictionaries')
 
   // Register cleanup before starting asynchronous work. Mount completion must
   // never register effects on a fiber that may already have been disposed.
@@ -560,43 +567,24 @@ export function apply(ctx: ClientContext): void {
     }
   }
 
-  ctx.slots.inject('settings.section', () => ctx.slots.register({
-    name: 'settings.section',
-    id: 'capability',
-    order: 12,
-    label: () => t('nav'),
-    locale: NS,
-    inject: injected,
-  }, CapabilitySection))
-
-  // 总览：只显示执行保护计数与能力菜单状态，两块都不读会话历史（任务项 7）。
+  // 思考节流：唯一设置入口，内部三个子页（总览 → 思考限制 → 能力菜单）。
+  const shellT = ctx.locale.bind(SHELL_NS) as (key: ThinkingThrottleKey) => string
   const overviewT = ctx.locale.bind(OVERVIEW_NS) as (key: OverviewKey) => string
-  ctx.slots.inject('settings.section', () => ctx.slots.register({
-    name: 'settings.section',
-    id: 'thinking-guard-overview',
-    order: 13,
-    label: () => overviewT('nav'),
-    locale: OVERVIEW_NS,
-    inject: () => ({
-      guardRemote,
-      capabilityRemote,
-      t: overviewT,
-    }),
-  }, OverviewSection))
-
-  // 执行保护：Guard 自己的单页（任务项 4）。
   const guardT = ctx.locale.bind(GUARD_NS) as (key: GuardSectionKey) => string
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section',
-    id: 'thinking-guard',
-    order: 14,
-    label: () => guardT('nav'),
-    locale: GUARD_NS,
-    inject: () => ({
-      remote: guardRemote,
-      t: guardT,
+    id: 'thinking-throttle',
+    order: 12,
+    label: () => shellT('nav'),
+    locale: SHELL_NS,
+    inject: (): ThinkingThrottleInjected => ({
+      t: shellT,
+      remoteMount,
+      capability: injected(),
+      overview: { guardRemote, capabilityRemote, t: overviewT },
+      guard: { remote: guardRemote, t: guardT },
     }),
-  }, GuardSection))
+  }, ThinkingThrottleSection))
 
   remoteMount.start()
   guardMount.start()

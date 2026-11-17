@@ -53,7 +53,7 @@ function entry() {
   }
   return {
     ctx: ctx as unknown as Context, pending, effect, remote,
-    state: () => sections.get('capability')!.inject().remoteMount!,
+    state: () => sections.get('thinking-throttle')!.inject().remoteMount as ReturnType<typeof createRemoteMount>,
     dispose() { active = false; for (const cleanup of cleanups.reverse()) cleanup() },
   }
 }

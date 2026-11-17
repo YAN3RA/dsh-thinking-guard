@@ -528,21 +528,21 @@ export function guardDictionaries(): {
   en: Record<GuardSectionKey, string>
 } {
   const zh: Record<GuardSectionKey, string> = {
-    nav: '执行保护',
-    title: '执行保护',
+    nav: '思考限制',
+    title: '思考限制',
     desc: '只针对有证据的重复与无进展拦截具体操作；不因总步数、工具总次数或任务时长终止任务。',
     // 状态行
-    guardStatusLoading: '正在读取执行保护状态…',
-    guardStatusAvailable: '执行保护已生效',
-    guardStatusUnavailable: '执行保护当前未生效',
-    guardStatusUnknown: '执行保护状态未知',
+    guardStatusLoading: '正在读取思考限制状态…',
+    guardStatusAvailable: '思考限制已生效',
+    guardStatusUnavailable: '思考限制当前未生效',
+    guardStatusUnknown: '思考限制状态未知',
     guardDiagInvalidPatch: '配置非法，Guard 未注册任何钩子',
     guardDiagNotMounted: '本进程未挂载 Guard',
     guardDiagPersistenceDirty: '有未落盘改动，下次保存成功后会自动补写',
     guardDiagWriteFailed: '状态文件写入失败，改动只保留在内存中',
     // 错误行
-    guardReadFailed: '读取执行保护设置失败',
-    guardWriteFailed: '保存执行保护设置失败',
+    guardReadFailed: '读取思考限制设置失败',
+    guardWriteFailed: '保存思考限制设置失败',
     guardSaveUnconfirmed: '已提交，但读回值不同，未确认生效',
     // 保存反馈
     guardSavedSwitch: '已保存',
@@ -550,7 +550,7 @@ export function guardDictionaries(): {
     guardSwitchOn: '开',
     guardSwitchOff: '关',
     // 计数看板
-    guardStatsTitle: '执行保护活动',
+    guardStatsTitle: '思考限制活动',
     guardStatObservations: '已观察调用',
     guardStatObservationsHint: 'Guard 实际观察到的工具调用数',
     guardStatObservationsZeroHint: '本进程启动后还没有工具调用经过 Guard；计数不回溯历史。若你一直在用工具，这里仍是 0 就说明 Guard 没生效。',

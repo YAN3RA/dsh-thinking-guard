@@ -906,6 +906,10 @@ type CapabilitySectionProps = CapabilitySectionInjected;
  */
 type CapabilityKey = 'title' | 'desc' | 'mandatory' | 'toolsGroup' | 'skillsGroup' | 'builtInGroup' | 'globalSkills' | 'projectSkills' | 'presetSkills' | 'emptyTools' | 'emptySkills' | 'emptyGlobalSkills' | 'emptyProjectSkills' | 'emptyPresetSkills' | 'toolCount' | 'filterByName' | 'filterHint' | 'filterNoMatch' | 'residentShort' | 'onDemandShort' | 'disabledShort' | 'cycleHint' | 'cycleSaved' | 'notPreviewable' | 'previewClose' | 'markdownCode' | 'markdownWrap' | 'markdownUnwrap' | 'markdownCopy' | 'markdownCopied' | 'markdownFootnotes' | 'detailNotFound' | 'cycleOverridden' | 'refreshFailed' | 'mcpToolsPending' | 'feedback' | 'retry' | 'carrierFailureHint' | 'registerCapability' | 'edit' | 'cancel' | 'notEditable' | 'skillAdopted' | 'skillSource' | 'skillSourceHint' | 'skillFromPreset' | 'skillFromPresetHint' | 'skillUnmanaged' | 'adoptSkill' | 'adoptSkillHint' | 'adoptSkillTitle' | 'sourceCustom' | 'sourceBundled' | 'viewCatalog' | 'catalogPolicy' | 'catalogOnDemand' | 'catalogPolicyNote' | 'catalogSearchNote' | 'catalogEmpty' | 'diagnosticTitle' | 'diagnosticUnavailable' | 'diagnosticShadowed' | 'diagnosticBroken' | 'diagnosticUnbrowseable' | 'diagnosticUndocumented' | 'editSearchMetadata' | 'searchMetadataButton' | 'searchDescription' | 'searchMetadataNote' | 'searchMetadataSave' | 'searchMetadataRestore' | 'searchMetadataRestoreHint' | 'searchMetadataSaved' | 'summaryLimit' | 'summaryLimitUnit' | 'summaryLimitInvalid' | 'summaryLimitDisabled' | 'summaryLimitSaved' | 'projectRootLabel' | 'skillBrowseUnavailable' | 'updateAvailable' | 'newVersion' | 'updateDialogTitle' | 'updateVersionComparison' | 'updateNpmNote' | 'updateLocalNote' | 'updateSourceSteps' | 'updateSourceStepsHide' | 'updateSourceStepsIntro' | 'updateSourceStepsRestart' | 'installUpdate' | 'switchAndInstall' | 'updatingPlugin' | 'pluginUpdated' | 'pluginSwitched' | 'pluginNonRegistrySource' | 'pluginProfileUnavailable' | 'pluginUpdateFailed';
 //#endregion
+//#region src/client/thinking-throttle.d.ts
+/** 外壳自身用到的文案键（页签与标题）。 */
+type ThinkingThrottleKey = 'nav' | 'title' | 'tabOverview' | 'tabGuard' | 'tabCapability';
+//#endregion
 //#region src/client/index.d.ts
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -915,6 +919,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
     'settings.thinking-guard': Record<GuardSectionKey, string>;
     /** 总览 tab copy. */
     'settings.thinking-guard-overview': Record<OverviewKey, string>;
+    /** 思考节流外壳 copy. */
+    'settings.thinking-throttle': Record<ThinkingThrottleKey, string>;
   }
 }
 /** Required services (cordis fiber inject). `remote.capabilityPolicy` is NOT

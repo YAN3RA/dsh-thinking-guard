@@ -332,6 +332,29 @@ export type CallIndexSourceCounts = Readonly<Record<CallIndexSourceKind, number>
  * `undefined` means "this Host cannot give me a trend", which the UI must show
  * as a missing block, not as zeros.
  */
+/**
+ * One tool's totals over the WHOLE filtered set.
+ *
+ * The per-tool table cannot be built from the rows a page holds: the newest
+ * 1,050 calls on a busy corpus were all one tool, so the table showed a single
+ * row while 60+ tools existed. The Host aggregates over the frozen set instead.
+ */
+export interface CallIndexToolAggregate {
+  readonly toolName: string
+  readonly calls: number
+  readonly success: number
+  readonly failed: number
+  readonly cancelled: number
+  readonly unresolved: number
+  readonly unknown: number
+  readonly running: number
+  readonly durationSumMs: number
+  readonly durationCount: number
+  readonly lastStartedAt: number
+  /** Dominant source kind over this tool's calls; `unknown` when the Host cannot prove one. */
+  readonly sourceKind: CallIndexSourceKind
+}
+
 export interface CallIndexAggregates {
   /** Distinct `toolName` values; a non-negative integer. */
   readonly distinctTools: number
@@ -340,6 +363,10 @@ export interface CallIndexAggregates {
   readonly byDay?: readonly CallIndexDayBucket[]
   /** The day boundary actually used, echoed so a day label cannot be misread. */
   readonly dayOffsetMinutes: number
+  /** Per-tool totals over the whole filtered set; absent on an older Host. */
+  readonly tools?: readonly CallIndexToolAggregate[]
+  /** True when more tools exist than the Host reply could carry. */
+  readonly toolsTruncated?: boolean
 }
 
 /** Envelope shared by `summary`, `sessions`, `calls` and `detail` replies. */
@@ -825,7 +852,38 @@ function projectAggregates(value: unknown): CallIndexAggregates | undefined {
   // the same read so they cannot be trusted to be independently complete.
   const byDay = value.byDay === undefined ? undefined : projectDayBuckets(value.byDay)
   if (value.byDay !== undefined && byDay === undefined) return undefined
-  return { distinctTools, bySource, dayOffsetMinutes, ...(byDay === undefined ? {} : { byDay }) }
+  // Per-tool rows are optional and independently degradable: an older Host omits
+  // them and the table falls back to what the page holds. A malformed entry is
+  // dropped rather than poisoning the whole aggregates block.
+  const tools = Array.isArray(value.tools) ? value.tools.map(projectToolAggregate).filter((row): row is CallIndexToolAggregate => row !== undefined) : undefined
+  const toolsTruncated = readBool(value.toolsTruncated)
+  return {
+    distinctTools, bySource, dayOffsetMinutes,
+    ...(byDay === undefined ? {} : { byDay }),
+    ...(tools === undefined || tools.length === 0 ? {} : { tools }),
+    ...(toolsTruncated === true ? { toolsTruncated: true } : {}),
+  }
+}
+
+function projectToolAggregate(value: unknown): CallIndexToolAggregate | undefined {
+  if (!isRecord(value)) return undefined
+  const toolName = readString(value.toolName)
+  const calls = readCount(value.calls)
+  if (toolName === undefined || toolName === '' || calls === undefined) return undefined
+  return {
+    toolName,
+    calls,
+    success: readCount(value.success) ?? 0,
+    failed: readCount(value.failed) ?? 0,
+    cancelled: readCount(value.cancelled) ?? 0,
+    unresolved: readCount(value.unresolved) ?? 0,
+    unknown: readCount(value.unknown) ?? 0,
+    running: readCount(value.running) ?? 0,
+    durationSumMs: readFinite(value.durationSumMs) ?? 0,
+    durationCount: readCount(value.durationCount) ?? 0,
+    lastStartedAt: readFinite(value.lastStartedAt) ?? 0,
+    sourceKind: readEnum<CallIndexSourceKind>(value.sourceKind, SOURCE_KIND_SET) ?? 'unknown',
+  }
 }
 
 function projectCallRow(value: unknown): CallIndexCallRow | undefined {

@@ -56,6 +56,7 @@ import {
   type CallIndexSummaryCounts,
   type CallIndexTaskView,
   type CallIndexViewError,
+  type CallIndexToolAggregate,
 } from './call-index-adapter.ts'
 // Re-exported for sibling client modules (PluginSection) that consume the panel.
 export type { CallIndexCallPageView } from './call-index-adapter.ts'
@@ -1283,7 +1284,12 @@ export function callIndexDetailState(input: CallIndexDetailStateInput): CallInde
     return {
       kind: 'partial',
       title: '覆盖不完整',
-      detail: `当前快照覆盖状态为「${COVERAGE_LABELS[page.coverage]}」：下面的数字是已观察到的下限，不能当作完整调用量。`,
+      // 「覆盖不完整」 used to read as if the backend were under-reporting, even when
+      // the only reason was that the CURRENT conversation is still being written.
+      // Naming that case is the difference between a real defect and normal live use.
+      detail: status !== undefined && status.sessions.pendingLive > 0 && status.sessions.pending === status.sessions.pendingLive
+        ? `当前快照覆盖状态为「${COVERAGE_LABELS[page.coverage]}」：还有 ${status.sessions.pendingLive} 个会话正在写入（就是当前对话），所以数字会随时增长；这不是后端少报。`
+        : `当前快照覆盖状态为「${COVERAGE_LABELS[page.coverage]}」：下面的数字是已观察到的下限，不能当作完整调用量。`,
       keepsRows: true,
       canRetry: true,
     }
@@ -1496,7 +1502,16 @@ function toolDisplayLabel(toolName: string): string {
 /** Minimum pixel width for one day column in the scrollable trend. */
 export const CALL_INDEX_TREND_MINCOL = 34
 /** Floor width so a short series still fills the card. */
-export const CALL_INDEX_TREND_MINWIDTH = 320
+/**
+ * Floor width for a short trend series.
+ *
+ * 320 was small enough that a one-to-three point trend drew a narrow plot in a
+ * ~800px card (measured fill ratio 0.40) — the 「调用趋势宽度压缩很小」 report.
+ * The SVG cannot be stretched to fit without distorting its glyphs, so the floor
+ * is raised to the typical card width instead: the plot then fills the card and
+ * the text keeps its natural size.
+ */
+export const CALL_INDEX_TREND_MINWIDTH = 720
 
 /** Pixel width of the trend for `days` buckets: days x min column, floored. */
 export function callIndexTrendWidth(days: number): number {
@@ -2219,6 +2234,29 @@ export interface CallIndexToolRow {
  * repeats down the page. Session and turn/step are dropped with the same intent —
  * neither identifies a tool's health.
  */
+/**
+ * Build the tool table from the Host's own aggregates.
+ *
+ * The page-derived rows can only describe the calls this browser happened to
+ * read (20 pages). On a busy corpus the newest 1,050 calls were all one tool, so
+ * the table showed one row while the Host knew about 60+. When aggregates are
+ * available they cover the WHOLE filtered set, so they win.
+ */
+export function callIndexToolRowsFromHost(tools: readonly CallIndexToolAggregate[]): CallIndexToolRow[] {
+  return tools
+    .map(tool => ({
+      toolName: tool.toolName,
+      sourceKind: tool.sourceKind,
+      lastAt: tool.lastStartedAt,
+      success: tool.success,
+      // The table and the charts call a confirmed error a failure.
+      error: tool.failed,
+      calls: tool.calls,
+      ...(tool.durationCount === 0 ? {} : { averageDurationMs: tool.durationSumMs / tool.durationCount }),
+    }))
+    .sort((a, b) => b.calls - a.calls || a.toolName.localeCompare(b.toolName))
+}
+
 export function callIndexToolRows(page: CallIndexCallPageView | undefined): CallIndexToolRow[] {
   if (page === undefined) return []
   const byTool = new Map<string, {
@@ -2259,12 +2297,16 @@ export function callIndexToolRows(page: CallIndexCallPageView | undefined): Call
 }
 
 /** Short source marker for the tool cell: MCP / 技能 / 插件 / 来源未解析. */
-function sourceNoteForKind(kind: CallIndexSourceKind): string | undefined {
+function sourceNoteForKind(kind: CallIndexSourceKind, toolName: string): string | undefined {
   switch (kind) {
     case 'mcp': return 'MCP'
     case 'skill': return '技能'
     case 'plugin-tool': return '插件'
-    case 'unknown': return '来源未解析'
+    case 'unknown':
+      // `mcp__<server>__<tool>` is the Host's own MCP naming convention, so the
+      // prefix is evidence even when the source field never is. Marked 「推断」 so
+      // it is never mistaken for a Host-proven attribution.
+      return toolName.startsWith('mcp__') ? 'MCP（推断）' : '原生工具（推断）'
     default: return undefined
   }
 }
@@ -2295,7 +2337,7 @@ function CallIndexToolTable(props: {
           const known = row.success + row.error
           const rate = known > 0 ? row.success / known : undefined
           const bad = row.error > 0 && row.error / row.calls >= 0.2
-          const note = sourceNoteForKind(row.sourceKind)
+          const note = sourceNoteForKind(row.sourceKind, row.toolName)
           const server = row.toolName.startsWith('mcp__') ? row.toolName.split('__')[1] : undefined
           const shortName = row.sourceKind === 'mcp' && row.toolName.startsWith('mcp__')
             ? row.toolName.split('__').slice(2).join('__')
@@ -2363,6 +2405,10 @@ export interface CallIndexDetailPanelViewProps {
   readonly status?: CallIndexStatusView
   readonly page?: CallIndexCallPageView
   readonly sessions?: CallIndexSessionPageView
+  /** Host-computed per-tool totals for the whole filtered set (preferred source). */
+  readonly hostTools?: readonly CallIndexToolAggregate[]
+  /** True when the Host capped the per-tool list; the table must say so. */
+  readonly hostToolsTruncated?: boolean
   readonly detail?: CallIndexDetailView
   readonly detailTarget?: { readonly sessionId: string; readonly callSeq: number }
   readonly detailFailure?: CallIndexPanelFailure
@@ -2411,7 +2457,7 @@ export interface CallIndexDetailPanelViewProps {
  */
 export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): ReactElement {
   const {
-    query, status, page,
+    query, status, page, hostTools, hostToolsTruncated,
     loading, loadingMore, failure, onQueryChange, onResolveScope, catalog, sessionMenu,
     moreFailure,
     startFailure, startTask,
@@ -2458,7 +2504,10 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
     : `失败 ${page.summary.error} + 未配对 ${page.summary.unresolved ?? 0}；未配对表示没有捕获到结果，不等于失败`
 
   // One row per TOOL: the same filtered set feeds the two charts and the table.
-  const allRows = page === undefined ? [] : callIndexToolRows(page)
+  // Prefer the Host's whole-set aggregates; fall back to what this page read.
+  const allRows = hostTools !== undefined && hostTools.length > 0
+    ? callIndexToolRowsFromHost(hostTools)
+    : (page === undefined ? [] : callIndexToolRows(page))
   const term = (search ?? '').trim().toLowerCase()
   const rows = term === '' ? allRows : allRows.filter(row => row.toolName.toLowerCase().includes(term))
 
@@ -2639,11 +2688,13 @@ export function CallIndexDetailPanelView(props: CallIndexDetailPanelViewProps): 
     createElement('div', { className: 'v3-panel', style: { marginTop: 12 } },
       createElement('div', { className: 'v3-ph' },
         createElement('span', { className: 'v3-pt' }, '完整工具表'),
-        createElement('span', { className: 'v3-pn' }, `${rows.length} 行 · 表内滚动`),
+        createElement('span', { className: 'v3-pn' }, hostToolsTruncated === true ? `${rows.length} 行 · 已截断` : `${rows.length} 行 · 表内滚动`),
       ),
       createElement(CallIndexToolTable, { rows }),
       createElement('div', { className: 'v3-tfoot' },
-        createElement('span', null, `${rows.length} 个工具 · 表内滚动`),
+        createElement('span', null, hostToolsTruncated === true
+          ? `${rows.length} 个工具 · Host 只返回了前 ${rows.length} 个（按调用量排序）`
+          : `${rows.length} 个工具 · 表内滚动`),
       ),
     ),
     // Every tool row is on the page; the box above scrolls instead of the page
@@ -2906,6 +2957,9 @@ interface DetailState {
   readonly status?: CallIndexStatusView
   readonly page?: CallIndexCallPageView
   readonly sessions?: CallIndexSessionPageView
+  /** Host per-tool totals for the whole filtered set; the table prefers these. */
+  readonly hostTools?: readonly CallIndexToolAggregate[]
+  readonly hostToolsTruncated?: boolean
   readonly detail?: CallIndexDetailView
   readonly detailTarget?: { readonly sessionId: string; readonly callSeq: number }
   readonly loading: boolean
@@ -3197,10 +3251,14 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
       ...(isNewQuery ? { page: undefined, sessions: undefined, failure: undefined } : {}),
     }))
     void (async () => {
-      const [statusResult, pageResult, sessionsResult] = await Promise.all([
+      const [statusResult, pageResult, sessionsResult, overviewResult] = await Promise.all([
         api.getStatus(),
         api.listCalls(query, undefined, anchor),
         api.listSessions(query),
+        // The per-tool table needs the WHOLE filtered set, not the rows one page
+        // holds. The Host aggregates it inside the same frozen snapshot, so this is
+        // the authoritative source; page-derived rows stay as a fallback.
+        api.getOverview(query, anchor),
       ])
       if (!active || generation.current !== requestGeneration) return
       if (pageResult.ok) {
@@ -3234,6 +3292,14 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
             ? { page: mergeRefreshedPage(previous.page, pageResult.value, appendedPages.current) }
             : {}),
           ...(sessionsResult.ok ? { sessions: sessionsResult.value } : {}),
+          // Host-computed per-tool totals for the whole filtered set. Absent on an
+          // older Host, in which case the table keeps using the rows it read.
+          ...(overviewResult.ok && overviewResult.value.aggregates?.tools !== undefined
+            ? {
+                hostTools: overviewResult.value.aggregates.tools,
+                hostToolsTruncated: overviewResult.value.aggregates.toolsTruncated === true,
+              }
+            : {}),
           ...(failure === undefined ? { failure: undefined } : { failure }),
           // The open detail is addressed by (sessionId, callSeq), NOT by the
           // snapshot id, so a refresh does not invalidate it. Clearing it here
@@ -3430,6 +3496,8 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
     ...(state.status === undefined ? {} : { status: state.status }),
     ...(state.page === undefined ? {} : { page: state.page }),
     ...(state.sessions === undefined ? {} : { sessions: state.sessions }),
+    ...(state.hostTools === undefined ? {} : { hostTools: state.hostTools }),
+    ...(state.hostToolsTruncated === true ? { hostToolsTruncated: true } : {}),
     ...(state.detail === undefined ? {} : { detail: state.detail }),
     ...(state.detailTarget === undefined ? {} : { detailTarget: state.detailTarget }),
     ...(state.detailFailure === undefined ? {} : { detailFailure: state.detailFailure }),

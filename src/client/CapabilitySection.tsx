@@ -245,6 +245,7 @@ export type CapabilityKey =
   | 'guardStatsTitle'
   | 'guardStatObservations'
   | 'guardStatObservationsHint'
+  | 'guardStatObservationsZeroHint'
   | 'guardStatOutcomes'
   | 'guardStatOutcomesHint'
   | 'guardStatReminders'

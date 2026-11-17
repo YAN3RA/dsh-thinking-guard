@@ -117,6 +117,16 @@ export const CALL_INDEX_MAX_DAY_OFFSET_MINUTES = 840
 /** Hard cap on returned day buckets: one calendar year of daily rows. */
 export const CALL_INDEX_MAX_DAY_BUCKETS = 366
 
+/**
+ * How many per-tool rows an aggregates reply may carry.
+ *
+ * The per-tool table needs the whole filtered set, not the rows one page holds:
+ * a busy corpus put one tool in the newest 1,050 calls and the table looked like
+ * it only had that tool. Bounding the list keeps the reply small; `toolsTruncated`
+ * tells the UI to say so instead of implying completeness.
+ */
+export const CALL_INDEX_MAX_TOOL_ROWS = 60
+
 export const callIndexSummaryRequestSchema = z
   .object({
     query: callIndexQuerySchema.optional(),
@@ -325,6 +335,37 @@ const dayBucketSchema = z.object({
   running: bucket.running ?? 0,
 }))
 
+/** One tool's totals over the whole filtered set (see {@link CALL_INDEX_MAX_TOOL_ROWS}). */
+const toolAggregateSchema = z.object({
+  // Same bound as the row schema: a tool name the rows may carry must not be
+  // rejected here, or one long identifier turns the whole reply into an error.
+  toolName: z.string().max(CALL_INDEX_MAX_ID_LENGTH),
+  calls: z.number().int().min(0),
+  success: z.number().int().min(0).optional(),
+  failed: z.number().int().min(0).optional(),
+  cancelled: z.number().int().min(0).optional(),
+  unresolved: z.number().int().min(0).optional(),
+  unknown: z.number().int().min(0).optional(),
+  running: z.number().int().min(0).optional(),
+  durationSumMs: z.number().min(0).optional(),
+  durationCount: z.number().int().min(0).optional(),
+  lastStartedAt: z.number().optional(),
+  sourceKind: z.enum(CALL_INDEX_SOURCE_KINDS).optional(),
+}).transform(tool => ({
+  toolName: tool.toolName,
+  calls: tool.calls,
+  success: tool.success ?? 0,
+  failed: tool.failed ?? 0,
+  cancelled: tool.cancelled ?? 0,
+  unresolved: tool.unresolved ?? 0,
+  unknown: tool.unknown ?? 0,
+  running: tool.running ?? 0,
+  durationSumMs: tool.durationSumMs ?? 0,
+  durationCount: tool.durationCount ?? 0,
+  lastStartedAt: tool.lastStartedAt ?? 0,
+  sourceKind: tool.sourceKind ?? 'unknown',
+}))
+
 export const callIndexAggregatesSchema = z.object({
   /** Distinct `toolName` values in the filtered set (rows, not calls). */
   distinctTools: z.number().int().min(0),
@@ -333,6 +374,10 @@ export const callIndexAggregatesSchema = z.object({
   byDay: z.array(dayBucketSchema).max(CALL_INDEX_MAX_DAY_BUCKETS).optional(),
   /** Day boundary actually used, echoed so the UI cannot mislabel a UTC day. */
   dayOffsetMinutes: z.number().int().min(CALL_INDEX_MIN_DAY_OFFSET_MINUTES).max(CALL_INDEX_MAX_DAY_OFFSET_MINUTES),
+  /** Per-tool totals over the whole filtered set, highest calls first. */
+  tools: z.array(toolAggregateSchema).max(CALL_INDEX_MAX_TOOL_ROWS).optional(),
+  /** True when more tools exist than the cap allowed to be sent. */
+  toolsTruncated: z.boolean().optional(),
 })
 
 const summaryDataSchema = z.object({

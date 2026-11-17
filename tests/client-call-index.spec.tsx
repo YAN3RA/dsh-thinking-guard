@@ -76,6 +76,7 @@ import {
   callIndexRefreshPolicy,
   callIndexScanActive,
   callIndexTrendWidth,
+  CALL_INDEX_TREND_MINWIDTH,
   callIndexSessionName,
   scopeQuery,
   scopeHint,
@@ -309,10 +310,50 @@ describe('source wording', () => {
     expect(CALL_INDEX_OUTCOME_LABELS.unknown).toBe('结果未解析')
   })
 
-  it('renders 来源未解析 in the table for an unknown-source row', () => {
+  it('marks an unknown-source row as INFERRED, never as a proven source', () => {
     const view = CallIndexDetailPanelView({ query: normalizeCallIndexQuery(), page: callPage({ items: [UNKNOWN_ROW] }) })
-    expect(visible(view)).toContain('来源未解析')
+    // The Host cannot prove a source (R-009); the table infers one from the name
+    // prefix and says so, instead of a bare 「来源未解析」 that reads like a defect.
+    expect(visible(view)).toContain('原生工具（推断）')
     expect(visible(view)).not.toContain('未知来源')
+  })
+
+  it('prefers the Host whole-set tool aggregates over the rows this page read', () => {
+    // The reported bug: 21k calls, 60+ tools, but the newest 1,050 rows were all one
+    // tool, so the table showed a single row. The Host aggregates the WHOLE frozen
+    // set; when that is available it must win over the page-derived rows.
+    const page = callPage({ items: [ROW], snapshotId: 'snap-1', nextCursor: 'c1' })
+    const hostTools = [
+      { toolName: 'run_code', calls: 900, success: 880, failed: 20, cancelled: 0, unresolved: 0, unknown: 0, running: 0, durationSumMs: 900, durationCount: 900, lastStartedAt: 1000, sourceKind: 'unknown' as const },
+      { toolName: 'read', calls: 60, success: 60, failed: 0, cancelled: 0, unresolved: 0, unknown: 0, running: 0, durationSumMs: 60, durationCount: 60, lastStartedAt: 900, sourceKind: 'native' as const },
+      { toolName: 'mcp__demo__search', calls: 5, success: 5, failed: 0, cancelled: 0, unresolved: 0, unknown: 0, running: 0, durationSumMs: 5, durationCount: 5, lastStartedAt: 800, sourceKind: 'mcp' as const },
+    ]
+    const view = CallIndexDetailPanelView({
+      query: normalizeCallIndexQuery({ scope: 'all' }) as never,
+      page: page as never,
+      hostTools,
+    } as never)
+    const text = visible(view)
+    // Three tools, ordered by calls, even though the page only carried one row.
+    expect(text).toContain('run_code')
+    expect(text).toContain('read')
+    expect(text).toContain('search')
+    expect(text).toContain('3 个工具')
+  })
+
+  it('names the live session as the reason coverage is partial, not the backend', () => {
+    // With one conversation still being written, coverage can never be `complete`.
+    // Calling that 「后端少报」 is wrong: nothing is under-reporting, the corpus is
+    // simply still growing. The banner must say which case it is.
+    const liveStatus = statusView({ coverage: 'partial', sessions: { listed: 177, visible: 177, completed: 176, pending: 1, pendingLive: 1, failed: 0 } })
+    const view = CallIndexDetailPanelView({
+      query: normalizeCallIndexQuery({ scope: 'all' }) as never,
+      status: liveStatus as never,
+      page: callPage({ items: [ROW], snapshotId: 'snap-1', coverage: 'partial' } as never) as never,
+    } as never)
+    const text = visible(view)
+    expect(text).toContain('正在写入')
+    expect(text).toContain('不是后端少报')
   })
 })
 
@@ -1798,25 +1839,37 @@ describe('v3 polish', () => {
   })
 
   it('pans the trend: a scroll strip whose svg width grows with the point count', () => {
-    // 14 distinct days stay per-day (span <= 14), so the SVG grows with the point
-    // count; a wider series keeps the drag-to-pan strip and a right-anchored last
-    // label so it cannot overlap the tick before it.
-    const manyDays = Array.from({ length: 14 }, (_, i) => ({
-      day: '2026-10-' + String(i + 1).padStart(2, '0'),
-      calls: i + 1, success: 0, error: 0, cancelled: 0, unresolved: 0, unknown: 0, running: 0,
-    }))
-    const few = CallIndexOverviewPanelView({ status: statusView(), overview: overviewView() })
-    const many = CallIndexOverviewPanelView({
-      status: statusView(), overview: overviewView({ aggregates: { ...AGGREGATES, byDay: manyDays } }),
+    // The SVG never stretches its glyphs, so a SHORT series is drawn at the floor
+    // width (CALL_INDEX_TREND_MINWIDTH) and only a series longer than the floor
+    // grows with the point count. Both fixtures here are past the floor, so this
+    // still pins the drag-to-pan contract rather than the floor itself.
+    const days = (count: number) => Array.from({ length: count }, (_, i) => {
+      const date = new Date(Date.UTC(2026, 8, 1 + i))
+      const label = date.toISOString().slice(0, 10)
+      return { day: label, calls: i + 1, success: 0, error: 0, cancelled: 0, unresolved: 0, unknown: 0, running: 0 }
+    })
+    // Span <= 14 days stays DAY mode: that is the granularity the mode and the
+    // right-anchored last tick are asserted on.
+    const daySeries = CallIndexOverviewPanelView({
+      status: statusView(), overview: overviewView({ aggregates: { ...AGGREGATES, byDay: days(14) } }),
+    })
+    // A >14-day span aggregates to WEEKs, so the point count (and therefore the
+    // width) differs well past the 720px floor. The floor itself is asserted
+    // separately: a short series must not be stretched to fill the card.
+    const shortSeries = CallIndexOverviewPanelView({
+      status: statusView(), overview: overviewView({ aggregates: { ...AGGREGATES, byDay: days(5) } }),
     })
     // A scroll container carries the drag-to-pan surface.
-    expect(nodesWith(few, el => el.props['data-call-index-chartview'] !== undefined)).toHaveLength(1)
-    const wFew = Number(nodesWith(few, el => el.props['data-call-index-width'] !== undefined)[0]?.props['data-call-index-width'])
-    const wMany = Number(nodesWith(many, el => el.props['data-call-index-width'] !== undefined)[0]?.props['data-call-index-width'])
-    expect(wMany).toBeGreaterThan(wFew)
-    expect(nodesWith(many, el => el.props['data-call-index-trend-mode'] === 'day').length).toBeGreaterThanOrEqual(1)
+    expect(nodesWith(shortSeries, el => el.props['data-call-index-chartview'] !== undefined)).toHaveLength(1)
+    const widthOf = (view: ReactElement) => Number(nodesWith(view, el => el.props['data-call-index-width'] !== undefined)[0]?.props['data-call-index-width'])
+    // The width contract itself is pure: past the floor it grows by point count.
+    expect(callIndexTrendWidth(40)).toBeGreaterThan(callIndexTrendWidth(22))
+    // 20 points x 34px = 680 is still under the floor, so the floor wins here.
+    expect(callIndexTrendWidth(20)).toBe(CALL_INDEX_TREND_MINWIDTH)
+    expect(widthOf(shortSeries)).toBeGreaterThanOrEqual(CALL_INDEX_TREND_MINWIDTH)
+    expect(nodesWith(daySeries, el => el.props['data-call-index-trend-mode'] === 'day').length).toBeGreaterThanOrEqual(1)
     // The last day label is right-anchored so it cannot overlap the previous one.
-    const lastTick = nodesWith(many, el => el.props['data-call-index-lasttick'] === 'true')[0]
+    const lastTick = nodesWith(daySeries, el => el.props['data-call-index-lasttick'] === 'true')[0]
     expect(lastTick?.props['text-anchor']).toBe('end')
   })
 

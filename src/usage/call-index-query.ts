@@ -43,6 +43,7 @@ import {
   CALL_INDEX_DEFAULT_MAX_VIEWS,
   CALL_INDEX_DEFAULT_TTL_MS,
   CALL_INDEX_MAX_DAY_BUCKETS,
+  CALL_INDEX_MAX_TOOL_ROWS,
   CALL_INDEX_MAX_REPLY_BYTES,
   CALL_INDEX_OUTCOMES,
   CALL_INDEX_SOURCE_KINDS,
@@ -272,11 +273,39 @@ interface DayBucket {
   running: number
 }
 
+/** One tool's totals over the WHOLE filtered set (not just the rows a page holds). */
+export interface ToolAggregate {
+  readonly toolName: string
+  readonly calls: number
+  readonly success: number
+  readonly failed: number
+  readonly cancelled: number
+  readonly unresolved: number
+  readonly unknown: number
+  readonly running: number
+  /** Sum and count of calls that reported a duration; the UI divides them. */
+  readonly durationSumMs: number
+  readonly durationCount: number
+  /** Newest call seen for this tool, so "最近调用" is real even off-page. */
+  readonly lastStartedAt: number
+  /**
+   * The source kind that accounts for the most calls of this tool.
+   *
+   * The Host only ever proves `unknown` (R-009), so this is usually that; when a
+   * backend does report a kind the table can show it instead of a blank.
+   */
+  readonly sourceKind: CallIndexSourceKind
+}
+
 interface Aggregates {
   distinctTools: number
   bySource: Record<CallIndexSourceKind, number>
   byDay?: DayBucket[]
   dayOffsetMinutes: number
+  /** Per-tool totals over the whole filtered set, capped by {@link CALL_INDEX_MAX_TOOL_ROWS}. */
+  tools?: ToolAggregate[]
+  /** True when more tools exist than the cap allowed to be sent. */
+  toolsTruncated?: boolean
 }
 
 /** `YYYY-MM-DD` for an instant, shifted by the caller's local-day offset. */
@@ -305,10 +334,34 @@ function localDayLabel(epochMs: number, offsetMinutes: number): string | undefin
 function aggregateRows(rows: readonly Row[], dayOffsetMinutes: number): Aggregates | undefined {
   const bySource: Record<CallIndexSourceKind, number> = { mcp: 0, 'plugin-tool': 0, native: 0, skill: 0, unknown: 0 }
   const tools = new Set<string>()
+  const perTool = new Map<string, { calls: number; success: number; failed: number; cancelled: number; unresolved: number; unknown: number; running: number; durationSumMs: number; durationCount: number; lastStartedAt: number; sources: Map<CallIndexSourceKind, number> }>()
   const days = new Map<string, DayBucket>()
   for (const row of rows) {
     bySource[row.sourceKind] += 1
     tools.add(row.toolName)
+    // Per-tool totals over the WHOLE filtered set. The per-tool table used to be
+    // built from the rows a page happened to hold, which on a busy corpus showed
+    // a single tool (the newest 1,050 calls were all one tool) even though 72
+    // different tools existed. Counting here is O(rowed) once per capture.
+    let entry = perTool.get(row.toolName)
+    if (entry === undefined) {
+      entry = { calls: 0, success: 0, failed: 0, cancelled: 0, unresolved: 0, unknown: 0, running: 0, durationSumMs: 0, durationCount: 0, lastStartedAt: 0, sources: new Map() }
+      perTool.set(row.toolName, entry)
+    }
+    entry.calls += 1
+    // Row outcomes use `error`; the tool table reports it as `failed`.
+    if (row.outcome === 'error') entry.failed += 1
+    else if (row.outcome === 'success') entry.success += 1
+    else if (row.outcome === 'cancelled') entry.cancelled += 1
+    else if (row.outcome === 'unresolved') entry.unresolved += 1
+    else if (row.outcome === 'unknown') entry.unknown += 1
+    else entry.running += 1
+    if (typeof row.durationMs === 'number' && Number.isFinite(row.durationMs) && row.durationMs >= 0) {
+      entry.durationSumMs += row.durationMs
+      entry.durationCount += 1
+    }
+    if (!Number.isFinite(entry.lastStartedAt) || row.startedAt > entry.lastStartedAt) entry.lastStartedAt = row.startedAt
+    entry.sources.set(row.sourceKind, (entry.sources.get(row.sourceKind) ?? 0) + 1)
     const day = localDayLabel(row.startedAt, dayOffsetMinutes)
     if (day === undefined) continue
     let bucket = days.get(day)
@@ -321,6 +374,24 @@ function aggregateRows(rows: readonly Row[], dayOffsetMinutes: number): Aggregat
     bucket[row.outcome] += 1
   }
   const aggregates: Aggregates = { distinctTools: tools.size, bySource, dayOffsetMinutes }
+  if (perTool.size > 0) {
+    const sorted = [...perTool.entries()]
+      .map(([toolName, e]) => {
+        let dominant: CallIndexSourceKind = 'unknown'
+        let best = -1
+        // Deterministic tie-break by the fixed source order, so a corpus that
+        // reports equal counts does not flip labels between replies.
+        for (const kind of CALL_INDEX_SOURCE_KINDS) {
+          const count = e.sources.get(kind) ?? 0
+          if (count > best) { best = count; dominant = kind }
+        }
+        const { sources: _sources, ...rest } = e
+        return { toolName, ...rest, sourceKind: dominant }
+      })
+      .sort((a, b) => (b.calls - a.calls) || (a.toolName < b.toolName ? -1 : a.toolName > b.toolName ? 1 : 0))
+    aggregates.tools = sorted.slice(0, CALL_INDEX_MAX_TOOL_ROWS)
+    if (sorted.length > CALL_INDEX_MAX_TOOL_ROWS) aggregates.toolsTruncated = true
+  }
   if (days.size > 0) aggregates.byDay = [...days.values()].sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0))
   return aggregates
 }
@@ -591,6 +662,28 @@ export class CallIndexQueries {
       return { kind: 'error', reason: 'internal-error' }
     }
     if (before !== stamp) return { kind: 'error', reason: 'cursor-stale' }
+    // Reuse an identical frozen view instead of capturing a second one.
+    //
+    // Every first-page read used to create a NEW view even when an equivalent
+    // one was alive. Those captures evicted the view a paginating reader was
+    // still walking (maxViews is small), so the next cursor page answered
+    // `cursor-stale` — observed live: 8 view-creating reads against 9 cursor
+    // reads in one session, most cursor pages stale, so the detail table never
+    // got past page one and the per-tool panels showed a single tool.
+    //
+    // A view is identified by its filter AND the corpus generation it froze.
+    // Same filter, same generation => byte-identical rows, so returning the
+    // live view is exactly what a caller would have got by capturing again.
+    const wanted = filterKey(filter)
+    const frozen = projection.data.generation
+    for (const existing of this.views.values()) {
+      if (existing.filterKey === wanted && existing.generation === frozen) {
+        // Touch it: a reader that is actively paging must not have its view
+        // expire underneath it, or the next cursor page fails the same way.
+        existing.capturedAt = this.now()
+        return { kind: 'ok', view: existing }
+      }
+    }
     this.evictExpired()
     while ((this.views.size >= this.maxViews || this.totalBytes + bytes > this.maxBytes) && this.views.size > 0) this.evictOldest()
     const view: View = { ...projection.data, stamp, filter, filterKey: filterKey(filter), capturedAt: this.now(), bytes }

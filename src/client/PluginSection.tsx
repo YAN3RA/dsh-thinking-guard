@@ -120,6 +120,7 @@ export type PluginSectionKey =
   | 'guardStatsTitle'
   | 'guardStatObservations'
   | 'guardStatObservationsHint'
+  | 'guardStatObservationsZeroHint'
   | 'guardStatOutcomes'
   | 'guardStatOutcomesHint'
   | 'guardStatReminders'

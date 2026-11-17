@@ -157,7 +157,10 @@ function GuardStatsBoard(props: { readonly t: (key: PluginSectionKey) => string;
   )
   return createElement('div', { className: 'v3-guard-stats' },
     createElement('div', { className: 'v3-stats', 'data-guard-stats': 'true', role: 'group', 'aria-label': t('guardStatsTitle') },
-      cell(t('guardStatObservations'), statText(stats?.observations), t('guardStatObservationsHint')),
+      // A zero here is truthful (counts are per process, never backfilled), but it
+      // reads as a black box unless the page says why it is zero.
+      cell(t('guardStatObservations'), statText(stats?.observations),
+        stats?.observations === 0 ? t('guardStatObservationsZeroHint') : t('guardStatObservationsHint')),
       cell(t('guardStatOutcomes'), statText(outcomes?.success) + ' / ' + statText(outcomes?.error), t('guardStatOutcomesHint')),
       cell(t('guardStatReminders'), statText(reminders?.repeat) + ' / ' + statText(reminders?.cycle), t('guardStatRemindersHint')),
       cell(t('guardStatDenials'), statText(stats?.denials), t('guardStatDenialsHint')),

@@ -491,6 +491,12 @@ const statusDataSchema = z.object({
     round: z.number().int().min(0),
   }).optional(),
   visibleSessions: z.number().int().min(0),
+  /**
+   * De-duplicated Sessions in this generation's progress denominator:
+   * |visible ∪ failures|. Optional so an older Host omits it; the client then
+   * falls back to `visible` (and to the old approximation only if that is 0).
+   */
+  scopeSessions: z.number().int().min(0).optional(),
   completedSessions: z.number().int().min(0),
   pendingSessions: z.number().int().min(0),
   failedSessions: z.number().int().min(0),

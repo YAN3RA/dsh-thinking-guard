@@ -1952,8 +1952,29 @@ export function callIndexScanProgress(status: CallIndexStatusView | undefined): 
   // `completed` counts coverage-complete Sessions only, so an under-reported but
   // fully read corpus looked like "nothing to index". Exhausted Sessions are a
   // read fact and belong in the denominator.
-  const exhausted = sessions.exhausted ?? 0
-  const total = sessions.completed + sessions.pending + Math.max(0, exhausted - sessions.completed)
+  //
+  // The denominator is the Host's de-duplicated census `scopeSessions`
+  // (|visible ∪ failures|), computed in this generation's snapshot. It needs no
+  // summing or approximation: summing `completed + pending + exhausted` counted
+  // the same Session several times (a stale Session is pending AND exhausted,
+  // and completed Sessions are exhausted by construction).
+  //
+  // NOTE on the 0% symptom: "0 / 2" and "0 / 1" are BOTH 0%. What pinned the bar
+  // at 0% was the NUMERATOR — `completed` excludes `stale` Sessions — not the
+  // denominator. Fixing the denominator removes the phantom extra member; the
+  // numerator's stale treatment is a separate product question.
+  //
+  // Backward compatibility: an older Host omits `scopeSessions`, so fall back
+  // to `visible` (also the Host's in-register size). Only when neither is
+  // available do we use the old lower-bound approximation. That approximation
+  // assumes every exhausted-but-not-completed Session is exactly one pending
+  // Session; for a D-030 Session read to EOF but coverage `partial` and neither
+  // pending nor failed, the `exhausted - completed` term over-subtracts, so it
+  // UNDERCUTS by at most min(that class's size, pending − |pending ∩ exhausted|)
+  // members. `scopeSessions`/visible avoid that entirely.
+  const approximateTotal = Math.max(sessions.completed, sessions.exhausted ?? 0)
+    + Math.max(0, sessions.pending - Math.max(0, (sessions.exhausted ?? 0) - sessions.completed))
+  const total = sessions.scopeSessions ?? (sessions.visible > 0 ? sessions.visible : approximateTotal)
   if (total <= 0) {
     return {
       detail: running ? '正在枚举会话…' : '没有可索引的会话。',
@@ -1970,7 +1991,14 @@ export function callIndexScanProgress(status: CallIndexStatusView | undefined): 
   // Two DIFFERENT terminal stories must never read the same:
   // - read finished, coverage partial  → a diagnosis about the data (under-report);
   // - read unfinished and paused       → work is owed and stopped on capacity.
+  // `exhaustedSessions >= total` alone is NOT "read finished": under the
+  // de-duplicated denominator (see above) a single stale Session makes total 1
+  // while exhaustedSessions is 1, so this alone would claim 「读取已完成」 for a
+  // Session that is still PENDING (E-01's own census). "Finished" also requires
+  // that no Session is owed or broken — anything pending or failed means the
+  // walk is not done.
   const readDone = status.exhaustedSessions !== undefined && status.exhaustedSessions >= total
+    && sessions.pending === 0 && sessions.failed === 0
   const pausedNow = status.paused === true || status.reasons.includes('scan-paused-capacity')
   const tail = pausedNow
     ? '；因容量上限暂停，可恢复（已读进度保留）'

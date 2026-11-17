@@ -768,8 +768,29 @@ export class SessionCallIndex {
       this.ledger = { used: 0 }
       this.published.clear(); this.stages.clear(); this.live.clear(); this.observedThrough.clear(); this.visible.clear()
       this.pending.clear(); this.failures.clear(); this.reasons.clear()
+      // `targetsById` and `digests` are per-generation identity/artifact state.
+      // They are rebuilt by the next pass anyway, but clearing them with the
+      // rest keeps the new generation from ever resolving an old target/digest.
+      this.targetsById.clear(); this.digests.clear()
       this.deferredWarm.length = 0; this.warmSaved.clear(); this.cacheNotes.clear()
       this.liveCount = 0; this.enumerated = false; this.enumerationCurrent = false; this.listedCount = 0; this.asOf = undefined
+      // A new token is a new generation: the scan phase and the capacity-pause
+      // flag describe the OLD one and must not leak into it. Without this reset,
+      // a mode/backend change cleared pending/failures/reasons while leaving
+      // `phase: 'partial'` (partial + no reasons) or `paused: true` behind.
+      // `dispose()` already resets the phase the same way.
+      this.phase = 'idle'; this.paused = false
+      // Same rule for the per-pass counters. `exhaustedCount` is written ONLY at
+      // a pass tail; left unreset it reports the PREVIOUS generation's read fact
+      // right after a scope switch, which (with the de-duplicated progress
+      // denominator) produced a "0 / N completed" bar and a false 「读取已完成」.
+      this.exhaustedCount = 0; this.progressEvents = 0
+      this.passReadEvents = 0; this.passPages = 0; this.passSessions = 0; this.passCut = 0
+      // The progress baseline is (session, revision) -> cut. A stale baseline
+      // suppresses the first pass's advance for a same-id/revision Session after
+      // a scope switch (the `cut > prior.cut` test never fires), so a large
+      // corpus could look stalled and trip the runtime's stagnation stop.
+      this.progressBase.clear()
       this.generation += 1
     }
     return scope.status === 'ready' ? scope : undefined
@@ -853,6 +874,11 @@ export class SessionCallIndex {
       this.publish(stage)
       // Data is current through an observed cut; corpus enumeration still needs reconciliation.
       this.pending.add(id)
+      // TG-09: a Session that stays pending owes work, and every owed-work state
+      // must carry a FIXED reason code. This path used to add the pending mark and
+      // say nothing, so a snapshot could report "still pending" with an empty
+      // reason list — the one combination the contract forbids.
+      this.gap('scan-pending')
       changed = true
     }
     if (changed) { this.enumerationCurrent = false; this.generation += 1 }
@@ -873,6 +899,7 @@ export class SessionCallIndex {
     this.token = undefined
     this.published.clear(); this.stages.clear(); this.live.clear(); this.observedThrough.clear(); this.visible.clear()
     this.pending.clear(); this.failures.clear(); this.reasons.clear(); this.targetsById.clear(); this.digests.clear()
+    this.progressBase.clear()
     this.deferredWarm.length = 0; this.warmSaved.clear()
     this.ledger = { used: 0 }; this.liveCount = 0; this.enumerated = false; this.enumerationCurrent = false
     this.listedCount = 0; this.asOf = undefined; this.phase = 'idle'
@@ -1425,6 +1452,45 @@ export class SessionCallIndex {
     const retained = entries.flatMap(([, entry]) => entry.value.rows)
     const rows = includeRows ? retained.map(row => ({ ...row })) : []
     const counted = retained.filter(row => !row.inherited)
+    /**
+     * TG-09, enforced at the SNAPSHOT layer instead of per write path.
+     *
+     * The phase was only ever re-derived when a pass ended, but Sessions become
+     * pending on many other paths — a live flush after the pass already settled,
+     * a warm restore, a capacity pause, a live-only retention — so the outward
+     * value could say `complete` while `pendingSessions`/read failures said
+     * work was still owed. The reader then saw 「扫描已完成」 next to 「还有 N 个会话
+     * 待补扫」 and a progress bar pinned at 0%.
+     *
+     * Deriving it here, from the state the snapshot REPORTS, makes the
+     * contradiction unrepresentable for every write path at once. Only the
+     * reachable-after-work values are downgraded: a cancelled or failed pass is
+     * already a truthful terminal story and must not be rewritten as partial.
+     */
+    const owed = this.pending.size > 0 || this.failures.size > 0
+    // `partial` means "a pass really ran and stopped with work left" (see the
+    // phase field's own definition). Downgrade an owed-work `complete` scan, and
+    // an `idle` that has ALREADY enumerated in this generation — but never a
+    // purely live-observed engine that has never scanned: that stays `idle`
+    // ("no scan has ever run"), carrying its pending count and reason instead.
+    const phase = owed && (this.phase === 'complete' || (this.phase === 'idle' && this.enumerated)) ? 'partial' as const : this.phase
+    /**
+     * Attach the fixed `scan-pending` code to the snapshot that this derivation
+     * just downgraded, so a partial snapshot never claims completion with an
+     * empty reason list (TG-09).
+     *
+     * This is a VIEW-ONLY backup, not the primary source: `flushLive()` records
+     * `scan-pending` into `this.reasons` itself, and so does the pass tail. The
+     * backup exists precisely because `this.reasons` is bounded to 32 codes — once
+     * it is full the primary `gap()` is dropped, and only this projection can
+     * still describe the owed work. It stays out of `this.reasons` so the bound
+     * and the next-census reset keep their meaning.
+     *
+     * Only PENDING work gets this code: read failures carry their own fixed codes
+     * (`session-read-failed`, `session-decode-failed`, …), and labelling a
+     * failure-only snapshot "scan-pending" would misname a 0-pending state.
+     */
+    const pendingReason = this.pending.size > 0 && phase === 'partial' && !this.reasons.has('scan-pending')
     const complete = this.lastScope.status === 'ready' && this.enumerated && this.enumerationCurrent && this.pending.size === 0 && this.failures.size === 0 && this.reasons.size === 0 && sessions.every(session => session.coverage === 'complete')
     const coverage = complete ? 'complete' as const : this.enumerated || this.visible.size > 0 ? 'partial' as const : 'unknown' as const
     // Every numeric field in this snapshot reaches the wire, where a single
@@ -1441,10 +1507,27 @@ export class SessionCallIndex {
     return {
       corpus: 'persisted-plus-observed-live' as const,
       scope: describeCallIndexScope(this.lastScope), generation: this.generation, censusGeneration: this.censusGeneration,
-      asOf: this.asOf, phase: this.phase, coverage, eventCoverage: coverage,
+      asOf: this.asOf, phase, coverage, eventCoverage: coverage,
       enumerationCoverage: !this.enumerationCurrent ? 'unknown' as const : this.reasons.has('session-capacity') || this.reasons.has('invalid-session-metadata') ? 'partial' as const : 'complete' as const,
       semanticCoverage: { source: this.options.resolveSource === undefined ? 'unknown' as const : 'verified' as const, ptc: 'unknown' as const, skillExecution: 'unavailable' as const, denied: 'unavailable' as const },
       listedSessions: finite(this.listedCount), visibleSessions: finite(this.visible.size), completedSessions: sessions.filter(session => session.coverage === 'complete' && !session.stale).length,
+      /**
+       * De-duplicated Sessions in THIS generation's progress denominator:
+       * |visible ∪ failures|. It is the census the progress bar divides by.
+       *
+       * `visible` alone misses a Session that went BAD and left the register —
+       * the `session-disappeared` branch adds it to `failures` and deletes it
+       * from `visible`, so counting only `visible` silently drops that member.
+       * Includes observed live-only Sessions (they are in `visible`); excludes
+       * Sessions rejected for capacity/metadata (those carry
+       * `session-capacity`/`invalid-session-metadata` and never entered either
+       * set). By construction >= completedSessions and >= pendingSessions.
+       *
+       * Computed from the live sets here, NOT from the pass-tail `exhaustedCount`
+       * (which is only written at a pass end and would be stale after a scope
+       * switch).
+       */
+      scopeSessions: finite(new Set<string>([...this.visible, ...this.failures]).size),
       pendingSessions: finite(this.pending.size), failedSessions: finite(this.failures.size), pendingLive: finite(this.liveCount),
       // Diagnostic pair: what the backend CLAIMED per session vs what we actually
       // read. Equal values mean the scan saw the whole log; a large gap means the
@@ -1483,7 +1566,7 @@ export class SessionCallIndex {
       progressEvents: finite(this.progressEvents),
       // A pass that stopped on capacity is RESUMABLE, not failed, and says so.
       paused: this.paused === true,
-      estimatedBytes: finite(this.ledger.used), reasons: [...this.reasons], sessions, rows,
+      estimatedBytes: finite(this.ledger.used), reasons: pendingReason ? [...this.reasons, 'scan-pending'] : [...this.reasons], sessions, rows,
       totals: { calls: counted.length, succeeded: counted.filter(row => row.outcome === 'success').length, failed: counted.filter(row => row.outcome === 'error').length, unresolved: counted.filter(row => row.outcome === 'unresolved').length, unknown: counted.filter(row => row.outcome === 'unknown').length, cancelled: counted.filter(row => row.outcome === 'cancelled').length, running: counted.filter(row => row.outcome === 'running').length, inherited: retained.length - counted.length },
     }
   }

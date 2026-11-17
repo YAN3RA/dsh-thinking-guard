@@ -510,3 +510,169 @@ describe('read failures are classified, not flattened', () => {  /** Start a sca
     expect(reasons.join(' ')).not.toContain('SECRET-PAYLOAD-CANARY')
   })
 })
+/**
+ * E-01 regression: a scan settles `complete`, then a live event arrives.
+ *
+ * `flushLive()` adds the Session to `pending` and sets `enumerationCurrent =
+ * false` but (before the fix) never recorded a reason and never touched the
+ * phase, so the snapshot reported `phase: 'complete'` with
+ * `pendingSessions: 1` and an empty `reasons` — exactly the 「最近扫描
+ * complete」 next to 「还有 1 个会话待补扫」 contradiction, with a 0% bar.
+ *
+ * The invariant is now enforced in `snapshot()` (for every write path), and
+ * `flushLive()` also records the fixed code. This test asserts the OUTWARD
+ * state, so it fails on the old logic and passes only when the contradiction is
+ * unrepresentable.
+ */
+describe('E-01: a settled scan + a late live event is never complete-with-pending', () => {
+  it('downgrades the outward phase and attaches the fixed reason after flushLive', async () => {
+    const value = doc()
+    const f = fixture([value])
+    const index = engine(f)
+    const settled = await index.start()
+    // Baseline: nothing is owed, so the honest story is a complete scan.
+    expect(settled.phase).toBe('complete')
+    expect(settled.pendingSessions).toBe(0)
+    expect(settled.reasons).toEqual([])
+
+    // A live event past the persisted cut lands AFTER the pass set the phase.
+    const extended = doc('a', 2)
+    expect(index.observeLive('a', extended.events[2]!, 0)).toBe(true)
+    const live = index.flushLive()
+
+    // The Session is visible and owed work is real…
+    expect(live.visibleSessions).toBe(1)
+    expect(live.pendingSessions).toBe(1)
+    // …so the phase must not claim completion, and the pending mark must carry
+    // its fixed reason code (TG-09: never complete with a "still pending" note).
+    expect(live.phase).not.toBe('complete')
+    expect(live.phase).toBe('partial')
+    expect(live.reasons).toContain('scan-pending')
+    expect(live.coverage).not.toBe('complete')
+  })
+
+  it('does not let a phase=complete, pending>0 snapshot out of snapshot() on any path', async () => {
+    const value = doc()
+    const f = fixture([value])
+    const index = engine(f)
+    await index.start()
+    // Live events on a Session that was never listed (listedSessions stays 0,
+    // visible becomes 1) — the shape the operator actually saw.
+    const extra = doc('extra', 0)
+    expect(index.observeLive('extra', extra.events[0] ?? value.events[0]!, 0)).toBe(true)
+    for (const status of [index.flushLive(), index.snapshot(false)]) {
+      expect(status.phase === 'complete' && status.pendingSessions > 0).toBe(false)
+      if (status.pendingSessions > 0) expect(status.reasons.length).toBeGreaterThan(0)
+    }
+  })
+  it('keeps a never-scanned live-only engine at idle, not partial (idle means "no scan ever ran")', async () => {
+    // Mandatory #2: `partial` is defined as "a pass really ran and stopped with
+    // work left". An engine that has NEVER scanned, only observed live events,
+    // must stay `idle` — the wire says idle = "no scan has ever run in this
+    // generation". It still reports pending work and the fixed reason so nothing
+    // is hidden; only the phase label is honest about `idle`.
+    const value = doc()
+    const f = fixture([])
+    const index = engine(f)
+    expect(index.observeLive('a', value.events[0]!, 0)).toBe(true)
+    const live = index.flushLive()
+    expect(live.phase).toBe('idle')
+    expect(live.pendingSessions).toBeGreaterThan(0)
+    expect(live.reasons).toContain('scan-pending')
+    // Never listed/open history: this is purely live-observed.
+    expect(f.service.list).not.toHaveBeenCalled()
+    expect(f.service.open).not.toHaveBeenCalled()
+  })
+
+  it('resets phase and paused when the scope token changes (no stale partial / paused across generations)', async () => {
+    // Mandatory #1: a mode/backend change replaces the token and clears the
+    // census sets, but the OLD generation's phase/paused used to survive. That
+    // leaked "phase=partial with reasons=[]" and "paused:true" into a fresh
+    // generation. This drives a real token change and asserts the outward state.
+    const f = fixture([doc()])
+    let backend: CallIndexBackend | undefined = f.service
+    const index = engine(f, { getBackend: () => backend })
+    const scanned = await index.start()
+    // The completed pass really recorded a read fact for this generation.
+    expect(scanned.exhaustedSessions).toBe(1)
+    expect(index.snapshot(false).phase).toBe('complete')
+    // Swap the backend identity → syncScope sees a NEW token and must reset.
+    backend = undefined
+    const degraded = index.snapshot(false)
+    expect(degraded.scope.status).not.toBe('ready')
+    // Now a genuinely new ready backend: a fresh generation.
+    backend = f.service
+    const fresh = index.snapshot(false)
+    expect(fresh.phase).toBe('idle')
+    expect(fresh.paused).toBe(false)
+    // Mandatory C: the previous generation's per-pass read fact must NOT leak.
+    // Left unreset it reported exhaustedSessions:1 right after the switch, which
+    // (with the de-duplicated denominator) produced "已完成 0 / N" + a false
+    // 「读取已完成」 in the fresh generation.
+    expect(fresh.exhaustedSessions).toBe(0)
+    expect(fresh.progressEvents).toBe(0)
+    expect(fresh.passReadEvents).toBe(0)
+    // No owed-work snapshot may pair partial with an empty reason list.
+    expect(fresh.phase === 'partial' && fresh.reasons.length === 0).toBe(false)
+  })
+})
+describe('scopeSessions: exact progress denominator (|visible ∪ failures|)', () => {
+  it('counts the de-duplicated member set on the E-01 census (1, not 2)', async () => {
+    const value = doc()
+    const f = fixture([value])
+    const index = engine(f)
+    const settled = await index.start()
+    // One Session, read to EOF, coverage complete → visible + exhausted both 1.
+    expect(settled.visibleSessions).toBe(1)
+    expect(settled.exhaustedSessions).toBe(1)
+    expect(settled.scopeSessions).toBe(1)
+    // A late live event makes it pending/stale but does NOT create a new member.
+    const extended = doc('a', 2)
+    index.observeLive('a', extended.events[2]!, 0)
+    const live = index.flushLive()
+    expect(live.visibleSessions).toBe(1)
+    expect(live.pendingSessions).toBe(1)
+    // Still exactly one in-register Session: the denominator must not become 2.
+    expect(live.scopeSessions).toBe(1)
+  })
+
+  it('keeps a Session that DISAPPEARED (failed, dropped from visible) in the denominator', async () => {
+    // The `session-disappeared` branch adds to failures and deletes from visible,
+    // so counting only `visible` would drop that member from the bar. scopeSessions
+    // is |visible ∪ failures| and must still count it.
+    const value = doc()
+    const f = fixture([value])
+    const index = engine(f)
+    // The Session is listed and read to EOF, but the post-read stat says the
+    // artifact is gone → failures.add + visible.delete.
+    vi.mocked(f.service.stat).mockImplementation(async () => undefined)
+    const status = await index.start()
+    expect(status.failedSessions).toBe(1)
+    expect(status.visibleSessions).toBe(0)
+    // |visible(0) ∪ failures(1)| = 1: the broken member still counts.
+    expect(status.scopeSessions).toBe(1)
+    expect(status.reasons).toContain('session-disappeared')
+  })
+})
+describe('per-generation state does not leak across a scope switch', () => {
+  it('clears the (session, revision) progress baseline on a token change', async () => {
+    // Item 2: `progressBase` maps (session, revision) -> cut and feeds
+    // progressEvents. A baseline from the OLD generation suppresses the first
+    // pass's advance after a switch (cut > prior.cut never fires for the same
+    // id+revision), which could stall a large corpus. This asserts the map is
+    // emptied at the generation boundary (white-box: the outward progressEvents
+    // is 0 for a first sighting either way, so the map size is the honest signal).
+    const f = fixture([doc('a', 2)])
+    let backend: CallIndexBackend | undefined = f.service
+    const index = engine(f, { getBackend: () => backend })
+    await index.start()
+    const inner = index as unknown as { progressBase: Map<string, unknown> }
+    expect(inner.progressBase.size).toBeGreaterThan(0)
+    // Force a new generation.
+    backend = undefined
+    index.snapshot(false)
+    backend = f.service
+    index.snapshot(false)
+    expect(inner.progressBase.size).toBe(0)
+  })
+})

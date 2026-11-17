@@ -332,7 +332,7 @@ export function installCallIndexRuntime(ctx: Context, config: CallIndexRuntimeCo
         ...(value.asOf === undefined ? {} : { asOf: value.asOf }), phase: value.phase,
         coverage: value.coverage, eventCoverage: value.eventCoverage,
         enumerationCoverage: value.enumerationCoverage, semanticCoverage: value.semanticCoverage,
-        listedSessions: value.listedSessions, visibleSessions: value.visibleSessions, completedSessions: value.completedSessions,
+        listedSessions: value.listedSessions, visibleSessions: value.visibleSessions, scopeSessions: value.scopeSessions, completedSessions: value.completedSessions,
         declaredEvents: value.declaredEvents, readEvents: value.readEvents,
         // Per-pass progress and the capacity-pause flag travel with the status so
         // the page can distinguish "working, nothing retained yet" from "dead".

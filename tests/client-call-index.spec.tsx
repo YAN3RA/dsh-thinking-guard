@@ -1562,6 +1562,88 @@ describe('empty corpus explains itself', () => {
     expect(callIndexScanProgress(noCensus).percent).toBeUndefined()
     expect(callIndexScanProgress(undefined).percent).toBeUndefined()
   })
+
+  it('does not double-count an exhausted Session that is also pending (E-01: bar stuck at 0%)', () => {
+    // The exact E-01 census: one Session exists, it was read to EOF (exhausted),
+    // but a late live event made it stale/pending, so completed drops to 0. The
+    // old denominator counted it BOTH as pending (1) and as exhausted-minus-
+    // completed (1) → total 2, completed 0 → a bar pinned at 0% forever.
+    const status = {
+      ...statusWith([]),
+      phase: 'partial',
+      reasons: ['scan-pending'],
+      // The real wire always carries the top-level exhaustedSessions counter;
+      // it is what the (now de-duplicated) denominator compares against, so the
+      // readDone false-positive (Mandatory A) only appears when it is present.
+      exhaustedSessions: 1,
+      paused: false,
+      sessions: { listed: 0, visible: 1, scopeSessions: 1, pending: 1, pendingLive: 0, completed: 0, failed: 0, exhausted: 1 },
+    } as unknown as StatusView
+    const progress = callIndexScanProgress(status)
+    // One Session, not two: the Host's census is 1, so the denominator is 1.
+    expect(progress.detail).toContain('已完成 0 / 1')
+    expect(progress.detail).not.toContain('/ 2 ')
+    // Mandatory A: total 1 cannot be read as "read finished" while this very
+    // Session is PENDING.
+    expect(progress.detail).not.toContain('读取已完成')
+  })
+
+  it('still reaches 100% when a fully-read corpus is all complete (no double-count)', () => {
+    const status = {
+      ...statusWith([]),
+      phase: 'complete',
+      sessions: { listed: 116, visible: 116, scopeSessions: 116, pending: 0, pendingLive: 0, completed: 116, failed: 0, exhausted: 116 },
+    } as unknown as StatusView
+    expect(callIndexScanProgress(status).percent).toBe(100)
+    expect(callIndexScanProgress(status).detail).toContain('已完成 116 / 116')
+  })
+
+  it('uses the Host census so a D-030 corpus is no longer under-counted', () => {
+    // (completed 8, pending 6, exhausted 10): ten Sessions were read to EOF, but
+    // two of them are coverage-partial and neither pending nor failed. The old
+    // approximation counted only 8 + max(0, 6 - (10-8)) = 10, missing nothing —
+    // but the exact union the Host now publishes is still the source of truth and
+    // must be used verbatim, never re-derived from the fallback formula.
+    const status = {
+      ...statusWith([]),
+      phase: 'partial',
+      exhaustedSessions: 10,
+      // scopeSessions = |visible ∪ failures| = 10 distinct Sessions.
+      sessions: { listed: 10, visible: 10, scopeSessions: 10, completed: 8, pending: 6, failed: 0, pendingLive: 0, exhausted: 10 },
+    } as unknown as StatusView
+    const progress = callIndexScanProgress(status)
+    // 8 / 10 = 80%, not inflated by a phantom member.
+    expect(progress.percent).toBe(80)
+    expect(progress.detail).toContain('已完成 8 / 10')
+  })
+
+  it('falls back to visible when an older Host omits scopeSessions', () => {
+    const status = {
+      ...statusWith([]),
+      phase: 'partial',
+      sessions: { listed: 5, visible: 5, completed: 0, pending: 5, failed: 0, pendingLive: 0, exhausted: 5 },
+    } as unknown as StatusView
+    const progress = callIndexScanProgress(status)
+    // No scopeSessions: use visible (5), NOT the approximation.
+    expect(progress.detail).toContain('已完成 0 / 5')
+  })
+
+  it('falls back to the approximation only when neither scopeSessions nor visible is available', () => {
+    // Old Host with visible 0 (e.g. a census that reported no visible set):
+    // the approximation must still produce a sane denominator without crashing.
+    const status = {
+      ...statusWith([]),
+      phase: 'partial',
+      sessions: { listed: 0, visible: 0, completed: 2, pending: 3, failed: 0, pendingLive: 0, exhausted: 4 },
+    } as unknown as StatusView
+    const progress = callIndexScanProgress(status)
+    // approximation: max(2,4) + max(0, 3 - max(0, 4-2)) = 4 + 1 = 5.
+    expect(progress.percent).toBe(40)
+    expect(progress.detail).toContain('已完成 2 / 5')
+    // And a total of 0 must still return the honest "nothing to index" branch.
+    const empty = { ...statusWith([]), sessions: { listed: 0, visible: 0, completed: 0, pending: 0, failed: 0, pendingLive: 0 } } as unknown as StatusView
+    expect(callIndexScanProgress(empty).percent).toBeUndefined()
+  })
 })
 
 describe('a rejected scan trigger is never silent', () => {

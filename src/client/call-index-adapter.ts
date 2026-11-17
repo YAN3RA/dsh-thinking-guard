@@ -246,6 +246,12 @@ export interface CallIndexSessionCensus {
   readonly failed: number
   readonly pendingLive: number
   /**
+   * De-duplicated Sessions in this generation's progress denominator:
+   * |visible ∪ failures|. Optional: an older Host omits it and the progress bar
+   * falls back to `visible`.
+   */
+  readonly scopeSessions?: number
+  /**
    * Sessions read through EOF, independent of coverage.
    *
    * Optional: an older Host does not send it, and the page must then fall back to
@@ -709,6 +715,7 @@ function projectStatus(data: Record<string, unknown>): CallIndexResult<CallIndex
     semanticCoverage,
     sessions: {
       listed, visible, completed, pending, failed, pendingLive,
+      ...(readCount(data.scopeSessions) === undefined ? {} : { scopeSessions: readCount(data.scopeSessions)! }),
       ...(readCount(data.exhaustedSessions) === undefined ? {} : { exhausted: readCount(data.exhaustedSessions)! }),
     },
     estimatedBytes,

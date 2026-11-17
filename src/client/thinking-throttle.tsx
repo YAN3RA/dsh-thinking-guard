@@ -79,7 +79,9 @@ export function ThinkingThrottleSection(props: ThinkingThrottleInjected): ReactE
         </div>
       </div>
       <div className="tt-body" role="tabpanel" data-active-tab={active}>
-        {active === 'overview' ? <OverviewSection {...props.overview} /> : null}
+        {active === 'overview'
+          ? <OverviewSection {...props.overview} onOpenCapability={() => { setActive('capability') }} />
+          : null}
         {active === 'guard' ? <GuardSection {...props.guard} /> : null}
         {active === 'capability' ? <CapabilitySection {...props.capability} /> : null}
       </div>

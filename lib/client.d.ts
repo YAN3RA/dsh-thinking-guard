@@ -81,10 +81,10 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
 /**
  * 本面板用到的全部文案键。
  *
- * 与旧插件同名键逐一对齐，因此 locale 字典里的中文说明可以直接沿用；不属于本页
- * 的键（tab 标签、总览、调用统计）不再出现在这里，也不再有任何外部 union 依赖。
+ * 与旧插件同名键逐一对齐的部分（阈值编辑器、生效范围）保留原措辞；三张机制卡的
+ * 说明改成结构化的「触发条件 / 处理方式 / 执行边界 / 参数」四块。
  */
-type GuardPanelKey = 'guardStatsTitle' | 'guardStatObservations' | 'guardStatObservationsHint' | 'guardStatObservationsZeroHint' | 'guardStatOutcomes' | 'guardStatOutcomesHint' | 'guardStatReminders' | 'guardStatRemindersHint' | 'guardStatDenials' | 'guardStatDenialsHint' | 'guardThresholds' | 'guardThresholdSave' | 'guardThresholdDraftHint' | 'guardThresholdHint' | 'guardBoundaryShort' | 'guardScopeTitle' | 'guardScopeBody' | 'guardScopeFoot' | 'guardSectionA' | 'guardSectionB' | 'guardSectionC' | 'guardABody1' | 'guardABody2' | 'guardABody3' | 'guardBBody1' | 'guardBBody2' | 'guardBBody3' | 'guardCBody1' | 'guardCBody2' | 'guardCBody3' | 'guardPurposeB' | 'guardPurposeC' | 'guardFired' | 'guardFootCycle' | 'guardFootNoProgress';
+type GuardPanelKey = 'guardSectionStatusOn' | 'guardSectionStatusOff' | 'guardSectionStatusUnknown' | 'guardBlockTrigger' | 'guardBlockAction' | 'guardBlockBoundary' | 'guardBlockParams' | 'guardThresholds' | 'guardThresholdSave' | 'guardThresholdDraftHint' | 'guardThresholdHint' | 'guardStageAt' | 'guardStageOnly' | 'guardStageFirst' | 'guardStageAgain' | 'guardStageTop' | 'guardScopeTitle' | 'guardScopeBody' | 'guardScopeFoot' | 'guardSectionA' | 'guardASummary' | 'guardATrigger' | 'guardAAction' | 'guardABoundary' | 'guardSectionB' | 'guardBSummary' | 'guardBTrigger' | 'guardBAction' | 'guardBBoundary' | 'guardBFlowNodeA' | 'guardBFlowNodeB' | 'guardBFlowNote' | 'guardSectionC' | 'guardCSummary' | 'guardCTrigger' | 'guardCAction' | 'guardCBoundary';
 //#endregion
 //#region src/client/guard-section.d.ts
 /**
@@ -868,12 +868,19 @@ interface CapabilityPolicyRemote {
 //#endregion
 //#region src/client/overview-section.d.ts
 /** 本页文案键。zh / en 两份字典的键必须与此完全一致。 */
-type OverviewKey = 'nav' | 'title' | 'desc' | 'overviewRefresh' | 'overviewRefreshing' | 'overviewLoading' | 'overviewUnknown' | 'overviewGuardTitle' | 'overviewGuardSource' | 'overviewGuardError' | 'overviewGuardObservations' | 'overviewGuardRepeat' | 'overviewGuardCycle' | 'overviewGuardDenials' | 'overviewGuardSwitches' | 'overviewGuardMaster' | 'overviewGuardDuplicate' | 'overviewGuardCycleSwitch' | 'overviewGuardNoProgress' | 'overviewSwitchOn' | 'overviewSwitchOff' | 'overviewGuardDiag' | 'overviewGuardEffective' | 'overviewGuardNotEffective' | 'overviewDiagInvalidPatch' | 'overviewDiagNotMounted' | 'overviewDiagPersistenceDirty' | 'overviewDiagWriteFailed' | 'overviewDiagNone' | 'overviewCatalogTitle' | 'overviewCatalogSource' | 'overviewCatalogError' | 'overviewCatalogResident' | 'overviewCatalogOnDemand' | 'overviewCatalogDisabled' | 'overviewCatalogTotal' | 'overviewCatalogVersion' | 'overviewCatalogObservedAt' | 'overviewCatalogTools' | 'overviewCatalogSkills' | 'overviewCatalogSkillsHint' | 'overviewCatalogState' | 'overviewCatalogStateEmpty' | 'overviewCatalogStateReady' | 'overviewCatalogStateHint' | 'overviewCatalogDiag' | 'overviewCatalogDiagUnavailable' | 'overviewCatalogDiagShadowed' | 'overviewCatalogDiagBrokenPreset';
-/** Props injected by the `settings.section` registration (see index.ts). */
+type OverviewKey = 'nav' | 'title' | 'overviewRefresh' | 'overviewRefreshing' | 'overviewLoading' | 'overviewUnknown' | 'overviewStatusTitle' | 'overviewStatusGuards' | 'overviewStatusMount' | 'overviewStatusPersist' | 'overviewStatusGuardsSuffix' | 'overviewStatusGuardsMasterOff' | 'overviewStatusGuardsAllOff' | 'overviewStatusMounted' | 'overviewStatusNotMounted' | 'overviewStatusInvalidPatch' | 'overviewStatusPersistOk' | 'overviewStatusPersistDirty' | 'overviewStatusPersistFailed' | 'overviewStatusSourceSwitches' | 'overviewStatusSourceMount' | 'overviewStatusSourcePersist' | 'overviewStatsTitle' | 'overviewStatsNote' | 'overviewGuardObservations' | 'overviewGuardRepeat' | 'overviewGuardCycle' | 'overviewGuardDenials' | 'overviewHintObservations' | 'overviewHintRepeat' | 'overviewHintCycle' | 'overviewHintDenials' | 'overviewStatsSince' | 'overviewStatsLastReminder' | 'overviewStatsLastDenial' | 'overviewStatsEmpty' | 'overviewGuardSource' | 'overviewGuardError' | 'overviewCatalogTitle' | 'overviewCatalogTotal' | 'overviewCatalogResident' | 'overviewCatalogOnDemand' | 'overviewCatalogDisabled' | 'overviewCatalogRatio' | 'overviewCatalogTools' | 'overviewCatalogSkills' | 'overviewCatalogObservedAt' | 'overviewCatalogVersion' | 'overviewCatalogJump' | 'overviewCatalogSource' | 'overviewCatalogError';
+/** Props injected by the settings.section registration (see index.ts). */
 interface OverviewSectionInjected {
   guardRemote: GuardRemote;
   capabilityRemote: CapabilityPolicyRemote;
   t: (key: OverviewKey) => string;
+  /**
+   * 跳到「能力菜单」页签。
+   *
+   * 由外壳注入（thinking-throttle.tsx）；缺省时分类行退化为纯文本，不出现点不动的
+   * 按钮。只做页签跳转，不改能力菜单的过滤状态 —— 本页不该替另一页决定它显示什么。
+   */
+  onOpenCapability?: () => void;
 }
 //#endregion
 //#region src/client/CapabilitySection.d.ts

@@ -1,6 +1,6 @@
 {
   "name": "dsh-thinking-guard",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "为 DeepSeek Harness 提供「思考节流」设置页：一个入口三个子页（总览 / 思考限制 / 能力菜单），统一管理工具与技能、查看运行数据、执行重复与空转保护。",
   "license": "Apache-2.0",
   "repository": {

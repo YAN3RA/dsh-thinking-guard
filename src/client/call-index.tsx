@@ -104,6 +104,17 @@ export const CALL_INDEX_PAGE_LIMIT = 50
 export const MAX_AUTO_PAGES = 20
 
 /**
+ * How many times one auto-fill may RESTART after a stale cursor.
+ *
+ * A scan pass invalidates any cursor issued before it, and a finishing scan can
+ * invalidate several. With a single restart a churning corpus stopped at page one
+ * (one tool row for 20k calls, even though the scan reported complete); with no
+ * bound a pathological snapshot could spin. Three restarts is enough for the
+ * settle window and still finite.
+ */
+export const CALL_INDEX_STALE_RESTARTS = 3
+
+/**
  * The window 总览 aggregates over. Stated in the UI, never implied.
  *
  * `'all'`, not `30`: 总览 and 调用明细 must read the SAME corpus. While 总览
@@ -1582,7 +1593,7 @@ function OverviewTrendSvg(props: { readonly series: CallIndexTrendSeries }): Rea
     }
   }
   const svg = createElement('svg', {
-    className: 'v3-chart', viewBox: '0 0 ' + W + ' ' + H, preserveAspectRatio: 'none', role: 'img',
+    className: 'v3-chart', viewBox: '0 0 ' + W + ' ' + H, preserveAspectRatio: 'xMidYMid meet', role: 'img',
     width: W, height: H,
     style: { width: W + 'px', minWidth: '100%', height: H + 'px' },
     'aria-label': `${modeText}调用趋势（已索引部分）：${n} 个点，峰值 ${series.maxCalls} 次`,
@@ -3063,7 +3074,8 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
   /** How many extra pages 加载更多 has appended; 0 means only the first page. */
   const appendedPages = useRef(0)
   /** A stale cursor is allowed exactly ONE silent re-read per query lifetime. */
-  const cursorStaleRetried = useRef(false)
+  // How many stale-cursor RESTARTS this query has already used (bounded).
+  const cursorStaleRestarts = useRef(0)
   /** Set once paging has to stop (benign stale with no retry left) to halt auto-fill. */
   const pagingStopped = useRef(false)
   // A different query invalidates paging: the rows are a different set. This is
@@ -3074,7 +3086,7 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
   if (lastQueryKey.current !== queryKey) {
     lastQueryKey.current = queryKey
     appendedPages.current = 0
-    cursorStaleRetried.current = false
+    cursorStaleRestarts.current = 0
     pagingStopped.current = false
   }
   /** Snapshot id the on-screen page belongs to; a different one is a new generation. */
@@ -3171,7 +3183,7 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
           // the appended rows stale. Reset the paging counter so the auto-fill
           // rebuilds to the previous depth instead of sitting at page one behind
           // a stuck count — the TG-11 「满页→自动刷新→塌回首页」 case.
-          cursorStaleRetried.current = false
+          cursorStaleRestarts.current = 0
           pagingStopped.current = false
         }
         appendedPages.current = nextAppended
@@ -3256,13 +3268,17 @@ export function CallIndexDetailPanel({ api, initialQuery, resolveScopeTarget, re
         return
       }
       if (!result.ok) {
-        const action = callIndexMoreFailureAction(result, cursorStaleRetried.current)
+        const action = callIndexMoreFailureAction(result, cursorStaleRestarts.current >= CALL_INDEX_STALE_RESTARTS)
         if (action === 'retry') {
           // A completed re-read invalidated the old cursor: restart silently from
           // page one. No red block, no duplicate 「加载失败…」 line, and at most one
           // retry per query so a pathological snapshot cannot spin forever.
-          cursorStaleRetried.current = true
-          pagingStopped.current = true
+          cursorStaleRestarts.current += 1
+          // pagingStopped MUST stay false here: the auto-fill effect bails out on
+          // that flag and never re-reads it, so latching it froze the table at page
+          // one forever after a single stale cursor — a 20k-call corpus then showed
+          // exactly one tool row even though the scan had finished. The single-retry
+          // guard above is what bounds the loop.
           appendedPages.current = 0
           setState(previous => ({ ...previous, loadingMore: false, moreFailure: undefined }))
           setRefreshToken(value => value + 1)
@@ -3451,19 +3467,36 @@ export function CallIndexOverviewPanel({ api }: CallIndexOverviewPanelProps): Re
       let tools: readonly CallIndexToolRow[] | undefined
       let toolsFailure: CallIndexPanelFailure | undefined
       if (callsResult.ok) {
-        const items = [...callsResult.value.items]
-        let cursor = callsResult.value.nextCursor
+        let page = callsResult.value
+        let items = [...page.items]
+        let cursor = page.nextCursor
         let pages = 0
+        let restarts = 0
         while (cursor !== undefined && pages < MAX_AUTO_PAGES) {
           const next = await api.listCalls(query, cursor, anchor)
-          // A stale cursor here just means the snapshot was re-read; stop filling
-          // without turning expected churn into a visible failure.
-          if (!next.ok) { if (!callIndexIsCursorStale(next)) toolsFailure = next; break }
+          if (!next.ok) {
+            // A stale cursor means the snapshot was re-read (a scan pass landed).
+            // Restarting from a FRESH first page is what makes the ranking cover the
+            // corpus: breaking out here built the per-tool panels from page one
+            // alone, so a 20k-call corpus ranked a single tool row.
+            if (callIndexIsCursorStale(next) && restarts < 2) {
+              restarts += 1
+              const fresh = await api.listCalls(query, undefined, Date.now())
+              if (!fresh.ok) { if (!callIndexIsCursorStale(fresh)) toolsFailure = fresh; break }
+              page = fresh.value
+              items = [...fresh.value.items]
+              cursor = fresh.value.nextCursor
+              pages = 0
+              continue
+            }
+            if (!callIndexIsCursorStale(next)) toolsFailure = next
+            break
+          }
           items.push(...next.value.items)
           cursor = next.value.nextCursor
           pages += 1
         }
-        tools = callIndexToolRows({ ...callsResult.value, items })
+        tools = callIndexToolRows({ ...page, items })
       } else {
         toolsFailure = callsResult
       }

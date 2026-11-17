@@ -118,6 +118,43 @@ export function defaultGuardStateFile(): string {
   return join(dirname(defaultPatchFile()), 'dsh-thinking-guard', 'guard.json')
 }
 
+/** Where the Guard's cumulative counters live (survives restarts / plugin updates). */
+export function defaultGuardStatsFile(): string {
+  return join(dirname(defaultPatchFile()), 'dsh-thinking-guard', 'guard-stats.json')
+}
+
+/** Read the persisted counter snapshot; a missing file means "no history yet". */
+export async function readGuardStatsFile(file: string): Promise<GuardStatsSnapshot | undefined> {
+  let source: string
+  try {
+    source = await readFile(file, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
+  }
+  const record = object(JSON.parse(source) as unknown, 'guard stats file')
+  if (record['version'] !== 1) throw new Error('unsupported guard stats version')
+  const stats = record['stats']
+  if (stats === null || typeof stats !== 'object' || Array.isArray(stats)) {
+    throw new Error('guard stats must be an object')
+  }
+  return stats as GuardStatsSnapshot
+}
+
+/** Atomically replace the persisted counter snapshot. */
+export async function writeGuardStatsFile(file: string, stats: GuardStatsSnapshot): Promise<void> {
+  await mkdir(dirname(file), { recursive: true })
+  const content = JSON.stringify({ version: 1, stats }, null, 2) + '\n'
+  const temporary = `${file}.tmp-${randomUUID()}`
+  try {
+    await writeFile(temporary, content, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+    await rename(temporary, file)
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined)
+    throw error
+  }
+}
+
 /** The 0.1.x state file the Guard's switches used to live in (migration source). */
 export function legacyPolicyStateFile(): string {
   return join(dirname(defaultPatchFile()), 'capability-menu-policy.json')
@@ -318,6 +355,8 @@ export interface Config {
   readonly stateFile?: string
   /** Override the 0.1.x migration source; empty disables migration. */
   readonly legacyStateFile?: string
+  /** Override the counters file; empty disables counter persistence (tests). */
+  readonly statsFile?: string
 }
 
 export const name = 'thinking-guard-state'
@@ -332,6 +371,9 @@ export const name = 'thinking-guard-state'
  */
 export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   const stateFile = (config.stateFile ?? defaultGuardStateFile()).trim()
+  // Keep it next to the switch file (same directory), and disabled exactly when
+  // the switch file is disabled — that keeps tests using a temp dir self-contained.
+  const statsFile = (config.statsFile ?? (stateFile.length > 0 ? join(dirname(stateFile), 'guard-stats.json') : '')).trim()
   const legacyFile = (config.legacyStateFile ?? legacyPolicyStateFile()).trim()
   let saved: GuardStateRecord = {}
   if (stateFile.length > 0) {
@@ -347,6 +389,23 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     } catch (error) {
       ctx.logger.warn(`thinking-guard: cannot read Guard state ${stateFile}; using shipped defaults: ${String(error)}`)
       saved = {}
+    }
+  }
+
+  /**
+   * Restore the cumulative counters before any hook can observe a call, so the
+   * 总览 page does not drop to zero on every restart / plugin update.
+   */
+  let lastStatsJson = ''
+  if (statsFile.length > 0) {
+    try {
+      const stored = await readGuardStatsFile(statsFile)
+      if (stored !== undefined) {
+        processGuardStats.restore(stored)
+        lastStatsJson = JSON.stringify(stored)
+      }
+    } catch (error) {
+      ctx.logger.warn(`thinking-guard: cannot read Guard stats ${statsFile}: ${String(error)}`)
     }
   }
 
@@ -456,4 +515,36 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   }
 
   ctx.provide('thinkingGuardState', service)
+
+  // Persist the counters periodically and once on unload. A mutation hook would
+  // sit in the tool hot path; a 5s sweep is enough for a settings readout and
+  // bounds what a hard kill can lose.
+  if (statsFile.length > 0) {
+    let writing = false
+    const flush = async (): Promise<void> => {
+      if (writing) return
+      const snapshot = processGuardStats.snapshot()
+      const json = JSON.stringify(snapshot)
+      if (json === lastStatsJson) return
+      writing = true
+      try {
+        await writeGuardStatsFile(statsFile, snapshot)
+        lastStatsJson = json
+      } catch (error) {
+        ctx.logger.warn(`thinking-guard: cannot persist Guard stats to ${statsFile}: ${String(error)}`)
+      } finally {
+        writing = false
+      }
+    }
+    const timer = setInterval(() => { void flush() }, 5_000)
+    ;(timer as unknown as { unref?: () => void }).unref?.()
+    // `effect` is the real cordis lifecycle. A minimal test host may omit it;
+    // then the timer still flushes on its own and cleanup is simply skipped.
+    if (typeof (ctx as unknown as { effect?: unknown }).effect === 'function') {
+      ctx.effect(() => async () => {
+        clearInterval(timer)
+        await flush()
+      }, 'thinking-guard: persist Guard stats')
+    }
+  }
 }

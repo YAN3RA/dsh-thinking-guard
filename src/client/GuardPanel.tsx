@@ -172,52 +172,7 @@ const GUARD_CSS = [
   '.mc-guard-threshold-hint[data-guard-threshold-invalid=\'true\']{color:var(--v3-bad)}',
 ].join('')
 
-/** '—' for a counter the Host did not report; never a fabricated 0. */
-function statText(value: number | undefined): string {
-  return value === undefined || !Number.isFinite(value) ? '—' : String(value)
-}
-
-/**
- * The Guard's real activity board, restyled as a v3 stat strip.
- *
- * Answers the two questions the page previously could not: 「它是否在工作」
- * (observations) and 「调用成功还是失败」 (outcome split). Every number comes
- * from the Host; a missing counter renders '—', so an older Host reads as
- * "unknown" rather than "zero". The four data-guard-stat cells and the
- * data-guard-stats hook are the published contract.
- */
-function GuardStatsBoard(props: {
-  readonly t: (key: GuardPanelKey) => string
-  readonly stats?: GuardStatsSnapshotView
-}): ReactElement {
-  const { t, stats } = props
-  const outcomes = stats?.outcomes
-  const reminders = stats?.reminders
-  const cell = (label: string, value: string, hint: string): ReactElement => (
-    <div className="v3-stat" data-guard-stat={label}>
-      <div className="v3-stat-l">{label}</div>
-      <div className="v3-stat-v">{value}</div>
-      <div className="v3-stat-d">{hint}</div>
-    </div>
-  )
-  return (
-    <div className="v3-guard-stats">
-      <div className="v3-stats" data-guard-stats="true" role="group" aria-label={t('guardStatsTitle')}>
-        {/* A zero here is truthful (counts are per process, never backfilled), but
-            it reads as a black box unless the page says why it is zero. */}
-        {cell(t('guardStatObservations'), statText(stats?.observations),
-          stats?.observations === 0 ? t('guardStatObservationsZeroHint') : t('guardStatObservationsHint'))}
-        {cell(t('guardStatOutcomes'), statText(outcomes?.success) + ' / ' + statText(outcomes?.error),
-          t('guardStatOutcomesHint'))}
-        {cell(t('guardStatReminders'), statText(reminders?.repeat) + ' / ' + statText(reminders?.cycle),
-          t('guardStatRemindersHint'))}
-        {cell(t('guardStatDenials'), statText(stats?.denials), t('guardStatDenialsHint'))}
-      </div>
-    </div>
-  )
-}
-
-/** Strictly ascending, 1..5 entries, each an integer in 2..50. */
+  /** Strictly ascending, 1..5 entries, each an integer in 2..50. */
 export function isGuardThresholdListValid(list: readonly number[]): boolean {
   if (list.length === 0 || list.length > 5) return false
   let previous = 1
@@ -471,15 +426,8 @@ export function parseGuardThresholds(text: string): readonly number[] | undefine
   return parsed
 }
 
-/** The counter a card reports as "fired", per the product mapping. */
-function firedValue(id: GuardSectionId, stats: GuardStatsSnapshotView | undefined): number | undefined {
-  if (id === 'duplicate_call') return stats?.reminders?.repeat
-  if (id === 'alternating_cycle') return stats?.reminders?.cycle
-  return stats?.denials
-}
-
-export function GuardPanel(props: GuardPanelProps): ReactElement {
-  const { t, enabled, duplicateThresholds, onToggle, onThresholdsChange, stats } = props
+ export function GuardPanel(props: GuardPanelProps): ReactElement {
+  const { t, enabled, duplicateThresholds, onToggle, onThresholdsChange } = props
 
   const section = (entry: (typeof SECTIONS)[number]): ReactElement => {
     const isOn = enabled?.[entry.id] ?? false
@@ -523,7 +471,7 @@ export function GuardPanel(props: GuardPanelProps): ReactElement {
           <span className="v3-gnm">{t(entry.titleKey)}</span>
           {/* Model-side identifier: the injected reminder is English, this label
               is Chinese, and this is the string that ties them together. */}
-          <span className="v3-gid">{entry.id}</span>
+          <span className="v3-gid">{entry.id === 'duplicate_call' ? '重复调用' : entry.id === 'alternating_cycle' ? '交替循环' : '无进展'}</span>
           <button
             type="button"
             role="switch"
@@ -538,11 +486,7 @@ export function GuardPanel(props: GuardPanelProps): ReactElement {
           {entry.bodyKeys.map(key => <li key={key} className="mc-guard-point">{t(key)}</li>)}
         </ul>
         {belowBullets}
-        <div className="v3-gfoot">
-          <span>{t('guardFired')}</span>
-          <span className="v3-kbd">{statText(firedValue(entry.id, stats))}</span>
-          {footNote}
-        </div>
+        {footNote === null ? null : <div className="v3-gfoot">{footNote}</div>}
       </div>
     )
   }
@@ -569,9 +513,7 @@ export function GuardPanel(props: GuardPanelProps): ReactElement {
           since": the counters come first. The switches keep whatever the
           operator set, so a "restore defaults" button would only be a way to
           lose that by accident. */}
-      <GuardStatsBoard t={t} {...(stats === undefined ? {} : { stats })} />
-      <p className="v3-hint">{t('guardBoundaryShort')}</p>
-      <div className="v3-gpanel">
+       <div className="v3-gpanel">
         {SECTIONS.map(section)}
         {scopeCell}
       </div>

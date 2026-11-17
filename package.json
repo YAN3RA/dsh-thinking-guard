@@ -1,7 +1,7 @@
 {
   "name": "dsh-thinking-guard",
-  "version": "0.3.2",
-  "description": "能力菜单 + 总览 + 执行保护 for the DeepSeek Harness: the upstream capability catalog and meta_search/meta_invoke, a v3 capability menu view, and an Agent Efficiency Guard with its own state — in one installable bundle (server + browser).",
+  "version": "0.3.3",
+  "description": "为 DeepSeek Harness 提供「思考节流」设置页：一个入口三个子页（总览 / 思考限制 / 能力菜单），统一管理工具与技能、查看运行数据、执行重复与空转保护。",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

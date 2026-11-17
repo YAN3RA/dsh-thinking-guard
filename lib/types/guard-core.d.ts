@@ -155,7 +155,7 @@ export interface GuardStatsSnapshot {
  * failure.
  */
 export declare class GuardStatsRecorder {
-    private readonly startedAt;
+    private startedAt;
     private observations;
     private repeatReminders;
     private cycleReminders;
@@ -174,6 +174,13 @@ export declare class GuardStatsRecorder {
     deny(now?: number): void;
     /** Frozen, content-free copy. Safe to serialize over the remote wire. */
     snapshot(): GuardStatsSnapshot;
+    /**
+     * Seed the counters from a persisted snapshot.
+     *
+     * Used once at mount so a process restart or a plugin update continues the same
+     * totals instead of zeroing them. `since` keeps the original first-start time.
+     */
+    restore(snapshot: GuardStatsSnapshot): void;
 }
 /** Counters for this process; imported by the policy service that serves them. */
 export declare const processGuardStats: GuardStatsRecorder;

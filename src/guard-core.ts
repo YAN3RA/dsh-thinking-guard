@@ -170,7 +170,7 @@ function bumpCounter(value: number): number {
  * failure.
  */
 export class GuardStatsRecorder {
-  private readonly startedAt: number
+  private startedAt: number
   private observations = 0
   private repeatReminders = 0
   private cycleReminders = 0
@@ -217,6 +217,25 @@ export class GuardStatsRecorder {
       ...(this.lastDenialAt !== undefined ? { lastDenialAt: this.lastDenialAt } : {}),
       since: this.startedAt,
     }
+  }
+
+  /**
+   * Seed the counters from a persisted snapshot.
+   *
+   * Used once at mount so a process restart or a plugin update continues the same
+   * totals instead of zeroing them. `since` keeps the original first-start time.
+   */
+  restore(snapshot: GuardStatsSnapshot): void {
+    this.observations = snapshot.observations
+    this.repeatReminders = snapshot.reminders.repeat
+    this.cycleReminders = snapshot.reminders.cycle
+    this.denials = snapshot.denials
+    this.successes = snapshot.outcomes.success
+    this.errors = snapshot.outcomes.error
+    this.cancellations = snapshot.outcomes.cancelled
+    this.lastReminderAt = snapshot.lastReminderAt
+    this.lastDenialAt = snapshot.lastDenialAt
+    this.startedAt = snapshot.since
   }
 }
 

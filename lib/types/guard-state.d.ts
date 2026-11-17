@@ -74,6 +74,12 @@ export interface GuardStateRecord {
  * upstream patch default does.
  */
 export declare function defaultGuardStateFile(): string;
+/** Where the Guard's cumulative counters live (survives restarts / plugin updates). */
+export declare function defaultGuardStatsFile(): string;
+/** Read the persisted counter snapshot; a missing file means "no history yet". */
+export declare function readGuardStatsFile(file: string): Promise<GuardStatsSnapshot | undefined>;
+/** Atomically replace the persisted counter snapshot. */
+export declare function writeGuardStatsFile(file: string, stats: GuardStatsSnapshot): Promise<void>;
 /** The 0.1.x state file the Guard's switches used to live in (migration source). */
 export declare function legacyPolicyStateFile(): string;
 /** Parse the guard section of a state document; unknown keys are ignored. */
@@ -118,6 +124,8 @@ export interface Config {
     readonly stateFile?: string;
     /** Override the 0.1.x migration source; empty disables migration. */
     readonly legacyStateFile?: string;
+    /** Override the counters file; empty disables counter persistence (tests). */
+    readonly statsFile?: string;
 }
 export declare const name = "thinking-guard-state";
 /**

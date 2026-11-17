@@ -21,7 +21,7 @@
  */
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import type { GuardDiagnostics, GuardRemote, GuardStatsSnapshot, GuardSwitches } from './guard-remote.ts'
+import type { GuardDiagnostics, GuardRemote, GuardSwitches } from './guard-remote.ts'
 import { GuardPanel, isGuardThresholdListValid, type GuardPanelKey, type GuardSectionId } from './GuardPanel.tsx'
 import { V3Styles, V3_ROOT_CLASS } from './v3-ui.ts'
 
@@ -139,7 +139,6 @@ export function GuardSavedTag(props: {
 interface ViewState {
   readonly switches?: GuardSwitches
   readonly diagnostics?: GuardDiagnostics
-  readonly stats?: GuardStatsSnapshot
   readonly error?: GuardSectionError
   readonly busy: boolean
 }
@@ -334,17 +333,13 @@ export function GuardSection(props: GuardSectionProps): ReactElement {
       commit(at, current => ({ ...current, busy: false, error: { kind: 'read', detail: switches.detail } }))
       return undefined
     }
-    const [stats, diagnostics] = await Promise.all([
-      readOptional(() => remote.getGuardStats()),
-      readOptional(() => remote.getGuardDiagnostics()),
-    ])
+    const diagnostics = await readOptional(() => remote.getGuardDiagnostics())
     if (!alive.current || at !== gen.current) return undefined
     // A missing fresh value is dropped rather than fabricated: the counters read
     // '—' and the status line says 「未知」 instead of inventing an answer.
     commit(at, () => ({
       switches: switches.value,
       busy: false,
-      ...(stats === undefined ? {} : { stats }),
       ...(diagnostics === undefined ? {} : { diagnostics }),
     }))
     return switches.value
@@ -464,7 +459,7 @@ export function GuardSection(props: GuardSectionProps): ReactElement {
     void write(change, change, { kind: 'thresholds' })
   }, [write, commit, nextGen, clearSaved])
 
-  const { switches, stats, diagnostics, error, busy } = state
+  const { switches, diagnostics, error, busy } = state
   const enabled = switches === undefined
     ? undefined
     : {
@@ -509,8 +504,7 @@ export function GuardSection(props: GuardSectionProps): ReactElement {
         // Prefer the LIVE thresholds from the Host: the operator can edit them,
         // so a constant fallback would show a value the detector does not use.
         {...(switches === undefined ? {} : { duplicateThresholds: switches.repeatThresholds })}
-        {...(stats === undefined ? {} : { stats })}
-        {...(interactive ? { onToggle: toggle, onThresholdsChange: changeThresholds } : {})}
+         {...(interactive ? { onToggle: toggle, onThresholdsChange: changeThresholds } : {})}
       />
     </section>
   )
@@ -536,8 +530,8 @@ export function guardDictionaries(): {
     guardStatusAvailable: '思考限制已生效',
     guardStatusUnavailable: '思考限制当前未生效',
     guardStatusUnknown: '思考限制状态未知',
-    guardDiagInvalidPatch: '配置非法，Guard 未注册任何钩子',
-    guardDiagNotMounted: '本进程未挂载 Guard',
+    guardDiagInvalidPatch: '配置非法，执行保护未注册任何钩子',
+    guardDiagNotMounted: '本进程未挂载执行保护',
     guardDiagPersistenceDirty: '有未落盘改动，下次保存成功后会自动补写',
     guardDiagWriteFailed: '状态文件写入失败，改动只保留在内存中',
     // 错误行
@@ -552,8 +546,8 @@ export function guardDictionaries(): {
     // 计数看板
     guardStatsTitle: '思考限制活动',
     guardStatObservations: '已观察调用',
-    guardStatObservationsHint: 'Guard 实际观察到的工具调用数',
-    guardStatObservationsZeroHint: '本进程启动后还没有工具调用经过 Guard；计数不回溯历史。若你一直在用工具，这里仍是 0 就说明 Guard 没生效。',
+    guardStatObservationsHint: '执行保护实际观察到的工具调用数',
+    guardStatObservationsZeroHint: '本进程启动后还没有工具调用经过执行保护；若你一直在用工具，这里仍是 0 就说明执行保护没生效。',
     guardStatOutcomes: '成功 / 失败',
     guardStatOutcomesHint: '被观察调用的结果分布',
     guardStatReminders: '提醒（重复 / 交替）',
@@ -587,7 +581,7 @@ export function guardDictionaries(): {
     guardFootNoProgress: '降级条件　日志缺失 · 结果不可比较 · 识别不确定',
     // 生效范围卡
     guardScopeTitle: '生效范围',
-    guardScopeBody: '三个开关按 Agent / Turn 隔离，不跨 Session 继承；关闭只停止对应的提醒与局部拒绝，不改动任何配置或历史。',
+    guardScopeBody: '三个开关按智能体 / 回合隔离，不跨会话继承；关闭只停止对应的提醒与局部拒绝，不改动任何配置或历史。',
     guardScopeFoot: '恢复默认只写回开关值，不重写其他配置',
   }
   const en: Record<GuardSectionKey, string> = {

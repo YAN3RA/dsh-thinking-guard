@@ -457,10 +457,10 @@ export function OverviewView(props: OverviewViewProps): ReactElement {
             </div>
           )}
         <div className="v3-stats" data-overview-stats="guard">
-          <StatCell stat="observations" label={t('overviewGuardObservations')} value={dash(guardStats?.observations)} hint="getGuardStats" />
-          <StatCell stat="repeat" label={t('overviewGuardRepeat')} value={dash(guardStats?.reminders.repeat)} hint="getGuardStats" />
-          <StatCell stat="cycle" label={t('overviewGuardCycle')} value={dash(guardStats?.reminders.cycle)} hint="getGuardStats" />
-          <StatCell stat="denials" label={t('overviewGuardDenials')} value={dash(guardStats?.denials)} hint="getGuardStats" />
+          <StatCell stat="observations" label={t('overviewGuardObservations')} value={dash(guardStats?.observations)} hint="进程内计数" />
+          <StatCell stat="repeat" label={t('overviewGuardRepeat')} value={dash(guardStats?.reminders.repeat)} hint="进程内计数" />
+          <StatCell stat="cycle" label={t('overviewGuardCycle')} value={dash(guardStats?.reminders.cycle)} hint="进程内计数" />
+          <StatCell stat="denials" label={t('overviewGuardDenials')} value={dash(guardStats?.denials)} hint="进程内计数" />
         </div>
         <div className="mc-overview-diag" data-overview-switches="guard">
           <span className="mc-overview-k">{t('overviewGuardSwitches')}</span>
@@ -516,10 +516,10 @@ export function OverviewView(props: OverviewViewProps): ReactElement {
             </div>
           )}
         <div className="v3-stats" data-overview-stats="catalog">
-          <StatCell stat="resident" label={t('overviewCatalogResident')} value={dash(counts.resident)} hint="classifyAll" />
-          <StatCell stat="on-demand" label={t('overviewCatalogOnDemand')} value={dash(counts.onDemand)} hint="classifyAll" />
-          <StatCell stat="disabled" label={t('overviewCatalogDisabled')} value={dash(counts.disabled)} hint="classifyAll" />
-          <StatCell stat="total" label={t('overviewCatalogTotal')} value={dash(counts.total)} hint="classifyAll" />
+          <StatCell stat="resident" label={t('overviewCatalogResident')} value={dash(counts.resident)} hint="目录快照" />
+          <StatCell stat="on-demand" label={t('overviewCatalogOnDemand')} value={dash(counts.onDemand)} hint="目录快照" />
+          <StatCell stat="disabled" label={t('overviewCatalogDisabled')} value={dash(counts.disabled)} hint="目录快照" />
+          <StatCell stat="total" label={t('overviewCatalogTotal')} value={dash(counts.total)} hint="目录快照" />
         </div>
         <p className="mc-overview-meta">
           <span className="mc-overview-k">{t('overviewCatalogVersion')}</span>
@@ -604,14 +604,14 @@ export function overviewDictionaries(): {
   const zh: Record<OverviewKey, string> = {
     nav: '总览',
     title: '总览',
-    desc: '执行保护与能力目录的当前状态；数字只来自本进程计数、Guard 状态文件与能力目录快照，不读会话历史。',
+    desc: '一眼看清执行保护与能力目录的状态；数字只来自本机计数、状态文件与能力目录快照，不读聊天记录。',
     overviewRefresh: '刷新',
     overviewRefreshing: '正在读取…',
     overviewLoading: '正在读取…',
     overviewUnknown: '未知',
     // 执行保护记录
     overviewGuardTitle: '执行保护记录',
-    overviewGuardSource: '来源：观察数与提醒/拒绝次数来自 Guard 进程内计数（getGuardStats，重启归零，不回溯历史）；开关与诊断来自 Guard 状态文件（getGuard / getGuardDiagnostics）。',
+    overviewGuardSource: '来源：观察数与提醒/拒绝次数是执行保护的累计计数，会保存在本机，重启或更新插件都不会清零；开关与诊断来自本机状态文件。',
     overviewGuardError: '执行保护设置读取失败',
     overviewGuardObservations: '已观察调用',
     overviewGuardRepeat: '重复提醒',
@@ -634,7 +634,7 @@ export function overviewDictionaries(): {
     overviewDiagNone: '无异常',
     // 能力菜单记录
     overviewCatalogTitle: '能力菜单记录',
-    overviewCatalogSource: '来源：三档计数与条目总数来自能力目录快照（classifyAll）；版本号来自 catalogVersion；观察时间是本页读到该快照时的浏览器时间，不是 Host 的刷新时刻；目录诊断来自 getDiagnostics。',
+    overviewCatalogSource: '来源：三档计数与条目总数来自能力目录快照；版本号来自目录自身；观察时间是本页读取快照的时间。',
     overviewCatalogError: '能力目录读取失败',
     overviewCatalogResident: '常驻',
     overviewCatalogOnDemand: '按需',
@@ -644,11 +644,11 @@ export function overviewDictionaries(): {
     overviewCatalogObservedAt: '本页观察时间',
     overviewCatalogTools: '工具',
     overviewCatalogSkills: '技能（全部来源）',
-    overviewCatalogSkillsHint: '含项目来源与预设来源，因此可能多于能力菜单 Skills 页里的「全局技能」。',
+    overviewCatalogSkillsHint: '含项目与预设来源，可能多于能力菜单「技能」页里的全局技能。',
     overviewCatalogState: '技能目录扫描',
     overviewCatalogStateEmpty: '目录为空',
     overviewCatalogStateReady: '就绪',
-    overviewCatalogStateHint: '技能目录扫描（getDiagnostics）与上方的能力条目（classifyAll）是两套口径，条目数以上方的「条目总数」为准。',
+    overviewCatalogStateHint: '技能目录扫描与上方能力条目是两套口径，条目数以上方「条目总数」为准。',
     overviewCatalogDiag: '诊断',
     overviewCatalogDiagUnavailable: '不可调用',
     overviewCatalogDiagShadowed: '重名',

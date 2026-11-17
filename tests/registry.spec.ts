@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
+import { tmpdir } from 'node:os'
+import { join as joinPath } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
@@ -95,7 +97,7 @@ describe('meta-registry', () => {
   it('keeps migrated search settings and tier choices in one state file', async () => {
     const { mkdtemp, readdir, writeFile } = await import('node:fs/promises')
     const { join } = await import('node:path')
-    const home = await mkdtemp('/tmp/dsh-registry-state-')
+    const home = await mkdtemp(joinPath(tmpdir(), 'dsh-registry-state-'))
     const stateFile = join(home, 'capability-menu-policy.json')
     const legacyFile = join(home, 'capability-menu-search-metadata.json')
     await writeFile(stateFile, JSON.stringify({ version: 1, tools: { bash: 'resident' }, skills: {} }))
@@ -115,7 +117,7 @@ describe('meta-registry', () => {
   })
 
   it('indexes harness-native tools under the built-in pseudo-server and keeps the control plane out', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const ctx = await setup(home)
     registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create a new issue/ticket/bug report in a Gongfeng project')
     const bash = registerNativeTool(ctx, 'bash', 'Run commands in a bash shell')
@@ -147,7 +149,7 @@ describe('meta-registry', () => {
 
 
   it('indexes MCP tools and model-invocable skills, and searches them', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     // Skills must exist before the skill provider/registry load: the skill
     // registry caches discovery by revision, and watch:false means a later
     // write is not re-discovered until an explicit invalidation.
@@ -187,7 +189,7 @@ describe('meta-registry', () => {
   })
 
   it('searches by keyword without requiring an exact id', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const ctx = await setup(home)
     registerMcpTool(ctx, 'iwiki', 'get_document', 'Get a wiki document')
     await ctx.capability.refresh()
@@ -198,7 +200,7 @@ describe('meta-registry', () => {
   it('matches only the displayed description for default and custom search text', async () => {
     const { mkdtemp } = await import('node:fs/promises')
     const { join } = await import('node:path')
-    const home = await mkdtemp('/tmp/dsh-registry-summary-limit-')
+    const home = await mkdtemp(joinPath(tmpdir(), 'dsh-registry-summary-limit-'))
     const description = `Useful guide ${'filler '.repeat(52)} deepneedle`
     await writeSkill(`${home}/.agents/skills`, 'long-guide', description, 'Guide body.')
     const ctx = await setup(home, { stateFile: join(home, 'capability-menu-policy.json') })
@@ -216,7 +218,7 @@ describe('meta-registry', () => {
   })
 
   it('writes objective stats back from tools/result for MCP names', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const ctx = await setup(home)
     const issue = registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create an issue')
     await ctx.capability.refresh()
@@ -235,7 +237,7 @@ describe('meta-registry', () => {
   })
 
   it('lists a skill directory and reads its text files with containment', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const { mkdir, writeFile } = await import('node:fs/promises')
     const { join } = await import('node:path')
     const skillDir = `${home}/.agents/skills/browse-me`
@@ -261,7 +263,7 @@ describe('meta-registry', () => {
   })
 
   it('enumerates skills across agent-preset scopes when agentPresets exists', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     await writeSkill(`${home}/.agents/skills`, 'global-skill', 'A global-layer skill', 'Global body.')
     const ctx = await setup(home)
 
@@ -294,7 +296,7 @@ describe('meta-registry', () => {
   it('records which agent preset a scoped skill came from, and keeps the global copy of a same-named skill', async () => {
     const { mkdtemp } = await import('node:fs/promises')
     const { join } = await import('node:path')
-    const home = await mkdtemp('/tmp/dsh-registry-')
+    const home = await mkdtemp(joinPath(tmpdir(), 'dsh-registry-'))
     const presetSkills = join(home, 'presets/cordis/skills')
     await writeSkill(`${home}/.agents/skills`, 'global-skill', 'A global-layer skill', 'Global body.')
     await writeSkill(`${home}/.agents/skills`, 'shared-name', 'The global copy', 'Global body.')
@@ -350,7 +352,7 @@ describe('meta-registry', () => {
   })
 
   it('supports the DSH 0.2 lease-based preset scope API and always disposes leases', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const ctx = await setup(home)
     const disposeSymbol = (Symbol as unknown as { asyncDispose?: symbol }).asyncDispose ?? Symbol.for('nodejs.asyncDispose')
     let acquired = 0
@@ -374,7 +376,7 @@ describe('meta-registry', () => {
   })
 
   it('paginates registry results and uses useful skill summary fallbacks', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const { mkdir, writeFile } = await import('node:fs/promises')
     const { join } = await import('node:path')
     const skillDir = join(home, '.agents/skills/summary-fallback')
@@ -392,7 +394,7 @@ describe('meta-registry', () => {
   })
 
   it('enumerates agent-preset scopes for tools as well as skills', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const ctx = await setup(home)
     registerNativeTool(ctx, 'bash', 'Run commands in a bash shell')
 
@@ -429,7 +431,7 @@ describe('meta-registry', () => {
   it('indexes live session tools and cwd-dependent project skills', async () => {
     const { mkdir, mkdtemp } = await import('node:fs/promises')
     const { join } = await import('node:path')
-    const home = await mkdtemp('/tmp/dsh-registry-')
+    const home = await mkdtemp(joinPath(tmpdir(), 'dsh-registry-'))
     const project = join(home, 'project')
     await mkdir(join(project, '.git'), { recursive: true })
     await writeSkill(join(project, '.agents/skills'), 'project-only', 'Project guidance', 'Project body.')
@@ -468,7 +470,7 @@ describe('meta-registry', () => {
   })
 
   it('keeps the catalog complete and serialises overlapping refreshes', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     await writeSkill(`${home}/.agents/skills`, 'overlap-skill', 'A skill indexed while refreshes overlap', 'Body.')
     const ctx = await setup(home, { refreshDebounceMs: 5 })
     const issue = registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create an issue')
@@ -513,7 +515,7 @@ describe('meta-registry', () => {
   })
 
   it('updates the live On-demand classification without re-enumerating anything', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const ctx = await setup(home, { refreshDebounceMs: 5 })
     await ctx.plugin(policy, { stateFile: '', tools: { resident: ['mcp__gongfeng__create_issue'] } })
     registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create an issue')
@@ -546,7 +548,7 @@ describe('meta-registry', () => {
   })
 
   it('reports an empty On-demand set from the live index', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const ctx = await setup(home)
     await ctx.plugin(policy, { stateFile: '' })
     await ctx.capability.refresh()
@@ -554,7 +556,7 @@ describe('meta-registry', () => {
   })
 
   it('coalesces a burst of change events into a single rebuild', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const ctx = await setup(home, { refreshDebounceMs: 5 })
     let listCalls = 0
     ctx.provide('agentPresets', {
@@ -578,7 +580,7 @@ describe('meta-registry', () => {
   })
 
   it('coalesces events landing mid-run into a single follow-up rebuild', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const ctx = await setup(home, { refreshDebounceMs: 5 })
 
     let armed = false
@@ -619,7 +621,7 @@ describe('meta-registry', () => {
   })
 
   it('stops chaining when rebuilds keep reproducing the same catalog', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const ctx = await setup(home, { refreshDebounceMs: 5 })
     let listCalls = 0
     ctx.provide('agentPresets', {
@@ -645,7 +647,7 @@ describe('meta-registry', () => {
   })
 
   it('stops scheduling after teardown', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const ctx = await setup(home, { refreshDebounceMs: 5 })
     let listCalls = 0
     ctx.provide('agentPresets', {
@@ -670,7 +672,7 @@ describe('meta-registry', () => {
   })
 
   it('keeps only On-demand capabilities in the policy-filtered search view', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
@@ -706,7 +708,7 @@ describe('meta-registry', () => {
   })
 
   it('persists tier changes outside the watched patch and skips unchanged writes', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const { readFile, writeFile } = await import('node:fs/promises')
     const { join } = await import('node:path')
     const patchFile = join(home, 'cordis.patch.yml')
@@ -734,7 +736,7 @@ describe('meta-registry', () => {
   })
 
   it('keeps a skill that disables model invocation out of the index', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     await writeSkill(`${home}/.agents/skills`, 'user-only-skill', 'User-invoked only', 'Body.', 'disable-model-invocation: true\n')
     await writeSkill(`${home}/.agents/skills`, 'normal-skill', 'Model-invocable', 'Body.')
     const ctx = await setup(home)
@@ -756,11 +758,11 @@ describe('meta-registry', () => {
     // alone (`user-agents`) only says which root it came from.
     const row = ctx.capabilityPolicy.classifyAll().find(r => r.id === 'normal-skill')
     expect(row?.source).toBe('user-agents')
-    expect(row?.path).toBe(`${home}/.agents/skills/normal-skill`)
+    expect(row?.path).toBe(joinPath(home, '.agents', 'skills', 'normal-skill'))
   })
 
   it('advances the catalog version when a rebuild lands', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-registry-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-registry-')))
     const ctx = await setup(home)
     await ctx.capability.refresh()
     const before = ctx.capability.version()

@@ -5,7 +5,16 @@ import { fileURLToPath } from 'node:url'
 import { lstat, readFile, readdir, realpath, unlink, writeFile } from 'node:fs/promises'
 import { promisify } from 'node:util'
 
-const PACKAGE = '@daweifu/capability-menu'
+/**
+ * This package's own npm name.
+ *
+ * Must equal `package.json` `name`: it is the key this module uses to find its
+ * own package root, the installed copy inside a profile, and the spec the
+ * profile declares — plus the registry path for the latest version. Keeping the
+ * upstream name here made every self-update check fail with
+ * "Cannot locate capability-menu package" once the package was renamed.
+ */
+const PACKAGE = 'dsh-thinking-guard'
 const execFileAsync = promisify(execFile)
 
 /**
@@ -80,7 +89,7 @@ async function packageRoot(): Promise<string> {
       if (manifest.name === PACKAGE) return dir
     } catch { /* Continue toward the package root. */ }
   }
-  throw new Error('Cannot locate capability-menu package')
+  throw new Error(`Cannot locate ${PACKAGE} package`)
 }
 
 async function activeProfile(root: string): Promise<{ name: string; dir: string; source: 'registry' | 'local' | 'other' } | undefined> {
@@ -108,7 +117,7 @@ async function activeProfile(root: string): Promise<{ name: string; dir: string;
 }
 
 async function latestVersion(): Promise<string> {
-  const response = await fetch('https://registry.npmjs.org/@daweifu%2Fcapability-menu/latest', {
+  const response = await fetch(`https://registry.npmjs.org/${PACKAGE}/latest`, {
     signal: AbortSignal.timeout(10_000),
     headers: { accept: 'application/json' },
   })

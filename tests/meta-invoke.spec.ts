@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest'
+import { tmpdir } from 'node:os'
+import { join as joinPath } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
@@ -142,7 +144,7 @@ async function runTool(
 
 describe('capability-menu-invoke', () => {
   it('preserves the caller session for an On-demand native tool', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     const ctx = await setup(home)
     await ctx.plugin(policy, { tools: { 'on-demand': ['ppt_list_templates'] }, stateFile: '' })
     ctx.tools.register(defineTool({
@@ -171,7 +173,7 @@ describe('capability-menu-invoke', () => {
   })
 
   it('does not bypass a caller scope restriction by known id', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     const ctx = await setup(home)
     const name = registerMcpTool(ctx, 'secret', 'read', 'Restricted tool')
     await ctx.capability.refresh()
@@ -189,7 +191,7 @@ describe('capability-menu-invoke', () => {
     expect(result.isError).toBe(true)
   })
   it('forwards MCP calls through the tool pipeline and preserves args', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     const ctx = await setup(home)
     let received: unknown
     const issue = registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create an issue', args => {
@@ -213,7 +215,7 @@ describe('capability-menu-invoke', () => {
     // `execute` runs, so a provider that stringifies the payload now fails loudly
     // instead of having the MCP layer silently degrade the call to `{}` and the
     // target server report "missing field <param>" (issue #4).
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     const ctx = await setup(home)
     let called = false
     const issue = registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create an issue', args => {
@@ -235,7 +237,7 @@ describe('capability-menu-invoke', () => {
   })
 
   it('rejects an array-shaped args payload (object required)', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     const ctx = await setup(home)
     const issue = registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create an issue')
     await ctx.capability.refresh()
@@ -250,7 +252,7 @@ describe('capability-menu-invoke', () => {
     // as an unrelated server error. The shape is now called out by name; it is
     // never rewritten, because a wrong-but-plausible call is worse than a loud
     // error (issue #10).
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     const ctx = await setup(home)
     let called = false
     const issue = registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create an issue', args => {
@@ -277,7 +279,7 @@ describe('capability-menu-invoke', () => {
   it('leaves a target that declares id/kind parameters alone', async () => {
     // The diagnostic must not fire for a tool whose real parameters are the
     // envelope's keys.
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     const ctx = await setup(home)
     let received: unknown
     const name = 'mcp__gongfeng__dispatcher'
@@ -311,7 +313,7 @@ describe('capability-menu-invoke', () => {
     // dispatch used to receive `arguments: undefined`, which the pipeline
     // rejects with "tool execution arguments must be losslessly
     // JSON-serializable". The target must be reached with `{}` instead.
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     const ctx = await setup(home)
     let received: unknown = 'sentinel'
     // Parameterless MCP tool: same shape as dbx_list_connections / list_pages.
@@ -331,7 +333,7 @@ describe('capability-menu-invoke', () => {
     // skill load that passes a stringified payload is rejected up front instead
     // of being silently ignored. (An omitted `args` keeps working — see the
     // skill-load tests below.)
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     const ctx = await setup(home)
     await writeSkill(`${home}/.agents/skills`, 'frontend-design', 'Design guidance', 'Follow the design principles.')
     await ctx.capability.refresh()
@@ -341,7 +343,7 @@ describe('capability-menu-invoke', () => {
   })
 
   it('surfaces target failure as an isError result', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     const ctx = await setup(home)
     const failing = registerMcpTool(ctx, 'gongfeng', 'boom', 'Always fails', () => {
       throw new Error('target exploded')
@@ -353,7 +355,7 @@ describe('capability-menu-invoke', () => {
   })
 
   it('loads a skill and renders content like the skill tool', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     // Skills must exist before the skill provider/registry load (see registry tests).
     await writeSkill(`${home}/.agents/skills`, 'frontend-design', 'Design guidance', 'Follow the design principles.')
     const ctx = await setup(home)
@@ -369,7 +371,7 @@ describe('capability-menu-invoke', () => {
   })
 
   it('resolve mode returns the target schema without executing', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     let executed = false
     const ctx = await setup(home, { forwardMode: 'resolve' })
     const issue = registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create an issue', () => {
@@ -388,7 +390,7 @@ describe('capability-menu-invoke', () => {
   })
 
   it('forwards a harness-native tool (built-in server) through the tool pipeline', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     const ctx = await setup(home)
     let received: unknown
     const bash = registerNativeTool(ctx, 'bash', 'Run commands in a bash shell', args => {
@@ -408,7 +410,7 @@ describe('capability-menu-invoke', () => {
   })
 
   it('executes an On-demand native tool while it stays out of the exposure surface', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
@@ -455,14 +457,14 @@ describe('capability-menu-invoke', () => {
   })
 
   it('rejects an unknown capability id', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     const ctx = await setup(home)
     const { isError } = await runTool(ctx, 'meta_invoke', { id: 'mcp__nope__missing', kind: 'tool' })
     expect(isError).toBe(true)
   })
 
   it('rejects a disabled capability', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
@@ -474,7 +476,10 @@ describe('capability-menu-invoke', () => {
       watch: false,
     })
     await ctx.plugin(registry, { stateFile: '' })
-    await ctx.plugin(policy, { tools: { disabled: ['mcp__gongfeng__create_issue'] } })
+    await ctx.plugin(policy, {
+      patchFile: joinPath(home, 'cordis.patch.yml'), stateFile: '',
+      tools: { disabled: ['mcp__gongfeng__create_issue'] },
+    })
     await ctx.plugin(toolMetaInvoke, {})
     const issue = registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create an issue')
     await ctx.capability.refresh()
@@ -484,7 +489,7 @@ describe('capability-menu-invoke', () => {
   })
 
   it('rejects a disabled skill', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     await writeSkill(`${home}/.agents/skills`, 'forbidden-skill', 'Forbidden skill body', 'Body text.')
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
@@ -497,7 +502,10 @@ describe('capability-menu-invoke', () => {
       watch: false,
     })
     await ctx.plugin(registry, { stateFile: '' })
-    await ctx.plugin(policy, { skills: { disabled: ['forbidden-skill'] } })
+    await ctx.plugin(policy, {
+      patchFile: joinPath(home, 'cordis.patch.yml'), stateFile: '',
+      skills: { disabled: ['forbidden-skill'] },
+    })
     await ctx.plugin(toolMetaInvoke, {})
     await ctx.capability.refresh()
 
@@ -506,7 +514,7 @@ describe('capability-menu-invoke', () => {
   })
 
   it('dedups already-loaded skills within one session and returns a short reminder on repeat', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     await writeSkill(`${home}/.agents/skills`, 'frontend-design', 'Design guidance', 'Full design instructions body here.')
     const ctx = await setup(home)
     await ctx.capability.refresh()
@@ -533,7 +541,7 @@ describe('capability-menu-invoke', () => {
   })
 
   it('keeps loaded-skill dedup isolated per session in the same process', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-invoke-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
     // A registered On-demand skill (agent-dir skill) resolves through ctx.skills
     // for both agents in the same process.
     await writeSkill(`${home}/.agents/skills`, 'frontend-design', 'Design guidance', 'Full design instructions body here.')

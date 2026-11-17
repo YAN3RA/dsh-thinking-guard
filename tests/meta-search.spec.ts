@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest'
+import { tmpdir } from 'node:os'
+import { join as joinPath } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
@@ -102,7 +104,7 @@ describe('capability-menu-search', () => {
   it('finds a project skill from the calling session cwd', async () => {
     const fs = await import('node:fs/promises')
     const { join } = await import('node:path')
-    const home = await fs.mkdtemp('/tmp/dsh-meta-search-')
+    const home = await fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-search-'))
     const project = join(home, 'project')
     await fs.mkdir(join(project, '.git'), { recursive: true })
     await writeSkill(join(project, '.agents/skills'), 'project-only', 'Project guidance', 'Project body.')
@@ -119,7 +121,7 @@ describe('capability-menu-search', () => {
     expect(detail.isError).toBe(false)
   })
   it('lists capabilities by keyword query', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-search-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-search-')))
     const ctx = await setup(home)
     const issue = registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create a new issue/ticket/bug report in a Gongfeng project')
     await ctx.capability.refresh()
@@ -134,7 +136,7 @@ describe('capability-menu-search', () => {
   })
 
   it('excludes unrelated capabilities from keyword results while allowing explicit browsing', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-search-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-search-')))
     const ctx = await setup(home)
     const issue = registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create a project issue')
     const weather = registerMcpTool(ctx, 'weather', 'forecast', 'Predict tomorrow rainfall')
@@ -159,7 +161,7 @@ describe('capability-menu-search', () => {
   })
 
   it('reports truncation and allows up to 100 results without pagination', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-search-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-search-')))
     const ctx = await setup(home)
     const ids = Array.from({ length: 105 }, (_, index) => registerMcpTool(ctx, 'samples', `item_${String(index).padStart(3, '0')}`, 'catalogneedle capability'))
     registerMcpTool(ctx, 'samples', 'unrelated', 'Predict tomorrow rainfall')
@@ -183,7 +185,7 @@ describe('capability-menu-search', () => {
   })
 
   it('does not search or inspect capabilities outside the caller scope', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-search-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-search-')))
     await writeSkill(`${home}/.agents/skills`, 'out-of-scope-skill', 'Hidden skill description', 'Hidden body.')
     const ctx = await setup(home)
     await ctx.capability.refresh()
@@ -198,7 +200,7 @@ describe('capability-menu-search', () => {
   })
 
   it('returns full detail for an exact id', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-search-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-search-')))
     const ctx = await setup(home)
     const issue = registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create an issue')
     await ctx.capability.refresh()
@@ -212,7 +214,7 @@ describe('capability-menu-search', () => {
   })
 
   it('does not expose redundant detail or removed pagination parameters', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-search-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-search-')))
     const ctx = await setup(home)
     registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create an issue')
     await ctx.capability.refresh()
@@ -223,7 +225,7 @@ describe('capability-menu-search', () => {
   })
 
   it('rejects query and id together', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-search-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-search-')))
     const ctx = await setup(home)
     const issue = registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create an issue')
     await ctx.capability.refresh()
@@ -233,7 +235,7 @@ describe('capability-menu-search', () => {
   })
 
   it('searches and details harness-native tools via the built-in server', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-search-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-search-')))
     const ctx = await setup(home)
     const grep = registerNativeTool(ctx, 'grep', 'Search file contents with regular expressions')
     registerMcpTool(ctx, 'gongfeng', 'search', 'Find issues by keyword')
@@ -254,7 +256,7 @@ describe('capability-menu-search', () => {
   })
 
   it('hides Resident capabilities from list and exact-id detail', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-search-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-search-')))
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
@@ -276,7 +278,7 @@ describe('capability-menu-search', () => {
   })
 
   it('hides disabled capabilities from list and rejects disabled detail', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-search-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-search-')))
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
@@ -288,7 +290,10 @@ describe('capability-menu-search', () => {
       watch: false,
     })
     await ctx.plugin(registry, { stateFile: '' })
-    await ctx.plugin(policy, { tools: { disabled: ['mcp__gongfeng__create_issue'] } })
+    await ctx.plugin(policy, {
+      patchFile: joinPath(home, 'cordis.patch.yml'), stateFile: '',
+      tools: { disabled: ['mcp__gongfeng__create_issue'] },
+    })
     await ctx.plugin(toolMetaSearch, {})
     const issue = registerMcpTool(ctx, 'gongfeng', 'create_issue', 'Create an issue')
     await ctx.capability.refresh()
@@ -303,7 +308,7 @@ describe('capability-menu-search', () => {
   })
 
   it('does not let disabled or resident hits consume result slots', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-search-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-search-')))
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
@@ -315,10 +320,13 @@ describe('capability-menu-search', () => {
       watch: false,
     })
     await ctx.plugin(registry, { stateFile: '' })
-    await ctx.plugin(policy, { tools: {
-      disabled: ['mcp__gongfeng__blocked_issue'],
-      'on-demand': ['mcp__gongfeng__open_issue'],
-    } })
+    await ctx.plugin(policy, {
+      patchFile: joinPath(home, 'cordis.patch.yml'), stateFile: '',
+      tools: {
+        disabled: ['mcp__gongfeng__blocked_issue'],
+        'on-demand': ['mcp__gongfeng__open_issue'],
+      },
+    })
     await ctx.plugin(toolMetaSearch, {})
     // Registered first, so it ranks first for the shared keyword — and used to
     // eat the only result slot before being filtered out.
@@ -333,7 +341,7 @@ describe('capability-menu-search', () => {
   })
 
   it('hides disabled skills from list and rejects disabled skill detail', async () => {
-    const home = await import('node:fs/promises').then(fs => fs.mkdtemp('/tmp/dsh-meta-search-'))
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-search-')))
     await writeSkill(`${home}/.agents/skills`, 'forbidden-skill', 'Forbidden skill body', 'Body text.')
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
@@ -346,7 +354,10 @@ describe('capability-menu-search', () => {
       watch: false,
     })
     await ctx.plugin(registry, { stateFile: '' })
-    await ctx.plugin(policy, { skills: { disabled: ['forbidden-skill'] } })
+    await ctx.plugin(policy, {
+      patchFile: joinPath(home, 'cordis.patch.yml'), stateFile: '',
+      skills: { disabled: ['forbidden-skill'] },
+    })
     await ctx.plugin(toolMetaSearch, {})
     await ctx.capability.refresh()
 

@@ -1,0 +1,947 @@
+/**
+ * Host-hook tests for the Agent Efficiency Guard.
+ *
+ * MIGRATION NOTE (state decoupling). These cases used to install a fake
+ * `capabilityPolicy`: the 0.1.x Guard read its live switches and its
+ * control-plane tool list through the capability menu's policy service. The Guard
+ * now resolves both from its own `thinkingGuardState` service
+ * (`src/guard-state.ts`) plus the patch config, so only the HARNESS changed —
+ * every detection assertion below is untouched:
+ *
+ * - `setup()` mounts no state service, which models "patch config only"; the
+ *   withdrawn cases are the ones that used to hand in a policy.
+ * - `setupWithSwitches()` installs a stub `thinkingGuardState` whose
+ *   `getGuard()` resolves the same live switch object the settings page writes
+ *   through, with the same default < base < override precedence.
+ * - The former "uses live policy metaTools" case now configures the patch-file
+ *   `metaTools` list instead of stubbing a policy read; the catalog's own two
+ *   tools stay excluded through the shipped `DEFAULT_GUARD_META_TOOLS` constant.
+ * - Two cases were added to pin the new assembly: the `inject` dependency name
+ *   and the base-layer registration/withdrawal the Guard now performs itself.
+ */
+import type { Context } from '@deepseek-ai/cordis'
+import { TOOL_ABORTED } from '@deepseek-ai/dsh-tools'
+import { describe, expect, it, vi } from 'vitest'
+import { apply, Config, inject } from '../src/guard.ts'
+import { DEFAULT_GUARD_SWITCHES, type GuardStateService, type GuardSwitches } from '../src/guard-state.ts'
+import { DEFAULT_REPEAT_THRESHOLDS, FINGERPRINT_MAX_BYTES } from '../src/guard-loop-core.ts'
+import { processGuardStats } from '../src/guard-core.ts'
+
+/**
+ * Counts real fingerprint computations without changing them. The wrapper
+ * delegates to the shipped implementation, so every other assertion in this file
+ * sees unchanged behaviour while these tests can prove a payload was never
+ * canonicalized at all — as opposed to being hashed and then discarded.
+ */
+const fingerprintCalls = vi.hoisted(() => ({ result: 0, signature: 0 }))
+vi.mock('../src/guard-loop-core.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/guard-loop-core.ts')>()
+  return {
+    ...actual,
+    guardResultFingerprint: (...args: Parameters<typeof actual.guardResultFingerprint>) => {
+      fingerprintCalls.result += 1
+      return actual.guardResultFingerprint(...args)
+    },
+    guardToolSignature: (...args: Parameters<typeof actual.guardToolSignature>) => {
+      fingerprintCalls.signature += 1
+      return actual.guardToolSignature(...args)
+    },
+  }
+})
+
+type Execution = { callId: string; agent: { inject: ReturnType<typeof vi.fn> }; name: string; arguments: unknown }
+type Result = { isError: boolean; value?: unknown; error?: { message: string; info?: { name: string; code: string } }; content: Array<{ type: string; text?: string }> }
+
+function injectedText(agent: Execution['agent']): string {
+  return agent.inject.mock.calls.flat().map((message) => {
+    const value = message as { content?: Array<{ type?: string; text?: string }> }
+    return value.content?.filter(block => block.type === 'text').map(block => block.text ?? '').join('') ?? ''
+  }).join('\n')
+}
+
+function setup(config: Parameters<typeof apply>[1] = {}, state?: GuardStateService) {
+  const hooks = new Map<string, (...args: any[]) => any>()
+  const warn = vi.fn(), info = vi.fn(), toolGuard = vi.fn(), toolBodies = vi.fn()
+  let registeredGuard: ((execution: any) => string | undefined) | undefined
+  const disposers: Array<ReturnType<typeof vi.fn>> = []
+  const effects: Array<() => void> = []
+  const ctx = {
+    logger: { warn, info },
+    // The Guard resolves live switches through `ctx.get('thinkingGuardState')`.
+    // Omitting the service (the default here) models a host that mounts none, where
+    // the patch config is the only layer that exists.
+    get: (key: string) => (key === 'thinkingGuardState' ? state : undefined),
+    tools: { guard: (callback: (execution: any) => string | undefined) => {
+      toolGuard(callback)
+      registeredGuard = callback
+      const dispose = vi.fn()
+      disposers.push(dispose)
+      return dispose
+    } },
+    on: (name: string, handler: (...args: any[]) => any) => {
+      hooks.set(name, handler)
+      const dispose = vi.fn()
+      disposers.push(dispose)
+      return dispose
+    },
+    // Collect EVERY effect: the Guard registers one for its state base and one for
+    // hook cleanup, and both must be withdrawn when the fiber unloads.
+    effect: (factory: () => () => void) => { effects.push(factory()) },
+  }
+  apply(ctx as unknown as Context, config)
+  return {
+    hooks, warn, info, toolGuard, toolBodies, registeredGuard: () => registeredGuard,
+    disposers, effects, cleanup: () => { for (const dispose of effects.splice(0)) dispose() },
+  }
+}
+
+type TestHost = ReturnType<typeof setup>
+
+function execution(agent: Execution['agent'], name: string, args: unknown, callId: string): Execution {
+  return { agent, name, arguments: args, callId }
+}
+
+function success(value: unknown, text = JSON.stringify(value)): Result {
+  return { isError: false, value, content: [{ type: 'text', text }] }
+}
+
+async function prepareTurn(host: TestHost, agent: Execution['agent']): Promise<void> {
+  const next = vi.fn(async () => ({ kind: 'continue' }))
+  await host.hooks.get('agent/pre-step')!({ agent, turn: 1 }, next)
+}
+
+async function executeOnly(host: TestHost, call: Execution, result: Result = success({ ok: true }), prepared = false): Promise<void> {
+  if (!prepared) await prepareTurn(host, call.agent)
+  const execute = host.hooks.get('tools/execute')!
+  const next = vi.fn(async () => result)
+  await execute(call, next)
+  if (next.mock.calls.length > 0) host.toolBodies(call)
+}
+
+function resultOnly(host: TestHost, call: Execution, result: Result): void {
+  host.hooks.get('tools/result')!(call, result)
+}
+
+async function runTool(host: TestHost, call: Execution, result: Result): Promise<string | undefined> {
+  await prepareTurn(host, call.agent)
+  const denial = host.registeredGuard()!(call)
+  if (denial !== undefined) {
+    resultOnly(host, call, { isError: true, error: { message: denial }, content: [{ type: 'text', text: denial }] })
+    return denial
+  }
+  await executeOnly(host, call, result, true)
+  resultOnly(host, call, result)
+  return undefined
+}
+
+describe('Guard Host hooks', () => {
+  it('reports disabled state and does not inject reminders', async () => {
+    const host = setup({ enabled: false })
+    expect(host.info.mock.calls.flat().join(' ')).toContain('thinking-guard: disabled;')
+    const agent = { inject: vi.fn() }
+    const next = vi.fn(async () => ({ kind: 'continue' }))
+    expect(await host.hooks.get('agent/pre-step')!({ agent, turn: 1 }, next)).toEqual({ kind: 'continue' })
+    expect(await host.hooks.get('tools/execute')!(execution(agent, 'write', {}, 'd1'), next)).toEqual({ kind: 'continue' })
+    expect(agent.inject).not.toHaveBeenCalled()
+  })
+
+  it('accepts legacy schema switches and keeps steps running without convergence prompts', async () => {
+    const parsed = Config({ stepLimitMode: 'hard-stop', duplicateHardBlock: true })
+    const host = setup(parsed)
+    expect(host.warn).toHaveBeenCalledTimes(2)
+    expect(host.warn.mock.calls.flat().join(' ')).toMatch(/stepLimitMode=hard-stop/)
+    expect(host.warn.mock.calls.flat().join(' ')).toMatch(/duplicateHardBlock/)
+    expect(host.toolGuard).toHaveBeenCalledOnce()
+    expect(host.registeredGuard()).toBeTypeOf('function')
+    expect(host.hooks.has('agent/turn-stopping')).toBe(false)
+    const agent = { inject: vi.fn() }, messages: unknown[] = []
+    const next = vi.fn(async () => ({ kind: 'continue' }))
+    for (let i = 0; i < 30; i++) {
+      expect(await host.hooks.get('agent/pre-step')!({ agent, turn: 1, messages }, next)).toEqual({ kind: 'continue' })
+    }
+    expect(next).toHaveBeenCalledTimes(30)
+    expect(agent.inject).not.toHaveBeenCalled()
+    expect(messages).toEqual([])
+  })
+
+  it('warns at repeat thresholds and only locally denies after unchanged evidence', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    const callFor = (index: number) => execution(agent, 'write', { path: 'same' }, `w-${index}`)
+    const same = success({ rows: [1] })
+    for (let i = 1; i <= 8; i++) {
+      expect(await runTool(host, callFor(i), same)).toBeUndefined()
+      if ([3, 5, 8].includes(i)) expect(injectedText(agent)).toContain(`第 ${i} 次`)
+    }
+    expect(await runTool(host, callFor(9), same)).toContain('局部拒绝')
+    expect(await runTool(host, callFor(10), same)).toBeUndefined()
+    expect(await runTool(host, callFor(11), same)).toBeUndefined()
+  })
+
+  it('does not locally block common read-only tools even when their result is unchanged', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    const same = success({ rows: ['same'] })
+    for (let i = 1; i <= 10; i++) {
+      expect(await runTool(host, execution(agent, 'read', { path: 'a' }, `r-${i}`), same)).toBeUndefined()
+    }
+    expect(injectedText(agent)).toContain('第 3 次')
+    expect(injectedText(agent)).toContain('第 5 次')
+    expect(injectedText(agent)).toContain('第 8 次')
+  })
+
+  it('excludes configured polling tools and default image/job status polling', async () => {
+    const host = setup({ excludedTools: ['custom_poll'], pollingTools: ['custom_wait'] })
+    const agent = { inject: vi.fn() }
+    for (const name of ['get_image_generation_task', 'job_output', 'custom_poll', 'custom_wait']) {
+      for (let i = 0; i < 10; i++) {
+        expect(await runTool(host, execution(agent, name, { id: 'job-1' }, `${name}-${i}`), success({ status: 'running' }))).toBeUndefined()
+      }
+    }
+    expect(injectedText(agent)).toBe('')
+    expect(host.registeredGuard()!(execution(agent, 'job_output', { id: 'job-1' }, 'poll-next'))).toBeUndefined()
+  })
+
+  it('uses the configured metaTools and excludes the reserved run_code transport', async () => {
+    // Control-plane names are a Guard constant plus the patch config now, with no
+    // capability-policy read: `meta_find` comes from the config, `meta_search` /
+    // `meta_invoke` from DEFAULT_GUARD_META_TOOLS, and `run_code` is reserved.
+    const host = setup({ metaTools: ['meta_find'] })
+    const agent = { inject: vi.fn() }
+    for (const name of ['meta_find', 'meta_search', 'meta_invoke', 'run_code']) {
+      for (let i = 0; i < 10; i++) {
+        await runTool(host, execution(agent, name, { query: 'x' }, `${name}-${i}`), success({ ok: true }))
+      }
+    }
+    expect(injectedText(agent)).toBe('')
+  })
+
+  it('orders parallel results by callId dispatch sequence instead of completion order', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    const calls = [
+      execution(agent, 'tool-a', { id: 'a1' }, 'a1'),
+      execution(agent, 'tool-a', { id: 'a2' }, 'a2'),
+      execution(agent, 'tool-b', { id: 'b1' }, 'b1'),
+      execution(agent, 'tool-b', { id: 'b2' }, 'b2'),
+    ]
+    for (const call of calls) await executeOnly(host, call)
+    const unchanged = success({ stable: true })
+    for (const index of [0, 2, 1, 3]) resultOnly(host, calls[index], unchanged)
+    expect(injectedText(agent)).not.toContain('交替工具调用序列')
+    expect(host.registeredGuard()!(execution(agent, 'tool-a', { id: 'a3' }, 'a3'))).toBeUndefined()
+  })
+
+  it('fails open when an earlier dispatch result is unresolved beyond the bounded queue', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    for (let i = 0; i < 65; i++) await executeOnly(host, execution(agent, 'write', { i }, `gap-${i}`))
+    for (let i = 0; i < 65; i++) resultOnly(host, execution(agent, 'write', { i }, `gap-${i}`), success({ stable: true }))
+    expect(host.registeredGuard()!(execution(agent, 'write', { i: 99 }, 'after-overflow'))).toBeUndefined()
+  })
+
+  it('does not count a Guard denial or feed its result back into loop evidence', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    const call = (i: number) => execution(agent, 'write', { path: 'same' }, `deny-${i}`)
+    const same = success({ stable: true })
+    for (let i = 1; i <= 8; i++) await runTool(host, call(i), same)
+    expect(await runTool(host, call(9), same)).toContain('局部拒绝')
+    expect(host.toolBodies).toHaveBeenCalledTimes(8)
+    expect(await runTool(host, call(10), same)).toBeUndefined()
+    expect(host.toolBodies).toHaveBeenCalledTimes(9)
+  })
+
+  it('resets loop evidence on real user input but ignores synthetic Guard reminders', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    const makeCall = (i: number) => execution(agent, 'write', { path: 'same' }, `steer-${i}`)
+    const same = success({ stable: true })
+    for (let i = 1; i <= 8; i++) await runTool(host, makeCall(i), same)
+    const reminder = agent.inject.mock.calls[0]?.[0] as { id: string; source: { kind: string } }
+    expect(reminder?.source.kind).toBe('thinking-guard')
+    host.hooks.get('agent/inbox/inserted')!({ agent, message: reminder })
+    expect(await runTool(host, makeCall(9), same)).toContain('局部拒绝')
+    host.hooks.get('agent/inbox/inserted')!({ agent, message: { id: 'user-1', source: { kind: 'user' } } })
+    for (let i = 10; i <= 17; i++) expect(await runTool(host, makeCall(i), same)).toBeUndefined()
+    expect(await runTool(host, makeCall(18), same)).toContain('局部拒绝')
+  })
+
+  it('uses error and cancellation fingerprints and resets the chain on a user steer', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    const call = (i: number) => execution(agent, 'fetch', { url: 'https://example.invalid' }, `err-${i}`)
+    const failed: Result = { isError: true, error: { message: 'network failure', info: { name: 'Error', code: 'NETWORK' } }, content: [] }
+    for (let i = 1; i <= 8; i++) await runTool(host, call(i), failed)
+    expect(injectedText(agent)).toContain('连续重复')
+    expect(await runTool(host, call(9), failed)).toContain('局部拒绝')
+    const cancelledCall = (i: number) => execution(agent, 'fetch-cancelled', { url: 'https://example.invalid' }, `cancel-${i}`)
+    const cancelled: Result = { isError: true, error: { message: 'cancelled', info: { name: 'AbortError', code: TOOL_ABORTED } }, content: [] }
+    for (let i = 10; i <= 17; i++) await runTool(host, cancelledCall(i), cancelled)
+    expect(await runTool(host, cancelledCall(18), cancelled)).toContain('局部拒绝')
+  })
+
+  it('does not treat content changes as unchanged when canonical values are equal', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    for (let i = 1; i <= 8; i++) {
+      expect(await runTool(host, execution(agent, 'write', { id: 1 }, `content-${i}`), success({ stable: true }, `content-${i}`))).toBeUndefined()
+    }
+    expect(host.registeredGuard()!(execution(agent, 'write', { id: 1 }, 'content-next'))).toBeUndefined()
+  })
+
+  it('keeps the disabled switch silent and disposes every registered hook', async () => {
+    const disabled = setup({ duplicateDetection: false })
+    const agent = { inject: vi.fn() }
+    for (let i = 1; i <= 10; i++) await runTool(disabled, execution(agent, 'write', { id: 1 }, `disabled-${i}`), success({ stable: true }))
+    expect(injectedText(agent)).toBe('')
+    expect(disabled.registeredGuard()!(execution(agent, 'write', { id: 1 }, 'disabled-next'))).toBeUndefined()
+
+    const host = setup()
+    const cleanAgent = { inject: vi.fn() }
+    await runTool(host, execution(cleanAgent, 'meta_invoke', {}, 'meta-1'), success({}))
+    expect(cleanAgent.inject).not.toHaveBeenCalled()
+    host.hooks.get('agent/disposed')!({ agent: cleanAgent })
+    host.cleanup()
+    for (const dispose of host.disposers) expect(dispose).toHaveBeenCalledOnce()
+  })
+})
+
+describe('Guard state service wiring', () => {
+  /** Minimal stand-in for `src/guard-state.ts`, recording what the Guard registers. */
+  function recordingState(bases: Array<Partial<GuardSwitches>>, withdrawn: () => void): GuardStateService {
+    return {
+      getGuard: () => ({ ...DEFAULT_GUARD_SWITCHES, ...Object.assign({}, ...bases) }),
+      updateGuard: async () => {},
+      registerGuardBase: (base) => { bases.push(base); return withdrawn },
+      noteGuardUnavailable: () => () => {},
+      getGuardDiagnostics: () => ({
+        available: bases.length > 0,
+        reasons: bases.length > 0 ? [] : ['not-mounted' as const],
+        persistence: { dirty: false },
+      }),
+      getGuardStats: () => processGuardStats.snapshot(),
+      stateFilePath: () => '',
+    }
+  }
+
+  it('declares the Guard state service dependency instead of the capability policy', () => {
+    expect(inject).toEqual(['tools', 'thinkingGuardState'])
+  })
+
+  it('registers the patch switches as the state base and withdraws them on unload', () => {
+    const bases: Array<Partial<GuardSwitches>> = []
+    const withdrawn = vi.fn()
+    const host = setup(
+      { duplicateDetection: false, repeatThresholds: [2, 4] },
+      recordingState(bases, withdrawn),
+    )
+    // Only the five switch keys are published: profiles / host integration belong
+    // to the patch, not to the settings page's state layer.
+    expect(bases).toEqual([{ duplicateDetection: false, repeatThresholds: [2, 4] }])
+    host.cleanup()
+    expect(withdrawn).toHaveBeenCalledOnce()
+  })
+})
+
+describe('Guard live switches from the settings page', () => {
+  /**
+   * The settings page writes through the Guard's own state service. These tests
+   * install a fake `thinkingGuardState` that resolves the same live switch object,
+   * so they fail if the Guard ever reads a stale copy: the whole point is that a
+   * toggle applies without a reload.
+   */
+  type LiveSwitches = {
+    enabled: boolean; duplicateDetection: boolean
+    alternatingCycleDetection: boolean; noProgressProtection: boolean
+    repeatThresholds: readonly number[]
+  }
+
+  function setupWithSwitches(initial: {
+    enabled: boolean; duplicateDetection: boolean
+    alternatingCycleDetection: boolean; noProgressProtection: boolean
+    repeatThresholds?: readonly number[]
+  }) {
+    // The settings page writes through this package's own Guard state service
+    // (`ctx.thinkingGuardState`). This stub IS that service: `getGuard()`
+    // resolves the same live switch object the real one would, so `toggle()` below
+    // is exactly a toggle in the settings page.
+    const switches: LiveSwitches = { repeatThresholds: DEFAULT_REPEAT_THRESHOLDS, ...initial }
+    const bases = new Map<number, Partial<LiveSwitches>>()
+    let baseToken = 0
+    let unavailable = 0
+    const state: GuardStateService = {
+      getGuard(): GuardSwitches {
+        let base: Partial<LiveSwitches> = {}
+        for (const value of bases.values()) base = { ...base, ...value }
+        return { ...base, ...switches }
+      },
+      updateGuard: async (change) => { Object.assign(switches, change) },
+      registerGuardBase: (base) => {
+        baseToken += 1
+        const token = baseToken
+        bases.set(token, { ...base })
+        return () => { bases.delete(token) }
+      },
+      noteGuardUnavailable: () => {
+        unavailable += 1
+        return () => { unavailable -= 1 }
+      },
+      getGuardDiagnostics: () => ({
+        available: unavailable === 0 && bases.size > 0,
+        reasons: [
+          ...(unavailable > 0 ? ['invalid-patch' as const] : []),
+          ...(bases.size === 0 ? ['not-mounted' as const] : []),
+        ],
+        persistence: { dirty: false },
+      }),
+      getGuardStats: () => processGuardStats.snapshot(),
+      stateFilePath: () => '',
+    }
+    const hooks = new Map<string, (...args: any[]) => any>()
+    const info = vi.fn()
+    let registeredGuard: ((execution: any) => string | undefined) | undefined
+    const ctx = {
+      logger: { warn: vi.fn(), info },
+      get: (key: string) => (key === 'thinkingGuardState' ? state : undefined),
+      tools: {
+        guard: (callback: (execution: any) => string | undefined) => {
+          registeredGuard = callback
+          return vi.fn()
+        },
+      },
+      on: (name: string, handler: (...args: any[]) => any) => {
+        hooks.set(name, handler)
+        return vi.fn()
+      },
+      effect: () => undefined,
+    }
+    apply(ctx as unknown as Context, {})
+    return {
+      hooks,
+      switches,
+      guard: () => registeredGuard!,
+      toggle: (patch: Partial<LiveSwitches>) => Object.assign(switches, patch),
+    }
+  }
+
+  /** Drive N identical calls that all share one result fingerprint. */
+  async function repeatIdentical(
+    host: ReturnType<typeof setupWithSwitches>,
+    agent: { inject: ReturnType<typeof vi.fn> },
+    times: number,
+  ): Promise<string[]> {
+    const denials: string[] = []
+    const next = vi.fn(async () => ({ kind: 'continue' }))
+    await host.hooks.get('agent/pre-step')!({ agent, turn: 1 }, next)
+    for (let i = 0; i < times; i += 1) {
+      const call = execution(agent, 'write', { same: true }, `same-${i}`)
+      const denial = host.guard()(call)
+      if (denial !== undefined) {
+        denials.push(denial)
+        host.hooks.get('tools/result')!(call, {
+          isError: true, error: { message: denial }, content: [{ type: 'text', text: denial }],
+        })
+        continue
+      }
+      await host.hooks.get('tools/execute')!(call, vi.fn(async () => success({ ok: true })))
+      host.hooks.get('tools/result')!(call, success({ ok: true }))
+    }
+    return denials
+  }
+
+  /**
+   * One full business-tool round trip through the real hooks, so the dispatch
+   * record and the ordered observation queue both run.
+   */
+  async function runLive(
+    host: ReturnType<typeof setupWithSwitches>,
+    agent: { inject: ReturnType<typeof vi.fn> },
+    name: string,
+    args: unknown,
+    callId: string,
+  ): Promise<string | undefined> {
+    const call = execution(agent, name, args, callId)
+    const denial = host.guard()(call)
+    if (denial !== undefined) {
+      host.hooks.get('tools/result')!(call, {
+        isError: true, error: { message: denial }, content: [{ type: 'text', text: denial }],
+      })
+      return denial
+    }
+    await host.hooks.get('tools/execute')!(call, vi.fn(async () => success({ ok: true })))
+    host.hooks.get('tools/result')!(call, success({ ok: true }))
+    return undefined
+  }
+
+  it('keeps detecting an A-B-A-B cycle and denies it when only duplicate detection is off', async () => {
+    const host = setupWithSwitches({
+      enabled: true, duplicateDetection: false, alternatingCycleDetection: true, noProgressProtection: true,
+    })
+    const agent = { inject: vi.fn() }
+    const next = vi.fn(async () => ({ kind: 'continue' }))
+    await host.hooks.get('agent/pre-step')!({ agent, turn: 1 }, next)
+
+    // A -> B -> A -> B with an unchanged result on every leg: exact-repeat detection
+    // is off, so any cycle evidence here can only come from the cycle detector.
+    expect(await runLive(host, agent, 'tool-a', { step: 1 }, 'cycle-1')).toBeUndefined()
+    expect(await runLive(host, agent, 'tool-b', { step: 2 }, 'cycle-2')).toBeUndefined()
+    expect(await runLive(host, agent, 'tool-a', { step: 1 }, 'cycle-3')).toBeUndefined()
+    expect(await runLive(host, agent, 'tool-b', { step: 2 }, 'cycle-4')).toBeUndefined()
+    expect(injectedText(agent)).toContain('交替工具调用循环')
+
+    // The pending candidate carries source 'cycle', which duplicateDetection=false
+    // must not clear; the matching next call is denied locally.
+    expect(await runLive(host, agent, 'tool-b', { step: 2 }, 'cycle-5')).toContain('局部拒绝')
+    expect(next).toHaveBeenCalledTimes(1)
+  })
+
+  it('still reminds and denies exact repeats when only alternating-cycle detection is off', async () => {
+    const host = setupWithSwitches({
+      enabled: true, duplicateDetection: true, alternatingCycleDetection: false, noProgressProtection: true,
+    })
+    const agent = { inject: vi.fn() }
+    const denials = await repeatIdentical(host, agent, 9)
+    expect(agent.inject).toHaveBeenCalled()
+    expect(injectedText(agent)).toContain('第 8 次')
+    expect(denials.length).toBeGreaterThan(0)
+  })
+
+  it('only reminds, never denies, for both paths once no-progress protection is off', async () => {
+    const host = setupWithSwitches({
+      enabled: true, duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: false,
+    })
+    const repeatAgent = { inject: vi.fn() }
+    expect(await repeatIdentical(host, repeatAgent, 9)).toEqual([])
+    expect(injectedText(repeatAgent)).toContain('第 8 次')
+
+    const cycleAgent = { inject: vi.fn() }
+    const next = vi.fn(async () => ({ kind: 'continue' }))
+    await host.hooks.get('agent/pre-step')!({ agent: cycleAgent, turn: 1 }, next)
+    const cycleCalls: Array<[string, unknown, string]> = [
+      ['tool-a', { step: 1 }, 'guard-off-1'],
+      ['tool-b', { step: 2 }, 'guard-off-2'],
+      ['tool-a', { step: 1 }, 'guard-off-3'],
+      ['tool-b', { step: 2 }, 'guard-off-4'],
+      ['tool-b', { step: 2 }, 'guard-off-5'],
+      ['tool-b', { step: 2 }, 'guard-off-6'],
+    ]
+    for (const [toolName, toolArgs, id] of cycleCalls) {
+      expect(await runLive(host, cycleAgent, toolName, toolArgs, id)).toBeUndefined()
+    }
+    expect(injectedText(cycleAgent)).toContain('交替工具调用循环')
+  })
+
+  it('produces no reminders and no denials while the master switch is off', async () => {
+    const host = setupWithSwitches({
+      enabled: false, duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: true,
+    })
+    const agent = { inject: vi.fn() }
+    const denials = await repeatIdentical(host, agent, 9)
+    expect(denials).toEqual([])
+    expect(agent.inject).not.toHaveBeenCalled()
+  })
+
+  /**
+   * `noProgressProtection` is the gate for the denial itself, not just for
+   * recording a candidate.
+   *
+   * A candidate is recorded during `tools/result` while the switch is on. If the
+   * switch is then turned off, the *next* matching call must not be denied — the
+   * settings page promises "关闭时仍然提醒，但绝不拒绝任何调用". Checking the
+   * switch only where candidates are recorded (and not at the enforcement point
+   * in `ctx.tools.guard`) lets an already-recorded candidate fire afterwards.
+   *
+   * The call that consumes the candidate must be a NEW call id: the Guard dedups
+   * by callId, so reusing one would make this test pass for the wrong reason.
+   */
+  it('stops denying after no-progress protection is flipped off mid-turn (repeat path)', async () => {
+    const host = setupWithSwitches({
+      enabled: true, duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: true,
+    })
+    const agent = { inject: vi.fn() }
+    const next = vi.fn(async () => ({ kind: 'continue' }))
+    await host.hooks.get('agent/pre-step')!({ agent, turn: 1 }, next)
+
+    // Drive to the 8th identical call so a repeat candidate is recorded. Every
+    // call here is admitted (the guard is only asked at the 9th), so the
+    // candidate stays pending.
+    for (let i = 0; i < 8; i += 1) {
+      const call = execution(agent, 'write', { same: true }, `before-${i}`)
+      expect(host.guard()(call)).toBeUndefined()
+      await host.hooks.get('tools/execute')!(call, vi.fn(async () => success({ ok: true })))
+      host.hooks.get('tools/result')!(call, success({ ok: true }))
+    }
+
+    // Flip the gate off, then ask the guard about the next identical call. The
+    // pending repeat candidate must not turn into a denial.
+    host.toggle({ noProgressProtection: false })
+    const denialAfter = host.guard()(execution(agent, 'write', { same: true }, 'after-0'))
+    expect(denialAfter).toBeUndefined()
+  })
+
+  it('stops denying after no-progress protection is flipped off mid-turn (cycle path)', async () => {
+    const host = setupWithSwitches({
+      enabled: true, duplicateDetection: false, alternatingCycleDetection: true, noProgressProtection: true,
+    })
+    const agent = { inject: vi.fn() }
+    const next = vi.fn(async () => ({ kind: 'continue' }))
+    await host.hooks.get('agent/pre-step')!({ agent, turn: 1 }, next)
+
+    // Build a complete A-B-A-B cycle with unchanged results.
+    expect(await runLive(host, agent, 'tool-a', { step: 1 }, 'flip-1')).toBeUndefined()
+    expect(await runLive(host, agent, 'tool-b', { step: 2 }, 'flip-2')).toBeUndefined()
+    expect(await runLive(host, agent, 'tool-a', { step: 1 }, 'flip-3')).toBeUndefined()
+    expect(await runLive(host, agent, 'tool-b', { step: 2 }, 'flip-4')).toBeUndefined()
+
+    // Flip the gate off. The recorded cycle candidate must no longer deny.
+    host.toggle({ noProgressProtection: false })
+    const denialAfter = host.guard()(execution(agent, 'tool-b', { step: 2 }, 'flip-5'))
+    expect(denialAfter).toBeUndefined()
+  })
+
+  it('reminds but never denies once no-progress protection is turned off', async () => {
+    const host = setupWithSwitches({
+      enabled: true, duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: false,
+    })
+    const agent = { inject: vi.fn() }
+    const denials = await repeatIdentical(host, agent, 9)
+    // Reminders still land…
+    expect(agent.inject).toHaveBeenCalled()
+    // …but the local denial never fires.
+    expect(denials).toEqual([])
+  })
+
+  it('starts denying the repeated call when no-progress protection is on', async () => {
+    const host = setupWithSwitches({
+      enabled: true, duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: true,
+    })
+    const agent = { inject: vi.fn() }
+    const denials = await repeatIdentical(host, agent, 9)
+    expect(denials.length).toBeGreaterThan(0)
+  })
+
+  it('applies a flipped switch immediately, without re-applying the plugin', async () => {
+    const host = setupWithSwitches({
+      enabled: true, duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: true,
+    })
+    const agent = { inject: vi.fn() }
+    host.toggle({ enabled: false })
+    const denials = await repeatIdentical(host, agent, 9)
+    expect(denials).toEqual([])
+  })
+
+  /**
+   * The thresholds used to be a hard-coded `3 / 5 / 8` constant that the settings
+   * page could only display — "阈值3-5-8次数无法修改". This case and the next drive
+   * the same call sequence through the same hooks and differ only in the live
+   * switch list, so a Guard that still reads the constant fails both.
+   */
+  it('reads the repeat thresholds from the live switches instead of the constant', async () => {
+    const host = setupWithSwitches({
+      enabled: true, duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: true,
+      repeatThresholds: [2, 4],
+    })
+    const agent = { inject: vi.fn() }
+    // Five identical calls: the 2nd and 4th must remind, and the highest entry (4)
+    // also gates the denial, so the 5th call is refused. With the shipped 3/5/8
+    // list the 2nd and 4th would be silent and the 5th would run.
+    const denials = await repeatIdentical(host, agent, 5)
+    const text = injectedText(agent)
+    expect(text).toContain('第 2 次')
+    expect(text).toContain('第 4 次')
+    expect(text).not.toContain('第 3 次')
+    expect(text).not.toContain('第 8 次')
+    expect(denials.length).toBeGreaterThan(0)
+  })
+
+  it('follows a threshold change made after the turn already started', async () => {
+    const host = setupWithSwitches({
+      enabled: true, duplicateDetection: true, alternatingCycleDetection: true, noProgressProtection: true,
+      repeatThresholds: [9],
+    })
+    const agent = { inject: vi.fn() }
+    // With [9] nothing at 3/5/8 may fire…
+    expect(await repeatIdentical(host, agent, 8)).toEqual([])
+    expect(injectedText(agent)).not.toContain('第 8 次')
+    // …and lowering the list to [3] makes the next run remind again. A fresh
+    // agent keeps its own per-Agent loop history, so this measures the switch
+    // rather than the eight calls above.
+    host.toggle({ repeatThresholds: [3] })
+    const fresh = { inject: vi.fn() }
+    expect(await repeatIdentical(host, fresh, 3)).toEqual([])
+    expect(injectedText(fresh)).toContain('第 3 次')
+  })
+})
+
+describe('Guard execution counters', () => {
+  /** Counter deltas over one test, so earlier tests cannot make this pass. */
+  function statsDelta(before: ReturnType<typeof processGuardStats.snapshot>): {
+    observations: number; repeat: number; cycle: number; denials: number
+    success: number; error: number; cancelled: number
+  } {
+    const after = processGuardStats.snapshot()
+    return {
+      observations: after.observations - before.observations,
+      repeat: after.reminders.repeat - before.reminders.repeat,
+      cycle: after.reminders.cycle - before.reminders.cycle,
+      denials: after.denials - before.denials,
+      success: after.outcomes.success - before.outcomes.success,
+      error: after.outcomes.error - before.outcomes.error,
+      cancelled: after.outcomes.cancelled - before.outcomes.cancelled,
+    }
+  }
+
+  it('counts observations, reminders, denials and outcomes as real calls happen', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    const before = processGuardStats.snapshot()
+    const same = success({ stable: true })
+    // Eight admitted identical calls, then one locally denied 9th.
+    for (let index = 1; index <= 8; index += 1) {
+      expect(await runTool(host, execution(agent, 'write', { path: 'same' }, `count-${index}`), same)).toBeUndefined()
+    }
+    expect(await runTool(host, execution(agent, 'write', { path: 'same' }, 'count-9'), same)).toContain('局部拒绝')
+
+    const delta = statsDelta(before)
+    // The denial itself is never dispatched, so it is not an observation.
+    expect(delta.observations).toBe(8)
+    expect(delta.success).toBe(8)
+    expect(delta.error).toBe(0)
+    expect(delta.cancelled).toBe(0)
+    expect(delta.repeat).toBe(3) // thresholds 3, 5 and 8 all fired
+    expect(delta.cycle).toBe(0)
+    expect(delta.denials).toBe(1)
+
+    const snapshot = processGuardStats.snapshot()
+    expect(snapshot.lastReminderAt).toBeTypeOf('number')
+    expect(snapshot.lastDenialAt).toBeTypeOf('number')
+    expect(snapshot.since).toBeLessThanOrEqual(snapshot.lastReminderAt!)
+  })
+
+  it('counts error and cancelled outcomes without counting excluded or polling calls', async () => {
+    const host = setup({ pollingTools: ['custom_wait'] })
+    const agent = { inject: vi.fn() }
+    const before = processGuardStats.snapshot()
+    const failed: Result = {
+      isError: true, error: { message: 'boom', info: { name: 'Error', code: 'E_BOOM' } }, content: [],
+    }
+    const cancelled: Result = {
+      isError: true, error: { message: 'cancelled', info: { name: 'AbortError', code: TOOL_ABORTED } }, content: [],
+    }
+    await runTool(host, execution(agent, 'fetch', { url: 'a' }, 'out-err'), failed)
+    await runTool(host, execution(agent, 'fetch', { url: 'b' }, 'out-cancel'), cancelled)
+    // Excluded by name: the detector skips them, so they are not observations.
+    for (const name of ['job_output', 'custom_wait', 'meta_search']) {
+      await runTool(host, execution(agent, name, { id: 'job-1' }, `skip-${name}`), success({ running: true }))
+    }
+
+    const delta = statsDelta(before)
+    expect(delta.observations).toBe(2)
+    expect(delta.error).toBe(1)
+    expect(delta.cancelled).toBe(1)
+    expect(delta.success).toBe(0)
+    expect(delta.repeat).toBe(0)
+    expect(delta.cycle).toBe(0)
+    expect(delta.denials).toBe(0)
+  })
+
+  it('counts a cycle reminder separately from a repeat reminder', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    const before = processGuardStats.snapshot()
+    const unchanged = success({ stable: true })
+    for (const [name, args, id] of [
+      ['tool-a', { step: 1 }, 'cyc-1'],
+      ['tool-b', { step: 2 }, 'cyc-2'],
+      ['tool-a', { step: 1 }, 'cyc-3'],
+      ['tool-b', { step: 2 }, 'cyc-4'],
+    ] as const) {
+      await runTool(host, execution(agent, name, args, id), unchanged)
+    }
+    expect(injectedText(agent)).toContain('交替工具调用循环')
+    const delta = statsDelta(before)
+    expect(delta.cycle).toBeGreaterThan(0)
+    expect(delta.observations).toBe(4)
+  })
+
+  it('never retains arguments, results or error text in the snapshot', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    // Canaries: unique strings that only exist in the call/result payloads. If any
+    // of them survives into the snapshot, the wire would carry session content.
+    const argumentCanary = 'CANARY-ARG-6c1f9a'
+    const resultCanary = 'CANARY-RESULT-2b7d4e'
+    const errorCanary = 'CANARY-ERROR-9f0c3d'
+    const toolNameCanary = 'canary_tool_4a2e'
+    const same = success({ secret: resultCanary }, JSON.stringify({ secret: resultCanary }))
+    for (let index = 1; index <= 9; index += 1) {
+      await runTool(host, execution(agent, toolNameCanary, { secret: argumentCanary }, `canary-${index}`), same)
+    }
+    const failed: Result = {
+      isError: true,
+      error: { message: errorCanary, info: { name: 'Error', code: 'CANARY_CODE' } },
+      content: [{ type: 'text', text: errorCanary }],
+    }
+    for (let index = 1; index <= 3; index += 1) {
+      await runTool(host, execution(agent, toolNameCanary, { secret: argumentCanary }, `canary-err-${index}`), failed)
+    }
+
+    const serialized = JSON.stringify(processGuardStats.snapshot())
+    expect(serialized).not.toContain(argumentCanary)
+    expect(serialized).not.toContain(resultCanary)
+    expect(serialized).not.toContain(errorCanary)
+    expect(serialized).not.toContain(toolNameCanary)
+    // The snapshot is exactly the documented shape — counts and timestamps only.
+    expect(Object.keys(JSON.parse(serialized) as object).sort()).toEqual([
+      'denials', 'lastDenialAt', 'lastReminderAt', 'observations', 'outcomes', 'reminders', 'since',
+    ])
+  })
+
+  it('keeps counting when the host refuses to deliver a reminder', async () => {
+    const host = setup()
+    // `inject` throwing must not lose the observation: the call happened and
+    // the Guard saw it, but a reminder that was never delivered is not counted.
+    const agent = { inject: vi.fn(() => { throw new Error('agent disposed') }) }
+    const before = processGuardStats.snapshot()
+    const same = success({ stable: true })
+    for (let index = 1; index <= 3; index += 1) {
+      await runTool(host, execution(agent, 'write', { path: 'boom' }, `throw-${index}`), same)
+    }
+    expect(agent.inject).toHaveBeenCalled()
+    const delta = statsDelta(before)
+    expect(delta.observations).toBe(3)
+    expect(delta.repeat).toBe(0)
+  })
+})
+
+describe('Guard fingerprint budget at the host hooks', () => {
+  /** One full round trip that also reports how the result stage behaved. */
+  async function roundTrip(host: TestHost, agent: Execution['agent'], name: string, args: unknown, callId: string, result: Result) {
+    await prepareTurn(host, agent)
+    const call = execution(agent, name, args, callId)
+    expect(host.registeredGuard()!(call)).toBeUndefined()
+    await executeOnly(host, call, result, true)
+    resultOnly(host, call, result)
+    return call
+  }
+
+  it('computes no result fingerprint for polling and warn-only tools', async () => {
+    const host = setup({ pollingTools: ['custom_wait'] })
+    const agent = { inject: vi.fn() }
+    const before = fingerprintCalls.result
+    // `job_output` is a default polling tool, `read` a default warn-only tool, and
+    // `meta_search` a control-plane tool: none may ever become blockable.
+    for (const name of ['job_output', 'custom_wait', 'read', 'meta_search']) {
+      for (let index = 0; index < 3; index += 1) {
+        await roundTrip(host, agent, name, { id: 'job-1' }, `${name}-${index}`, success({ status: 'running' }))
+      }
+    }
+    expect(fingerprintCalls.result).toBe(before)
+  })
+
+  it('computes a result fingerprint for a normal business tool', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    const before = fingerprintCalls.result
+    await roundTrip(host, agent, 'write', { path: 'a' }, 'write-1', success({ ok: true }))
+    expect(fingerprintCalls.result).toBe(before + 1)
+  })
+
+  it('returns an oversized tool result to the caller unchanged and never blocks on it', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    const huge = { content: [{ type: 'text', text: 'z'.repeat(FINGERPRINT_MAX_BYTES + 4096) }], rows: [{ id: 1 }] }
+    const result = success(huge)
+    const before = fingerprintCalls.result
+    for (let index = 1; index <= 9; index += 1) {
+      await roundTrip(host, agent, 'write', { path: 'big' }, `big-${index}`, result)
+    }
+    // The Guard does attempt the fingerprint for a normal tool…
+    expect(fingerprintCalls.result).toBe(before + 9)
+    // …the real result is untouched, and with no fingerprint no denial is produced.
+    expect(result.value).toBe(huge)
+    expect(result.isError).toBe(false)
+    expect(injectedText(agent)).not.toContain('局部拒绝')
+    expect(host.registeredGuard()!(execution(agent, 'write', { path: 'big' }, 'big-next'))).toBeUndefined()
+  })
+
+  it('keeps processing tools/result after an internal Guard fault', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    // A throwing `arguments` getter makes the signature step explode; the result
+    // stage must still consume the record and leave no stuck queue behind.
+    const hostile = {
+      agent, name: 'write', callId: 'hostile-1',
+      get arguments(): unknown { throw new Error('hostile arguments getter') },
+    } as unknown as Execution
+    await prepareTurn(host, agent)
+    expect(() => host.registeredGuard()!(hostile)).not.toThrow()
+    const next = vi.fn(async () => success({ ok: true }))
+    await expect(host.hooks.get('tools/execute')!(hostile, next)).resolves.toBeDefined()
+    expect(next).toHaveBeenCalledOnce()
+
+    // Normal detection is unaffected afterwards: 8 identical calls still escalate
+    // and the 9th is locally denied.
+    const same = success({ stable: true })
+    for (let index = 1; index <= 8; index += 1) {
+      expect(await runTool(host, execution(agent, 'write', { path: 'same' }, `after-${index}`), same)).toBeUndefined()
+    }
+    expect(await runTool(host, execution(agent, 'write', { path: 'same' }, 'after-9'), same)).toContain('局部拒绝')
+  })
+
+  it('does not disturb tools/result when the result payload itself is unhashable', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    await prepareTurn(host, agent)
+    const cyclic: Record<string, unknown> = { content: [{ type: 'text', text: 'x' }] }
+    cyclic.self = cyclic
+    const call = execution(agent, 'write', { path: 'cyclic' }, 'cyclic-1')
+    await executeOnly(host, call, success(cyclic, 'cyclic-payload'), true)
+    const result = success(cyclic, 'cyclic-payload')
+    expect(() => resultOnly(host, call, result)).not.toThrow()
+    expect(result.value).toBe(cyclic)
+    expect(agent.inject).not.toHaveBeenCalled()
+  })
+
+  it('keeps tools/result non-throwing when the host supplies a malformed error result', async () => {
+    const host = setup()
+    const agent = { inject: vi.fn() }
+    await prepareTurn(host, agent)
+    const call = execution(agent, 'write', { path: 'broken' }, 'broken-1')
+    await executeOnly(host, call, success({ ok: true }), true)
+    // `isError: true` without an `error` object is malformed; reading it throws
+    // inside the Guard's own bookkeeping. The host must still be free to continue.
+    const malformed = { isError: true, content: [] } as unknown as Result
+    expect(() => resultOnly(host, call, malformed)).not.toThrow()
+
+    // Detection keeps working for later calls in the same turn.
+    const same = success({ stable: true })
+    for (let index = 1; index <= 8; index += 1) {
+      expect(await runTool(host, execution(agent, 'write', { path: 'same' }, `ok-${index}`), same)).toBeUndefined()
+    }
+    expect(await runTool(host, execution(agent, 'write', { path: 'same' }, 'ok-9'), same)).toContain('局部拒绝')
+  })
+
+  it('fails open and resets detection when injecting a reminder throws', async () => {
+    const host = setup()
+    // The host Agent can be disposed mid-flight; `inject` throwing must not escape
+    // tools/result, and the half-drained queue must not stall the rest of the turn.
+    const agent = { inject: vi.fn(() => { throw new Error('agent disposed') }) }
+    const same = success({ stable: true })
+    await prepareTurn(host, agent)
+    for (let index = 1; index <= 3; index += 1) {
+      await executeOnly(host, execution(agent, 'write', { path: 'boom' }, `boom-${index}`), same, true)
+      expect(() => resultOnly(host, execution(agent, 'write', { path: 'boom' }, `boom-${index}`), same)).not.toThrow()
+    }
+    expect(agent.inject).toHaveBeenCalled()
+
+    // After the fault the Guard fails open for this turn rather than staying stuck.
+    const healthy = { inject: vi.fn() }
+    const other = success({ stable: true })
+    for (let index = 1; index <= 8; index += 1) {
+      expect(await runTool(host, execution(healthy, 'write', { path: 'same' }, `healthy-${index}`), other)).toBeUndefined()
+    }
+    expect(await runTool(host, execution(healthy, 'write', { path: 'same' }, 'healthy-9'), other)).toContain('局部拒绝')
+  })
+})

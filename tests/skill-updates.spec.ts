@@ -51,6 +51,14 @@ async function fixture(): Promise<Fixture> {
   git(repo, 'config', '--file', config,
     `url.${pathToFileURL(repo).href}.insteadOf`,
     'https://github.com/example-owner/example-skills.git')
+  // Git for Windows ships `core.autocrlf=true` in the *system* config, which
+  // rewrites every checked-out file to CRLF. The product compares raw file
+  // digests between the installed Skill and the checkout, so the fixture keeps
+  // LF end to end; the override lives in this file's global config so it also
+  // reaches the git processes the plugin spawns.
+  git(repo, 'config', '--file', config, 'core.autocrlf', 'false')
+  git(repo, 'config', '--file', config, 'core.safecrlf', 'false')
+  git(repo, 'config', '--file', config, 'core.eol', 'lf')
   process.env.GIT_CONFIG_GLOBAL = config
 
   const registry = new LocationRegistry(new Context(), { patchFile, skillsDir })
@@ -322,7 +330,10 @@ describe('legacy Skill source recovery', () => {
     expect((await f.registry.checkSkillUpdate('alpha')).status).toBe('unmanaged')
   })
 
-  it('reports the distinct-version limit without writing provenance', async () => {
+  // Windows spawns a git.exe per command, so 200 commits plus the 200 tree
+  // checkouts of the history search take ~80s here (a few seconds on POSIX).
+  // Only the time budget changes; the assertions are untouched.
+  it('reports the distinct-version limit without writing provenance', { timeout: 240_000 }, async () => {
     const f = await fixture()
     await f.writeSkill('alpha', 'Version 0')
     f.commit('Initial version')

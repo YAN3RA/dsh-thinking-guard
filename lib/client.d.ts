@@ -1,27 +1,103 @@
-window.__ModuleLoader__.load({ id: "@daweifu/capability-menu", factory: (require) => {
+window.__ModuleLoader__.load({ id: "dsh-thinking-guard", factory: (require) => {
 var module = { exports: {} };
 var exports = module.exports;
 
 import { Context } from "@deepseek-ai/cordis";
+import "react";
 import { RemoteResult } from "@deepseek-ai/dsh-typert-protocol";
 import "@deepseek-ai/schemastery";
 import { ScopeKey } from "@deepseek-ai/dsh-scope";
 import { JsonSchemaNode } from "@deepseek-ai/dsh-tools";
-//#region src/client/remote-mount.d.ts
-type RemoteMountState<T> = {
-  status: 'loading';
-} | {
-  status: 'ready';
-  remote: T;
-} | {
-  status: 'error';
-  error: string;
-};
-interface RemoteMount<T> {
-  start(): void;
-  dispose(): void;
-  getSnapshot(): RemoteMountState<T>;
-  subscribe(listener: () => void): () => void;
+//#region src/client/guard-remote.d.ts
+/**
+ * The Guard switches the settings page exposes.
+ *
+ * Mirror of `GuardSwitches` in `src/guard-state.ts`; the Host validates every
+ * write with the same normalizer, so this schema only has to keep the wire
+ * shape honest.
+ */
+interface GuardSwitches {
+  readonly enabled: boolean;
+  readonly duplicateDetection: boolean;
+  readonly alternatingCycleDetection: boolean;
+  readonly noProgressProtection: boolean;
+  /** Consecutive-repeat counts that raise a reminder (1-5 ascending 2..50). */
+  readonly repeatThresholds: readonly number[];
+}
+/** Fixed diagnostic reasons; the wire never carries free-form text. */
+type GuardDiagnosticReason = 'invalid-patch' | 'not-mounted';
+/** Mirror of `GuardDiagnostics` in `src/guard-state.ts`. */
+interface GuardDiagnostics {
+  readonly available: boolean;
+  readonly reasons: readonly GuardDiagnosticReason[];
+  readonly persistence: {
+    readonly dirty: boolean;
+    readonly lastErrorCode?: 'write-failed';
+  };
+}
+/** Content-free Guard counters (mirror of `GuardStatsSnapshot` in guard-core). */
+interface GuardStatsSnapshot {
+  readonly observations: number;
+  readonly reminders: {
+    readonly repeat: number;
+    readonly cycle: number;
+  };
+  readonly denials: number;
+  readonly outcomes: {
+    readonly success: number;
+    readonly error: number;
+    readonly cancelled: number;
+  };
+  readonly lastReminderAt?: number;
+  readonly lastDenialAt?: number;
+  readonly since: number;
+}
+/** The mounted Guard remote face as the browser sees it. */
+interface GuardRemote {
+  getGuard(): Promise<RemoteResult<GuardSwitches>>;
+  updateGuard(change: Partial<GuardSwitches>): Promise<RemoteResult<void>>;
+  getGuardDiagnostics(): Promise<RemoteResult<GuardDiagnostics>>;
+  getGuardStats(): Promise<RemoteResult<GuardStatsSnapshot>>;
+}
+declare module '@deepseek-ai/dsh-typert-protocol' {
+  interface TypertRemoteNamespace$7468696e6b696e674775617264 {
+    getGuard: () => Promise<RemoteResult<GuardSwitches>>;
+    updateGuard: (change: Partial<GuardSwitches>) => Promise<RemoteResult<void>>;
+    getGuardDiagnostics: () => Promise<RemoteResult<GuardDiagnostics>>;
+    getGuardStats: () => Promise<RemoteResult<GuardStatsSnapshot>>;
+  }
+  interface TypertRemoteMap {
+    'thinkingGuard/getGuard': () => Promise<RemoteResult<GuardSwitches>>;
+    'thinkingGuard/updateGuard': (change: Partial<GuardSwitches>) => Promise<RemoteResult<void>>;
+    'thinkingGuard/getGuardDiagnostics': () => Promise<RemoteResult<GuardDiagnostics>>;
+    'thinkingGuard/getGuardStats': () => Promise<RemoteResult<GuardStatsSnapshot>>;
+  }
+  interface TypertRemoteNamespaceMap {
+    thinkingGuard: TypertRemoteNamespace$7468696e6b696e674775617264;
+  }
+}
+//#endregion
+//#region src/client/GuardPanel.d.ts
+/**
+ * 本面板用到的全部文案键。
+ *
+ * 与旧插件同名键逐一对齐，因此 locale 字典里的中文说明可以直接沿用；不属于本页
+ * 的键（tab 标签、总览、调用统计）不再出现在这里，也不再有任何外部 union 依赖。
+ */
+type GuardPanelKey = 'guardStatsTitle' | 'guardStatObservations' | 'guardStatObservationsHint' | 'guardStatObservationsZeroHint' | 'guardStatOutcomes' | 'guardStatOutcomesHint' | 'guardStatReminders' | 'guardStatRemindersHint' | 'guardStatDenials' | 'guardStatDenialsHint' | 'guardThresholds' | 'guardThresholdSave' | 'guardThresholdDraftHint' | 'guardThresholdHint' | 'guardBoundaryShort' | 'guardScopeTitle' | 'guardScopeBody' | 'guardScopeFoot' | 'guardSectionA' | 'guardSectionB' | 'guardSectionC' | 'guardABody1' | 'guardABody2' | 'guardABody3' | 'guardBBody1' | 'guardBBody2' | 'guardBBody3' | 'guardCBody1' | 'guardCBody2' | 'guardCBody3' | 'guardPurposeB' | 'guardPurposeC' | 'guardFired' | 'guardFootCycle' | 'guardFootNoProgress';
+//#endregion
+//#region src/client/guard-section.d.ts
+/**
+ * 本页文案键：页面级（nav / title / desc 与状态行）+ 面板自己的键。
+ *
+ * 面板键直接复用 `GuardPanelKey`，因此 locale 字典里 guard* 的中文说明与旧插件
+ * 逐字一致。
+ */
+type GuardSectionKey = 'nav' | 'title' | 'desc' | 'guardStatusLoading' | 'guardStatusAvailable' | 'guardStatusUnavailable' | 'guardStatusUnknown' | 'guardDiagInvalidPatch' | 'guardDiagNotMounted' | 'guardDiagPersistenceDirty' | 'guardDiagWriteFailed' | 'guardReadFailed' | 'guardWriteFailed' | 'guardSaveUnconfirmed' | 'guardSavedSwitch' | 'guardSavedThresholds' | 'guardSwitchOn' | 'guardSwitchOff' | GuardPanelKey;
+/** Props injected by the `settings.section` registration (see index.ts). */
+interface GuardSectionInjected {
+  remote: GuardRemote;
+  t: (key: GuardSectionKey) => string;
 }
 //#endregion
 //#region src/registry.d.ts
@@ -790,11 +866,26 @@ interface CapabilityPolicyRemote {
   }>;
 }
 //#endregion
+//#region src/client/overview-section.d.ts
+/** 本页文案键。zh / en 两份字典的键必须与此完全一致。 */
+type OverviewKey = 'nav' | 'title' | 'desc' | 'overviewRefresh' | 'overviewRefreshing' | 'overviewLoading' | 'overviewUnknown' | 'overviewGuardTitle' | 'overviewGuardSource' | 'overviewGuardError' | 'overviewGuardObservations' | 'overviewGuardRepeat' | 'overviewGuardCycle' | 'overviewGuardDenials' | 'overviewGuardSwitches' | 'overviewGuardMaster' | 'overviewGuardDuplicate' | 'overviewGuardCycleSwitch' | 'overviewGuardNoProgress' | 'overviewSwitchOn' | 'overviewSwitchOff' | 'overviewGuardDiag' | 'overviewGuardEffective' | 'overviewGuardNotEffective' | 'overviewDiagInvalidPatch' | 'overviewDiagNotMounted' | 'overviewDiagPersistenceDirty' | 'overviewDiagWriteFailed' | 'overviewDiagNone' | 'overviewCatalogTitle' | 'overviewCatalogSource' | 'overviewCatalogError' | 'overviewCatalogResident' | 'overviewCatalogOnDemand' | 'overviewCatalogDisabled' | 'overviewCatalogTotal' | 'overviewCatalogVersion' | 'overviewCatalogObservedAt' | 'overviewCatalogTools' | 'overviewCatalogSkills' | 'overviewCatalogSkillsHint' | 'overviewCatalogState' | 'overviewCatalogStateEmpty' | 'overviewCatalogStateReady' | 'overviewCatalogStateHint' | 'overviewCatalogDiag' | 'overviewCatalogDiagUnavailable' | 'overviewCatalogDiagShadowed' | 'overviewCatalogDiagBrokenPreset';
+/** Props injected by the `settings.section` registration (see index.ts). */
+interface OverviewSectionInjected {
+  guardRemote: GuardRemote;
+  capabilityRemote: CapabilityPolicyRemote;
+  t: (key: OverviewKey) => string;
+}
+//#endregion
 //#region src/client/CapabilitySection.d.ts
+type CapabilityKey$1 = 'nav' | 'title' | 'desc' | 'resident' | 'on-demand' | 'disabled' | 'tool' | 'skill' | 'mandatory' | 'toolsGroup' | 'skillsGroup' | 'builtInGroup' | 'globalSkills' | 'projectSkills' | 'presetSkills' | 'emptyTools' | 'emptySkills' | 'emptyGlobalSkills' | 'emptyProjectSkills' | 'emptyPresetSkills' | 'filterByName' | 'filterHint' | 'filterNoMatch' | 'toolCount' | 'residentShort' | 'onDemandShort' | 'disabledShort' | 'cycleHint' | 'notPreviewable' | 'previewClose' | 'markdownCode' | 'markdownWrap' | 'markdownUnwrap' | 'markdownCopy' | 'markdownCopied' | 'markdownFootnotes' | 'detailNotFound' | 'cycleOverridden' | 'refreshFailed' | 'mcpToolsPending' | 'feedback' | 'retry' | 'carrierFailureHint' | 'registerCapability' | 'editMcp' | 'editSkillNamed' | 'edit' | 'save' | 'remove' | 'cancel' | 'confirmRemove' | 'confirmRemoveMcp' | 'confirmRemoveSkillLink' | 'confirmRemoveSkillDir' | 'confirmSaveAnyway' | 'saveConfirmRealDir' | 'register' | 'notEditable' | 'entryNotFound' | 'mcpServers' | 'skillDirs' | 'skillUpdates' | 'skillCheckUpdates' | 'skillUpdateAll' | 'skillChecking' | 'skillUpdating' | 'skillInstalledRevision' | 'skillLatestRevision' | 'skillUpToDate' | 'skillLocalModified' | 'skillUpdateAvailable' | 'skillChangedFiles' | 'skillViewChanges' | 'skillUpdateOne' | 'skillUpdateProgress' | 'skillCheckProgress' | 'skillCheckComplete' | 'skillUpdatingItem' | 'skillUpdateComplete' | 'skillAssociatingItem' | 'skillUnlinking' | 'skillUnlinked' | 'skillAssociated' | 'skillSourceFailed' | 'skillAvailableCount' | 'skillWaiting' | 'skillGitManaged' | 'skillEditSource' | 'skillUnlinkSource' | 'skillErrorDetails' | 'skillAssociating' | 'skillSourceUrl' | 'skillAssociateSource' | 'skillAssociateHint' | 'skillDirPath' | 'skillDirHint' | 'skillRoot' | 'skillRootUser' | 'skillRootProject' | 'skillRootHintUser' | 'skillRootHintProject' | 'skillProjectPath' | 'skillProjectPathHint' | 'skillRegisteredAt' | 'skillRepointed' | 'skillAdopted' | 'skillSource' | 'skillSourceHint' | 'skillFromPreset' | 'skillFromPresetHint' | 'githubImporting' | 'importing' | 'skillUnmanaged' | 'adoptSkill' | 'adoptSkillHint' | 'adoptSkillTitle' | 'sourceCustom' | 'sourceBundled' | 'serverName' | 'serverNameImmutable' | 'transport' | 'transportStdio' | 'transportHttp' | 'transportHintStdio' | 'transportHintHttp' | 'command' | 'args' | 'cwd' | 'env' | 'url' | 'headers' | 'headersHint' | 'timeout' | 'timeoutInvalid' | 'viewCatalog' | 'catalogPolicy' | 'catalogOnDemand' | 'catalogPolicyNote' | 'catalogSearchNote' | 'catalogEmpty' | 'diagnosticTitle' | 'diagnosticUnavailable' | 'diagnosticShadowed' | 'diagnosticBroken' | 'diagnosticUnbrowseable' | 'diagnosticUndocumented' | 'editSearchMetadata' | 'searchMetadataButton' | 'searchDescription' | 'searchMetadataNote' | 'searchMetadataSave' | 'searchMetadataRestore' | 'searchMetadataRestoreHint' | 'searchMetadataSaved' | 'summaryLimit' | 'summaryLimitUnit' | 'summaryLimitInvalid' | 'summaryLimitDisabled' | 'summaryLimitSaved' | 'projectRootLabel' | 'skillBrowseUnavailable' | 'updateAvailable' | 'newVersion' | 'updateDialogTitle' | 'updateVersionComparison' | 'updateNpmNote' | 'updateLocalNote' | 'updateSourceSteps' | 'updateSourceStepsHide' | 'updateSourceStepsIntro' | 'updateSourceStepsRestart' | 'installUpdate' | 'switchAndInstall' | 'updatingPlugin' | 'pluginUpdated' | 'pluginSwitched' | 'pluginNonRegistrySource' | 'pluginProfileUnavailable' | 'pluginUpdateFailed';
+//#endregion
+//#region src/client/capability-v3/section.d.ts
 /** Props injected by the settings.section registration (see index.ts). */
 interface CapabilitySectionInjected {
-  remoteMount: RemoteMount<CapabilityPolicyRemote>;
+  remote: CapabilityPolicyRemote;
   t(key: CapabilityKey, params?: Record<string, unknown>): string;
+  /** Diagnostic: `$mount` failure surfaced instead of crashing the section. */
+  mountError?: string;
   /**
    * Subscribe to signals that the host catalog may have moved without this page
    * asking: a settings document edit (registering a source, editing a
@@ -804,13 +895,26 @@ interface CapabilitySectionInjected {
   subscribeSignals: (listener: () => void) => () => void;
 }
 type CapabilitySectionProps = CapabilitySectionInjected;
-type CapabilityKey = 'nav' | 'title' | 'desc' | 'resident' | 'on-demand' | 'disabled' | 'tool' | 'skill' | 'mandatory' | 'toolsGroup' | 'skillsGroup' | 'builtInGroup' | 'globalSkills' | 'projectSkills' | 'presetSkills' | 'emptyTools' | 'emptySkills' | 'emptyGlobalSkills' | 'emptyProjectSkills' | 'emptyPresetSkills' | 'filterByName' | 'filterHint' | 'filterNoMatch' | 'toolCount' | 'residentShort' | 'onDemandShort' | 'disabledShort' | 'cycleHint' | 'notPreviewable' | 'previewClose' | 'markdownCode' | 'markdownWrap' | 'markdownUnwrap' | 'markdownCopy' | 'markdownCopied' | 'markdownFootnotes' | 'detailNotFound' | 'cycleOverridden' | 'refreshFailed' | 'mcpToolsPending' | 'feedback' | 'retry' | 'carrierFailureHint' | 'registerCapability' | 'editMcp' | 'editSkillNamed' | 'edit' | 'save' | 'remove' | 'cancel' | 'confirmRemove' | 'confirmRemoveMcp' | 'confirmRemoveSkillLink' | 'confirmRemoveSkillDir' | 'confirmSaveAnyway' | 'saveConfirmRealDir' | 'register' | 'notEditable' | 'entryNotFound' | 'mcpServers' | 'skillDirs' | 'skillUpdates' | 'skillCheckUpdates' | 'skillUpdateAll' | 'skillChecking' | 'skillUpdating' | 'skillInstalledRevision' | 'skillLatestRevision' | 'skillUpToDate' | 'skillLocalModified' | 'skillUpdateAvailable' | 'skillChangedFiles' | 'skillViewChanges' | 'skillUpdateOne' | 'skillUpdateProgress' | 'skillCheckProgress' | 'skillCheckComplete' | 'skillUpdatingItem' | 'skillUpdateComplete' | 'skillAssociatingItem' | 'skillUnlinking' | 'skillUnlinked' | 'skillAssociated' | 'skillSourceFailed' | 'skillAvailableCount' | 'skillWaiting' | 'skillGitManaged' | 'skillEditSource' | 'skillUnlinkSource' | 'skillErrorDetails' | 'skillAssociating' | 'skillSourceUrl' | 'skillAssociateSource' | 'skillAssociateHint' | 'skillDirPath' | 'skillDirHint' | 'skillRoot' | 'skillRootUser' | 'skillRootProject' | 'skillRootHintUser' | 'skillRootHintProject' | 'skillProjectPath' | 'skillProjectPathHint' | 'skillRegisteredAt' | 'skillRepointed' | 'skillAdopted' | 'skillSource' | 'skillSourceHint' | 'skillFromPreset' | 'skillFromPresetHint' | 'githubImporting' | 'importing' | 'skillUnmanaged' | 'adoptSkill' | 'adoptSkillHint' | 'adoptSkillTitle' | 'sourceCustom' | 'sourceBundled' | 'serverName' | 'serverNameImmutable' | 'transport' | 'transportStdio' | 'transportHttp' | 'transportHintStdio' | 'transportHintHttp' | 'command' | 'args' | 'cwd' | 'env' | 'url' | 'headers' | 'headersHint' | 'timeout' | 'timeoutInvalid' | 'viewCatalog' | 'catalogPolicy' | 'catalogOnDemand' | 'catalogPolicyNote' | 'catalogSearchNote' | 'catalogEmpty' | 'diagnosticTitle' | 'diagnosticUnavailable' | 'diagnosticShadowed' | 'diagnosticBroken' | 'diagnosticUnbrowseable' | 'diagnosticUndocumented' | 'editSearchMetadata' | 'searchMetadataButton' | 'searchDescription' | 'searchMetadataNote' | 'searchMetadataSave' | 'searchMetadataRestore' | 'searchMetadataRestoreHint' | 'searchMetadataSaved' | 'summaryLimit' | 'summaryLimitUnit' | 'summaryLimitInvalid' | 'summaryLimitDisabled' | 'summaryLimitSaved' | 'projectRootLabel' | 'skillBrowseUnavailable' | 'updateAvailable' | 'newVersion' | 'updateDialogTitle' | 'updateVersionComparison' | 'updateNpmNote' | 'updateLocalNote' | 'updateSourceSteps' | 'updateSourceStepsHide' | 'updateSourceStepsIntro' | 'updateSourceStepsRestart' | 'installUpdate' | 'switchAndInstall' | 'updatingPlugin' | 'pluginUpdated' | 'pluginSwitched' | 'pluginNonRegistrySource' | 'pluginProfileUnavailable' | 'pluginUpdateFailed';
+/**
+ * 本页用到的 `t` 键。
+ *
+ * WHY TRIMMED: 0.1.27 的四页签外壳把 Catalog / 概览 / 执行保护三页的键塞进同一个
+ * 联合类型，并在 `index.ts` 的字典里一起维护。现在本包改成「一个页面一个视图」，
+ * 这一页只保留它真正渲染的 96 个键（档位、过滤、诊断、检索摘要、位置注册、目录
+ * 文档、自更新）；概览与 Guard 的键归各自的 section，调用统计的键已随统计
+ * 子系统删除。少一个键在这里，`t` 的调用点就少一处能让字典漂移的地方。
+ */
+type CapabilityKey = 'title' | 'desc' | 'mandatory' | 'toolsGroup' | 'skillsGroup' | 'builtInGroup' | 'globalSkills' | 'projectSkills' | 'presetSkills' | 'emptyTools' | 'emptySkills' | 'emptyGlobalSkills' | 'emptyProjectSkills' | 'emptyPresetSkills' | 'toolCount' | 'filterByName' | 'filterHint' | 'filterNoMatch' | 'residentShort' | 'onDemandShort' | 'disabledShort' | 'cycleHint' | 'cycleSaved' | 'notPreviewable' | 'previewClose' | 'markdownCode' | 'markdownWrap' | 'markdownUnwrap' | 'markdownCopy' | 'markdownCopied' | 'markdownFootnotes' | 'detailNotFound' | 'cycleOverridden' | 'refreshFailed' | 'mcpToolsPending' | 'feedback' | 'retry' | 'carrierFailureHint' | 'registerCapability' | 'edit' | 'cancel' | 'notEditable' | 'skillAdopted' | 'skillSource' | 'skillSourceHint' | 'skillFromPreset' | 'skillFromPresetHint' | 'skillUnmanaged' | 'adoptSkill' | 'adoptSkillHint' | 'adoptSkillTitle' | 'sourceCustom' | 'sourceBundled' | 'viewCatalog' | 'catalogPolicy' | 'catalogOnDemand' | 'catalogPolicyNote' | 'catalogSearchNote' | 'catalogEmpty' | 'diagnosticTitle' | 'diagnosticUnavailable' | 'diagnosticShadowed' | 'diagnosticBroken' | 'diagnosticUnbrowseable' | 'diagnosticUndocumented' | 'editSearchMetadata' | 'searchMetadataButton' | 'searchDescription' | 'searchMetadataNote' | 'searchMetadataSave' | 'searchMetadataRestore' | 'searchMetadataRestoreHint' | 'searchMetadataSaved' | 'summaryLimit' | 'summaryLimitUnit' | 'summaryLimitInvalid' | 'summaryLimitDisabled' | 'summaryLimitSaved' | 'projectRootLabel' | 'skillBrowseUnavailable' | 'updateAvailable' | 'newVersion' | 'updateDialogTitle' | 'updateVersionComparison' | 'updateNpmNote' | 'updateLocalNote' | 'updateSourceSteps' | 'updateSourceStepsHide' | 'updateSourceStepsIntro' | 'updateSourceStepsRestart' | 'installUpdate' | 'switchAndInstall' | 'updatingPlugin' | 'pluginUpdated' | 'pluginSwitched' | 'pluginNonRegistrySource' | 'pluginProfileUnavailable' | 'pluginUpdateFailed';
 //#endregion
 //#region src/client/index.d.ts
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
     /** 能力菜单 tab copy. */
-    'settings.capability': Record<CapabilityKey, string>;
+    'settings.capability': Record<CapabilityKey$1, string>;
+    /** 执行保护 tab copy. */
+    'settings.thinking-guard': Record<GuardSectionKey, string>;
+    /** 总览 tab copy. */
+    'settings.thinking-guard-overview': Record<OverviewKey, string>;
   }
 }
 /** Required services (cordis fiber inject). `remote.capabilityPolicy` is NOT
@@ -821,7 +925,7 @@ declare const inject: string[];
 /** Register the 能力菜单 section once `settings.section` is on the ledger. */
 declare function apply(ctx: Context): void;
 //#endregion
-export { type CapabilityKey, type CapabilityPolicyRemote, type CapabilityRow, type CapabilitySectionInjected, type CapabilitySectionProps, type CapabilitySnapshot, apply, inject };
+export { type CapabilityKey, type CapabilityPolicyRemote, type CapabilityRow, type CapabilitySectionInjected, type CapabilitySectionProps, type CapabilitySnapshot, type GuardDiagnostics, type GuardRemote, type GuardSectionInjected, type GuardSectionKey, type GuardStatsSnapshot, type GuardSwitches, type OverviewKey, type OverviewSectionInjected, apply, inject };
 
 return module.exports;
 }});

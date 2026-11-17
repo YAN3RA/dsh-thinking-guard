@@ -60,13 +60,13 @@
   disabled: false
 - insert:
     - id: capability-menu-registry
-      name: '@daweifu/capability-menu/registry'
+      name: 'dsh-thinking-guard/registry'
     - id: capability-menu-search
-      name: '@daweifu/capability-menu/search'
+      name: 'dsh-thinking-guard/search'
     - id: capability-menu-invoke
-      name: '@daweifu/capability-menu/invoke'
+      name: 'dsh-thinking-guard/invoke'
     - id: capability-menu-policy
-      name: '@daweifu/capability-menu/policy'
+      name: 'dsh-thinking-guard/policy'
       config:
         # Native coding tools are cataloged under the reserved `built-in`
         # pseudo-server and are fully manageable like MCP tools. Unlisted
@@ -90,4 +90,18 @@
     # entry itself so @deepseek-ai/dsh-client-modules discovers its `dsh.client`
     # declaration and serves the 能力菜单 browser bundle (`./client`).
     - id: capability-menu
-      name: '@daweifu/capability-menu'
+      name: 'dsh-thinking-guard'
+      # 执行保护（Agent Efficiency Guard）。开关/阈值由设置页写
+      # <profile>/dsh-thinking-guard/guard.json；这里的值只是补丁基线，
+      # 中间层，优先级：出厂默认 < 这里 < 用户在页面上改的值。
+      # stateFile 留空表示用默认路径。
+      config:
+        guard:
+          enabled: true
+          profile: normal
+          duplicateDetection: true
+          alternatingCycleDetection: true
+          noProgressProtection: true
+          repeatThresholds: [3, 5, 8]
+          excludedTools: []
+          pollingTools: []

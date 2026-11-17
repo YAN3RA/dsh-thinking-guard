@@ -1,8 +1,15 @@
 import { defineConfig } from 'tsdown'
 import { readFileSync } from 'node:fs'
 
-const id = '@daweifu/capability-menu'
-const { version } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
+// The browser bundle's module id MUST equal this package's name: the host's
+// client-modules loader registers each bundle under its package name, and a
+// mismatch makes the entry fail to activate (observed as
+// `duplicate factory registration` + "entry did not activate", with every
+// settings section missing). Derived instead of hard-coded so a rename can
+// never desync the two again. Note: this is the MODULE id only — the Typert
+// descriptor ids in `src/client/remote.ts` are a wire contract with the host
+// face and deliberately keep their own package string.
+const { name: id, version } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
 
 export default defineConfig([{
   entry: { client: 'src/client/index.ts' },

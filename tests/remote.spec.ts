@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
@@ -165,7 +166,7 @@ describe('server gateway · adoptSkillLocation', () => {
 
 describe('server gateway · listSkillLocations', () => {
   it('lists a project skill whose directory name differs from the name it declares', async () => {
-    const project = await mkdtemp('/tmp/dsh-gateway-')
+    const project = await mkdtemp(join(tmpdir(), 'dsh-gateway-'))
     // dsh keys a skill by the name in its own SKILL.md; the directory under the
     // project's skill root need not share it.
     const skillDir = await writeSkillDir(join(project, '.dsh/skills/dir-name'), 'inner-name')
@@ -182,7 +183,7 @@ describe('server gateway · listSkillLocations', () => {
   })
 
   it('adds the project root to the user root and ignores roots it does not manage', async () => {
-    const project = await mkdtemp('/tmp/dsh-gateway-')
+    const project = await mkdtemp(join(tmpdir(), 'dsh-gateway-'))
     const skillDir = await writeSkillDir(join(project, '.dsh/skills/project-skill'), 'project-skill')
 
     const rows = await gateway(

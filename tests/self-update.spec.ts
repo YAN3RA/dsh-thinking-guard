@@ -8,7 +8,9 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { windowsCommand } from '../src/server/self-update.ts'
 
 const exec = promisify(execFile)
-const PACKAGE = '@daweifu/capability-menu'
+// 本包的 npm 名。自更新模块按这个名字找自己的包根、profile 里的安装副本与 registry 路径
+// （见 src/server/self-update.ts 的 PACKAGE），所以夹具必须用同一个名字。
+const PACKAGE = 'dsh-thinking-guard'
 const previous = '0.1.7'
 const latest = '0.1.8'
 const oldLock = 'original lockfile\n'
@@ -21,7 +23,7 @@ afterEach(async () => {
 describe('windowsCommand', () => {
   it('quotes arguments and wraps the line for /s while keeping the PATH command bare', () => {
     expect(windowsCommand('pnpm', ['add', `${PACKAGE}@${latest}`, '--save-exact']))
-      .toBe('"pnpm "add" "@daweifu/capability-menu@0.1.8" "--save-exact""')
+      .toBe('"pnpm "add" "dsh-thinking-guard@0.1.8" "--save-exact""')
     expect(() => windowsCommand('pnpm & other', [])).toThrow(/unsupported character/)
   })
 

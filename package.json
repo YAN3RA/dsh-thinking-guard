@@ -1,11 +1,11 @@
 {
-  "name": "@daweifu/capability-menu",
-  "version": "0.2.0",
-  "description": "Unified capability management for the DeepSeek Harness: catalog (ctx.capability) + meta_search/meta_invoke + Resident/On-demand/Disabled projection policy + 能力菜单 settings tab, in one installable bundle (server + browser).",
+  "name": "dsh-thinking-guard",
+  "version": "0.3.0",
+  "description": "能力菜单 + 总览 + 执行保护 for the DeepSeek Harness: the upstream capability catalog and meta_search/meta_invoke, a v3 capability menu view, and an Agent Efficiency Guard with its own state — in one installable bundle (server + browser).",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/PKUfudawei/dsh-capability-menu.git"
+    "url": "git+https://github.com/YAN3RA/dsh-thinking-guard.git"
   },
   "publishConfig": {
     "access": "public",

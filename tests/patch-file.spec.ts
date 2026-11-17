@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import YAML from 'yaml'
 import {
@@ -28,7 +29,7 @@ const SAMPLE = `# 顶部说明：我的 MCP 服务器
 `
 
 async function sampleFile(): Promise<string> {
-  const dir = await mkdtemp('/tmp/dsh-patch-file-')
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-patch-file-'))
   const file = join(dir, 'cordis.patch.yml')
   await writeFile(file, SAMPLE, 'utf8')
   return file
@@ -115,7 +116,7 @@ describe('patch-file', () => {
   })
 
   it('creates an insert block when the file has none', async () => {
-    const dir = await mkdtemp('/tmp/dsh-patch-file-')
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-patch-file-'))
     const file = join(dir, 'cordis.patch.yml')
     await writeFile(file, '[]\n', 'utf8')
 

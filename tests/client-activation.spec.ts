@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import { createRemoteMount } from '../src/client/remote-mount.ts'
 
-vi.mock('../src/client/CapabilitySection.tsx', () => ({ CapabilitySection: () => null }))
+// 我们的能力菜单页是独立视图（任务项 6）；这里把它换成空组件，避免 vitest 去加载
+// 浏览器端 UI primitives（它依赖的 clsx 只在宿主运行时提供，不在本包的依赖图里）。
+vi.mock('../src/client/capability-v3/section.tsx', () => ({ CapabilitySection: () => null }))
 vi.mock('../src/client/settings-nav-icon.ts', () => ({
   installSettingsNavIcon: (ctx: Context) => ctx.effect(() => () => {}, 'nav icon'),
 }))
@@ -20,8 +22,20 @@ function entry() {
   let active = true
   const cleanups: Array<() => unknown> = []
   const pending = deferred<() => Promise<void>>()
+  // 本插件现在 $mount 两个贡献（上游 capabilityPolicy + 自己的 thinkingGuard），
+  // 所以夹具必须给每次 $mount 各自的 promise；共用同一个会让同一个 disposer 被调用两次。
+  const otherMounts: Array<ReturnType<typeof deferred<() => Promise<void>>>> = []
+  let mountCalls = 0
+  const mount = vi.fn(() => {
+    if (mountCalls++ === 0) return pending.promise
+    const next = deferred<() => Promise<void>>()
+    otherMounts.push(next)
+    return next.promise
+  })
   const remote = { catalogVersion: vi.fn() }
-  let section: { inject(): { remoteMount: ReturnType<typeof createRemoteMount> } } | undefined
+  // 本插件现在注册三个设置页（能力菜单 / 总览 / 执行保护），按 id 取回能力菜单那条。
+  type SectionSpec = { id: string; inject(): { remoteMount?: ReturnType<typeof createRemoteMount> } }
+  const sections = new Map<string, SectionSpec>()
   const effect = vi.fn((callback: () => unknown) => {
     if (!active) throw Object.assign(new Error('INACTIVE_EFFECT'), { code: 'INACTIVE_EFFECT' })
     const cleanup = callback()
@@ -30,16 +44,16 @@ function entry() {
   const ctx = {
     effect,
     locale: { register: vi.fn(() => () => {}), bind: () => (key: string) => key },
-    remote: { $mount: vi.fn(() => pending.promise) },
+    remote: { $mount: mount },
     get: () => remote,
     slots: {
       inject: (_: string, callback: () => void) => effect(callback),
-      register: (spec: typeof section) => { section = spec; return () => {} },
+      register: (spec: SectionSpec) => { sections.set(spec.id, spec); return () => {} },
     },
   }
   return {
     ctx: ctx as unknown as Context, pending, effect, remote,
-    state: () => section!.inject().remoteMount,
+    state: () => sections.get('capability')!.inject().remoteMount!,
     dispose() { active = false; for (const cleanup of cleanups.reverse()) cleanup() },
   }
 }

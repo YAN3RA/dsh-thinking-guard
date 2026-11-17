@@ -12,22 +12,41 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-connection/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
-import { createRemoteMount } from './remote-mount.ts'
+import { createRemoteMount, type RemoteMount } from './remote-mount.ts'
 import { installSettingsNavIcon } from './settings-nav-icon.ts'
 import { TYPERT_REMOTE } from './remote.ts'
-import { CapabilitySection, type CapabilitySectionInjected, type CapabilityKey } from './CapabilitySection.tsx'
+import { TYPERT_GUARD_REMOTE, type GuardRemote } from './guard-remote.ts'
+import { GuardSection, guardDictionaries, type GuardSectionKey } from './guard-section.tsx'
+import { OverviewSection, overviewDictionaries, type OverviewKey } from './overview-section.tsx'
+// 字典键仍以上游节面的类型为准：同一份 185 键字典同时喂给我们的 v3 视图，
+// 视图本身换成独立实现（任务项 6：`CapabilitySection.tsx` 一字不改）。
+import type { CapabilityKey } from './CapabilitySection.tsx'
+import {
+  CapabilitySection,
+  type CapabilitySectionInjected,
+} from './capability-v3/section.tsx'
+import type { CapabilityPolicyRemote } from './store.ts'
 
-export type { CapabilitySectionInjected, CapabilitySectionProps } from './CapabilitySection.tsx'
-export type { CapabilityKey } from './CapabilitySection.tsx'
+export type { CapabilitySectionInjected, CapabilitySectionProps } from './capability-v3/section.tsx'
+export type { CapabilityKey } from './capability-v3/section.tsx'
 export type { CapabilityRow, CapabilitySnapshot, CapabilityPolicyRemote } from './store.ts'
+export type { GuardRemote, GuardSwitches, GuardDiagnostics, GuardStatsSnapshot } from './guard-remote.ts'
+export type { GuardSectionInjected, GuardSectionKey } from './guard-section.tsx'
+export type { OverviewSectionInjected, OverviewKey } from './overview-section.tsx'
 
-/** Dictionary namespace owned by this plugin. */
+/** Dictionary namespaces owned by this plugin — one per settings section. */
 const NS = 'settings.capability'
+const GUARD_NS = 'settings.thinking-guard'
+const OVERVIEW_NS = 'settings.thinking-guard-overview'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
     /** 能力菜单 tab copy. */
     'settings.capability': Record<CapabilityKey, string>
+    /** 执行保护 tab copy. */
+    'settings.thinking-guard': Record<GuardSectionKey, string>
+    /** 总览 tab copy. */
+    'settings.thinking-guard-overview': Record<OverviewKey, string>
   }
 }
 
@@ -96,7 +115,8 @@ export function apply(ctx: ClientContext): void {
     markdownCopied: '已复制',
     markdownFootnotes: '脚注',
     detailNotFound: '未找到该工具的详情',
-    cycleOverridden: '分类未生效：{count} 个能力被更高优先级规则覆盖（如通配规则），可移除对应通配规则后重试',
+    cycleSaved: '已保存：{name} → {tier}',
+  cycleOverridden: '分类未生效：{count} 个能力被更高优先级规则覆盖（如通配规则），可移除对应通配规则后重试',
     refreshFailed: '刷新失败，请查看日志',
     mcpToolsPending: '已注册「{name}」，但暂未加载出工具。请检查连接和认证后点刷新。',
     retry: '重试',
@@ -219,7 +239,7 @@ export function apply(ctx: ClientContext): void {
     diagnosticUndocumented: '描述待补：{name}；摘要回退为「{summary}」',
     projectRootLabel: '项目根：{path}',
     skillBrowseUnavailable: '该技能没有可浏览的目录根，可能是非目录型技能来源。',
-  } satisfies Record<CapabilityKey, string>
+  } satisfies Record<CapabilityKey | 'cycleSaved', string>
   const en = {
     nav: 'Capability Menu',
     title: 'Capability Menu',
@@ -277,6 +297,7 @@ export function apply(ctx: ClientContext): void {
     markdownCopied: 'Copied',
     markdownFootnotes: 'Footnotes',
     detailNotFound: 'Tool detail not found',
+    cycleSaved: 'Saved: {name} → {tier}',
     cycleOverridden: 'Classification not applied: {count} capability(ies) overridden by a higher-priority rule (e.g. a wildcard). Remove the matching wildcard rule and retry.',
     refreshFailed: 'Refresh failed; see the log',
     mcpToolsPending: '"{name}" is registered, but its tools have not loaded yet. Check its connection and authentication, then refresh.',
@@ -400,19 +421,83 @@ export function apply(ctx: ClientContext): void {
     diagnosticUndocumented: 'Description needed: {name}; search summary falls back to “{summary}”.',
     projectRootLabel: 'Project root: {path}',
     skillBrowseUnavailable: 'This Skill has no browsable directory root; its provider may be non-filesystem based.',
-  } satisfies Record<CapabilityKey, string>
+  } satisfies Record<CapabilityKey | 'cycleSaved', string>
 
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'capability-menu: dictionaries')
+  ctx.effect(() => ctx.locale.register(GUARD_NS, guardDictionaries()), 'thinking-guard: dictionaries')
+  ctx.effect(() => ctx.locale.register(OVERVIEW_NS, overviewDictionaries()), 'thinking-guard: overview dictionaries')
 
   // Register cleanup before starting asynchronous work. Mount completion must
   // never register effects on a fiber that may already have been disposed.
   const remoteMount = createRemoteMount(
     () => ctx.remote.$mount(TYPERT_REMOTE),
     // Resolve by key: property access would require injecting our own namespace.
-    () => (ctx.get as (key: string) => unknown)('remote.capabilityPolicy') as import('./store.ts').CapabilityPolicyRemote,
+    () => (ctx.get as (key: string) => unknown)('remote.capabilityPolicy') as CapabilityPolicyRemote,
   )
   ctx.effect(() => remoteMount.dispose, 'capability-menu: remote mount')
-  const t = ctx.locale.bind(NS) as CapabilitySectionInjected['t']
+  /**
+   * `$mount` for the Guard's own namespace (`thinkingGuard`).
+   *
+   * A second, separate contribution: the Guard face belongs to this package, the
+   * capability face belongs to the upstream package, and a Typert contribution
+   * carries exactly one package id. Mounting both from this entry is what keeps
+   * the two wire namespaces independent (task item 3).
+   */
+  const guardMount = createRemoteMount(
+    () => ctx.remote.$mount(TYPERT_GUARD_REMOTE),
+    () => (ctx.get as (key: string) => unknown)('remote.thinkingGuard') as GuardRemote,
+  )
+  ctx.effect(() => guardMount.dispose, 'thinking-guard: guard remote mount')
+
+  /**
+   * Resolve a mounted namespace, waiting for the contribution to finish mounting.
+   *
+   * `apply` is synchronous, so the namespace may not exist yet when the settings
+   * shell builds the section props. Every remote method is async anyway, so the
+   * proxies below await this instead of handing the section a half-mounted face
+   * (which would surface as a transport error the user would read as a bug).
+   */
+  const awaitMount = async <T,>(mount: RemoteMount<T>, what: string): Promise<T> => {
+    const ready = (): T | undefined => {
+      const snapshot = mount.getSnapshot()
+      return snapshot.status === 'ready' ? snapshot.remote : undefined
+    }
+    const current = ready()
+    if (current !== undefined) return current
+    await new Promise<void>((resolve, reject) => {
+      const stop = mount.subscribe(() => {
+        const snapshot = mount.getSnapshot()
+        if (snapshot.status === 'loading') return
+        stop()
+        if (snapshot.status === 'ready') resolve()
+        else reject(new Error(what + ': ' + snapshot.error))
+      })
+    })
+    const remote = ready()
+    if (remote === undefined) throw new Error(what + ': remote unavailable after mounting')
+    return remote
+  }
+
+  /** A remote face that resolves its mounted namespace on every call. */
+  const lazyRemote = <T extends object,>(mount: RemoteMount<T>, what: string): T =>
+    new Proxy({} as T, {
+      get(_target, property: string | symbol) {
+        if (typeof property !== 'string') return undefined
+        return async (...args: unknown[]) => {
+          const remote = await awaitMount(mount, what)
+          const member = (remote as unknown as Record<string, unknown>)[property]
+          if (typeof member !== 'function') throw new Error(what + ' has no method ' + property)
+          return (member as (...rest: unknown[]) => unknown).apply(remote, args)
+        }
+      },
+    })
+
+  const capabilityRemote = lazyRemote(remoteMount, 'capabilityPolicy')
+  const guardRemote = lazyRemote(guardMount, 'thinkingGuard')
+  // 字典键集比上游节面的键多出我们自己的键（`cycleSaved`），所以 t 的类型锚在这里，
+  // 而不是上游的 CapabilitySectionInjected['t']。参数方向是逆变：更宽的键集可以直接
+  // 赋给 v3 视图那个更窄的 t。
+  const t = ctx.locale.bind(NS) as (key: CapabilityKey | 'cycleSaved', params?: Record<string, unknown>) => string
   installSettingsNavIcon(ctx, () => t('nav'))
   /**
    * The two signals that say "the host catalog may have moved, and this page did
@@ -458,8 +543,17 @@ export function apply(ctx: ClientContext): void {
     }
   }
 
-  const injected = (): CapabilitySectionInjected => {
+  /**
+   * Props for the v3 capability section.
+   *
+   * `remote` is what the view actually calls (its data layer, ported from 0.1.27,
+   * owns the retry/loading states itself). `remoteMount` rides along unchanged
+   * from the upstream registration: it is the observable mount lifecycle, and
+   * keeping it wired is what the activation test and any diagnostics read.
+   */
+  const injected = (): CapabilitySectionInjected & { remoteMount: RemoteMount<CapabilityPolicyRemote> } => {
     return {
+      remote: capabilityRemote,
       remoteMount,
       t,
       subscribeSignals,
@@ -475,5 +569,35 @@ export function apply(ctx: ClientContext): void {
     inject: injected,
   }, CapabilitySection))
 
+  // 总览：只显示执行保护计数与能力菜单状态，两块都不读会话历史（任务项 7）。
+  const overviewT = ctx.locale.bind(OVERVIEW_NS) as (key: OverviewKey) => string
+  ctx.slots.inject('settings.section', () => ctx.slots.register({
+    name: 'settings.section',
+    id: 'thinking-guard-overview',
+    order: 13,
+    label: () => overviewT('nav'),
+    locale: OVERVIEW_NS,
+    inject: () => ({
+      guardRemote,
+      capabilityRemote,
+      t: overviewT,
+    }),
+  }, OverviewSection))
+
+  // 执行保护：Guard 自己的单页（任务项 4）。
+  const guardT = ctx.locale.bind(GUARD_NS) as (key: GuardSectionKey) => string
+  ctx.slots.inject('settings.section', () => ctx.slots.register({
+    name: 'settings.section',
+    id: 'thinking-guard',
+    order: 14,
+    label: () => guardT('nav'),
+    locale: GUARD_NS,
+    inject: () => ({
+      remote: guardRemote,
+      t: guardT,
+    }),
+  }, GuardSection))
+
   remoteMount.start()
+  guardMount.start()
 }

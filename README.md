@@ -224,4 +224,3 @@ dsh plugin --profile desktop add dsh-thinking-guard@0.3.5
   <br />
   <sub>DSH Thinking Guard · 为更清晰、更可控的 Agent 执行体验而设计</sub>
 </p>
-:::

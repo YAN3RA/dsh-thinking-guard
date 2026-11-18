@@ -467,6 +467,8 @@ export function guardDictionaries(): {
     guardSectionStatusOn: '已启用',
     guardSectionStatusOff: '已关闭',
     guardSectionStatusUnknown: '状态未知',
+    guardSwitchReasonUnknown: '读不到开关状态，暂时无法切换；恢复后会自动可用。',
+    guardSwitchReasonReadonly: '当前为只读视图，无法切换。',
     // 四块说明的标题
     guardBlockTrigger: '触发条件',
     guardBlockAction: '处理方式',
@@ -531,6 +533,8 @@ export function guardDictionaries(): {
     guardSectionStatusOn: 'Enabled',
     guardSectionStatusOff: 'Disabled',
     guardSectionStatusUnknown: 'Status unknown',
+    guardSwitchReasonUnknown: 'The switch state could not be read, so it is locked; it becomes available again once the connection recovers.',
+    guardSwitchReasonReadonly: 'This view is read-only, so the switch cannot be changed.',
     guardBlockTrigger: 'Trigger',
     guardBlockAction: 'Action',
     guardBlockBoundary: 'Boundary',

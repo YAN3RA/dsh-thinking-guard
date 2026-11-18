@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { ReactElement, ReactNode } from 'react'
 import {
   OverviewView,
@@ -11,6 +11,18 @@ import {
 } from '../src/client/overview-section.tsx'
 import type { GuardDiagnostics, GuardSwitches } from '../src/client/guard-remote.ts'
 import type { CapabilityRow } from '../src/client/store.ts'
+
+/** OverviewSection 从宿主原语包导入 StateDot；本包无 clsx，故替身为 span[data-state]。 */
+vi.mock('@deepseek-ai/dsh-client-ui-primitives', async () => {
+  const { createElement } = await import('react')
+  return {
+    StateDot: (props: Record<string, unknown>): unknown => createElement('span', {
+      'data-state': props.state,
+      'aria-hidden': 'true',
+      className: props.className,
+    }),
+  }
+})
 
 /**
  * 总览三层的可测内核。
@@ -327,5 +339,21 @@ describe('OverviewView', () => {
       onOpenCapability: () => {},
     }))
     expect(byData(withJump, 'data-overview-tier-jump').length).toBe(3)
+  })
+
+  it('folds the five status tones onto StateDot states (visual only)', () => {
+    const states = (nodes: FlatElement[]): unknown[] =>
+      nodes.filter(node => node.props['data-state'] !== undefined).map(node => node.props['data-state'])
+    // 默认三格全 ok → done。
+    expect(states(view())).toEqual(['done', 'done', 'done'])
+    // 读不到任何 Guard 面 → 三格 unknown → idle（不是绿）。
+    expect(states(flatten(OverviewView({ t, busy: false, guard: {}, catalog: {} })))).toEqual(['idle', 'idle', 'idle'])
+    // 挂载失败（bad）→ error；另两格仍 ok → done。
+    expect(states(flatten(OverviewView({
+      t,
+      busy: false,
+      guard: { switches: ALL_ON, diagnostics: { ...HEALTHY_DIAGNOSTICS, available: false, reasons: ['not-mounted'] } },
+      catalog: {},
+    })))).toEqual(['done', 'error', 'done'])
   })
 })

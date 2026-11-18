@@ -68,6 +68,10 @@ vi.mock('react', async importOriginal => {
   }
 })
 
+/** GuardPanel 现在从宿主原语包导入 Switch/StateDot/Tag；本包无 clsx，需替身以加载模块。
+ *  本文件只渲染 GuardThresholdEditor，不触及这三个原语，替身仅用于解析导入。 */
+vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({ Switch: 'button', StateDot: 'span', Tag: 'span' }))
+
 const { zh, en } = guardDictionaries()
 
 /** 文案按中文取，断言才能对着用户真正看到的那一句。 */

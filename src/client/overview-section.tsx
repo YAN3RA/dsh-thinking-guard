@@ -20,6 +20,7 @@ import { useCallback, useEffect, useRef, useState, type ReactElement } from 'rea
 import type { GuardDiagnostics, GuardRemote, GuardStatsSnapshot, GuardSwitches } from './guard-remote.ts'
 import type { CapabilityDiagnostics, CapabilityPolicyRemote, CapabilityRow } from './store.ts'
 import { V3_ROOT_CLASS } from './v3-ui.ts'
+import { StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 
 /** 本页文案键。zh / en 两份字典的键必须与此完全一致。 */
 export type OverviewKey =
@@ -310,6 +311,18 @@ export function countRows(rows: readonly CapabilityRow[] | undefined): {
 /** 状态色调：绿 / 灰 / 黄 / 红 / 未检测。 */
 export type StatusTone = 'ok' | 'off' | 'warn' | 'bad' | 'unknown'
 
+/**
+ * 五状态 → 官方 StateDot 视觉状态（B-2：只折叠视觉，StatusTone 与三个推导函数零改）。
+ * ok→done、warn→warning、bad→error、off→idle、unknown→idle（Q3：语义仍分开，视觉可同）。
+ */
+const STATUS_DOT_STATE: Readonly<Record<StatusTone, 'done' | 'warning' | 'error' | 'idle'>> = {
+  ok: 'done',
+  warn: 'warning',
+  bad: 'error',
+  off: 'idle',
+  unknown: 'idle',
+}
+
 /** 一个状态格里要显示的文案键。 */
 export type StatusCode =
   | 'overviewUnknown'
@@ -487,7 +500,7 @@ function StatusCard(props: {
     <div className="ov-scell" data-overview-status-cell={cell} data-tone={status.tone}>
       <div className="ov-slabel">{label}</div>
       <div className="ov-svalue" data-tone={status.tone}>
-        <span className="v3-dot" data-tone={dot} aria-hidden="true" />
+        <span className="v3-dot" data-tone={dot} aria-hidden="true"><StateDot state={STATUS_DOT_STATE[status.tone]} size={7} /></span>
         <span className="ov-stext" data-overview-status-text={cell}>{text}</span>
       </div>
       <div className="ov-sdetail" data-overview-status-detail={cell}>{detail}</div>

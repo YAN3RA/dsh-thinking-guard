@@ -8,6 +8,9 @@ vi.mock('../src/client/capability-v3/section.tsx', () => ({ CapabilitySection: (
 vi.mock('../src/client/settings-nav-icon.ts', () => ({
   installSettingsNavIcon: (ctx: Context) => ctx.effect(() => () => {}, 'nav icon'),
 }))
+// 执行保护/总览页现在从宿主原语包导入 Switch/StateDot/Tag；本包无 clsx，需替身以加载入口，
+// 本文件只验证注册与生命周期，不渲染这些原语，断言不受影响。
+vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({ Switch: 'button', StateDot: 'span', Tag: 'span' }))
 import { apply } from '../src/client/index.ts'
 
 function deferred<T>() {

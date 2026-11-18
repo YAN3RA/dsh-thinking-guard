@@ -62,6 +62,7 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({
   Button: 'button',
   SegmentedTabs: 'div',
   Modal: 'div',
+  StateDot: 'span',
   Toast: () => null,
   MarkdownText: () => null,
   IconTriangleRightFillMedium: 'svg',
@@ -294,5 +295,23 @@ describe('search field in the capability catalog', () => {
     expect(field.props.placeholder).toBe('搜索名称或分组…')
     expect(field.props['aria-label']).toBe('按名字、分组或正则过滤…')
     expect(field.props.title).toBe(zh.filterHint)
+  })
+})
+
+describe('B-2: resident row dot uses the blue adapter (StateDot has no info state)', () => {
+  it('keeps the business data-tone and adds v3-dot--info only for resident rows', () => {
+    const nodes = render(() => ToolGroupsView({
+      groups: [{ server: 'built-in', tools: [{ ...MANDATORY_TOOL, class: 'resident' }] }],
+      openServers: new Set(['built-in']),
+      busy: false,
+      t: ((key: string) => en[key]!) as never,
+      onToggle: () => {}, onCycle: () => {}, onOpenDetail: () => {}, onEditServer: () => {}, onEditSearch: () => {},
+    }))
+    // 外壳仍带业务 data-tone='info'。
+    expect(nodes.some(node => node.props.className === 'v3-dot' && node.props['data-tone'] === 'info')).toBe(true)
+    // 常驻用 idle + 蓝色 className，不擅自改成绿色（done）。
+    const dot = nodes.find(node => node.type === 'span' && node.props.state === 'idle' && node.props.className === 'v3-dot--info')
+    expect(dot).toBeDefined()
+    expect(nodes.some(node => node.props['data-state'] === 'done')).toBe(false)
   })
 })

@@ -21,6 +21,7 @@
  * 本文件不读会话历史，也不改任何检测逻辑：它只把配置读出来、把改动交回去。
  */
 import { useCallback, useEffect, useRef, useState, type ReactElement, type ReactNode } from 'react'
+import { StateDot, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 
 /** The three Guard capabilities, in display order. */
 export type GuardSectionId = 'duplicate_call' | 'alternating_cycle' | 'no_progress'
@@ -36,6 +37,9 @@ export type GuardPanelKey =
   | 'guardSectionStatusOn'
   | 'guardSectionStatusOff'
   | 'guardSectionStatusUnknown'
+  // 开关被禁用时的可见原因（B-1）
+  | 'guardSwitchReasonUnknown'
+  | 'guardSwitchReasonReadonly'
   // 四块说明的标题
   | 'guardBlockTrigger'
   | 'guardBlockAction'
@@ -154,7 +158,10 @@ const GUARD_CSS = [
   '.gd-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}',
   '.gd-head .gd-nm{font-size:13px;font-weight:600;color:var(--v3-t1)}',
   '.gd-head .gd-id{font-family:var(--v3-font-code);font-size:10.5px;color:var(--v3-t4)}',
-  '.gd-head .v3-sw{margin-left:auto}',
+  '.gd-head .gd-sw{margin-left:auto}',
+  '.gd-sw{display:inline-flex;flex:none}',
+  '.gd-sw-reason{margin:0;font-size:11px;line-height:16px;color:var(--v3-t4)}',
+  '.gd-status{display:inline-flex;align-items:center;flex:none}',
   '.gd-sum{margin:0;font-size:12px;line-height:18px;color:var(--v3-t2)}',
   '.gd-blocks{display:flex;flex-direction:column;gap:6px;margin:0}',
   '.gd-row{display:grid;grid-template-columns:52px minmax(0,1fr);gap:9px;align-items:start;min-width:0}',
@@ -248,6 +255,24 @@ const SECTION_STATE: Readonly<Record<SectionState, {
   on: { tone: 'ok', dot: 'ok', key: 'guardSectionStatusOn' },
   off: { tone: undefined, dot: undefined, key: 'guardSectionStatusOff' },
   unknown: { tone: 'warn', dot: 'warn', key: 'guardSectionStatusUnknown' },
+}
+
+/**
+ * 业务状态 → 官方 StateDot 视觉状态（B-2：只折叠视觉，业务状态与文案不变）。
+ * ok→done、warn→warning；off 的圆点本来就是中性灰，折叠为 idle。
+ */
+const SECTION_DOT_STATE: Readonly<Record<'ok' | 'warn', 'done' | 'warning'>> = {
+  ok: 'done',
+  warn: 'warning',
+}
+
+/**
+ * 业务状态 → 官方 Tag 色调（B-3），ok/warn 与 success/warning 名字不同，这里显式映射；
+ * off 没有状态色，用中性 neutral。
+ */
+const SECTION_TAG_TONE: Readonly<Record<'ok' | 'warn', 'success' | 'warning'>> = {
+  ok: 'success',
+  warn: 'warning',
 }
 
 /**
@@ -542,6 +567,17 @@ export function GuardPanel(props: GuardPanelProps): ReactElement {
     // without re-reading the optional props inside a closure.
     const toggle = onToggle
     const commitThresholds = onThresholdsChange
+    // B-1/B-2/B-3：只把既有业务状态映射成官方原语参数，不改任何判定/文案推导。
+    const dotState = look.dot === undefined ? 'idle' : SECTION_DOT_STATE[look.dot]
+    const tagTone = look.tone === undefined ? 'neutral' : SECTION_TAG_TONE[look.tone]
+    const switchDisabled = toggle === undefined || state === 'unknown'
+    const switchReasonKey: GuardPanelKey | undefined =
+      state === 'unknown'
+        ? 'guardSwitchReasonUnknown'
+        : toggle === undefined
+          ? 'guardSwitchReasonReadonly'
+          : undefined
+    const switchReasonId = 'guard-switch-reason-' + entry.id
     const params = entry.id === 'duplicate_call'
       ? (
         <div className="gd-params">
@@ -575,20 +611,35 @@ export function GuardPanel(props: GuardPanelProps): ReactElement {
     return (
       <div key={entry.id} className="gd-card" data-guard-section={entry.id} data-guard-state={state}>
         <div className="gd-head">
-          <span className="v3-dot" data-tone={look.dot} aria-hidden="true" />
+          <span className="v3-dot" data-tone={look.dot} aria-hidden="true">
+            <StateDot state={dotState} size={7} />
+          </span>
           <span className="gd-nm">{t(entry.titleKey)}</span>
           <span className="gd-id">{entry.id}</span>
-          <span className="v3-tag" data-tone={look.tone} data-guard-status={state}>{t(look.key)}</span>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={state === 'on' ? 'true' : 'false'}
+          <span className="gd-status" data-tone={look.tone} data-guard-status={state}>
+            <Tag tone={tagTone}>{t(look.key)}</Tag>
+          </span>
+          <span
+            className="gd-sw"
+            role="group"
             aria-label={t(entry.titleKey)}
-            className="v3-sw"
-            disabled={toggle === undefined || state === 'unknown'}
-            onClick={() => { if (toggle !== undefined && state !== 'unknown') toggle(entry.id, state !== 'on') }}
-          />
+            {...(switchReasonKey === undefined ? {} : { 'aria-describedby': switchReasonId })}
+          >
+            <Switch
+              checked={state === 'on'}
+              onChange={(next: boolean) => { if (toggle !== undefined && state !== 'unknown') toggle(entry.id, next) }}
+              label={t(entry.titleKey)}
+              disabled={switchDisabled}
+              {...(switchReasonKey === undefined ? {} : { title: t(switchReasonKey) })}
+              className="gd-sw-ctl"
+            />
+          </span>
         </div>
+        {switchReasonKey === undefined ? null : (
+          <p className="gd-sw-reason" id={switchReasonId} data-guard-switch-reason={state === 'unknown' ? 'unknown' : 'readonly'}>
+            {t(switchReasonKey)}
+          </p>
+        )}
         <p className="gd-sum" data-guard-summary={entry.id}>{t(entry.summaryKey)}</p>
         {entry.id === 'alternating_cycle'
           ? (

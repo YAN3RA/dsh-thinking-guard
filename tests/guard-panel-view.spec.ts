@@ -1,7 +1,37 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { ReactElement, ReactNode } from 'react'
 import { GuardPanel, thresholdStages } from '../src/client/GuardPanel.tsx'
 import { guardDictionaries } from '../src/client/guard-section.tsx'
+
+/**
+ * 宿主原语替身：忠实复刻构建产物 lib/index.js 里的真实 DOM 输出
+ * （Switch → button[role=switch][aria-checked][aria-label][disabled][title]，
+ * StateDot → span[data-state]，Tag → span[data-tone]）。本包没有 clsx，
+ * 真实原语在 node 环境无法加载，所以只替身 DOM 形状，断言仍读视图真实传来的参数。
+ * aria-checked 用浏览器里实际呈现的字符串（'true'/'false'），与改前自建 button 一致。
+ */
+vi.mock('@deepseek-ai/dsh-client-ui-primitives', async () => {
+  const { createElement } = await import('react')
+  const Switch = (props: Record<string, unknown>): unknown => createElement('button', {
+    type: 'button',
+    role: 'switch',
+    'aria-checked': props.checked === true ? 'true' : 'false',
+    'aria-label': props.label,
+    title: props.title,
+    disabled: props.disabled === true,
+    className: props.className,
+  }, createElement('span', { className: 'thumb' }))
+  const StateDot = (props: Record<string, unknown>): unknown => createElement('span', {
+    'data-state': props.state,
+    'aria-hidden': 'true',
+    className: props.className,
+  })
+  const Tag = (props: Record<string, unknown>): unknown => createElement('span', {
+    'data-tone': (props.tone as string | undefined) ?? 'outline',
+    className: props.className,
+  }, props.children as never)
+  return { Switch, StateDot, Tag }
+})
 
 /**
  * 思考限制页 A / B / C 三张卡的结构与状态表达。
@@ -45,6 +75,17 @@ function flatten(node: ReactNode, out: FlatElement[] = []): FlatElement[] {
 
 function byData(nodes: readonly FlatElement[], name: string): FlatElement[] {
   return nodes.filter(node => node.props[name] !== undefined)
+}
+
+/**
+ * data-guard-status 现在挂在最外层 span 上，可见文本在其内部的官方 Tag 里。
+ * 读取嵌套文本，保持「状态值 + 文案逐字相等」的原语义 —— 不是弱化，只是把
+ * 断言路径从「直接 children」改成「穿过 Tag 取文本」。
+ */
+function statusTextOf(node: FlatElement): unknown {
+  const inner = flatten(node.props.children as ReactNode)
+  const texts = inner.map(child => child.props.children).filter((child): child is string => typeof child === 'string')
+  return texts.length === 1 ? texts[0] : texts
 }
 
 const ALL_ON = {
@@ -105,16 +146,16 @@ describe('GuardPanel structure', () => {
 
   it('shows a text status next to the dot, never a bare coloured dot', () => {
     const nodes = render()
-    const statuses = byData(nodes, 'data-guard-status').map(node => [node.props['data-guard-status'], node.props.children])
+    const statuses = byData(nodes, 'data-guard-status').map(node => [node.props['data-guard-status'], statusTextOf(node)])
     expect(statuses).toEqual([['on', '已启用'], ['on', '已启用'], ['on', '已启用']])
     const off = byData(render({ enabled: { ...ALL_ON, no_progress: false } }), 'data-guard-status')
-    expect(off.map(node => [node.props['data-guard-status'], node.props.children])[2]).toEqual(['off', '已关闭'])
+    expect(off.map(node => [node.props['data-guard-status'], statusTextOf(node)])[2]).toEqual(['off', '已关闭'])
   })
 
   it('says 状态未知 and disables the switch when the switches were not read', () => {
     const nodes = render({ enabled: undefined })
     const statuses = byData(nodes, 'data-guard-status')
-    expect(statuses.every(node => node.props.children === '状态未知')).toBe(true)
+    expect(statuses.every(node => statusTextOf(node) === '状态未知')).toBe(true)
     const switches = byData(nodes, 'aria-label').filter(node => node.props.role === 'switch')
     expect(switches.length).toBe(3)
     expect(switches.every(node => node.props.disabled === true)).toBe(true)
@@ -166,5 +207,68 @@ describe('GuardPanel structure', () => {
     expect(text.length).toBe(1)
     expect(zh.guardCBoundary).toContain('不是达到次数就直接拒绝')
     expect(zh.guardCTrigger).toContain('证明没有进展')
+  })
+})
+
+/**
+ * B 阶段（官方原语试点）的可见契约：只折叠视觉，业务状态、文案与 data-* 断言不变。
+ *   - B-1：Switch 禁用时卡片内有可见原因行，且外包装用 aria-describedby 指向它（不传未知 prop）；
+ *   - B-2：状态点换成 StateDot 的 data-state，外壳仍保留业务 data-tone；
+ *   - B-3：机制卡状态 tag 换成 Tag，data-guard-status 与文案原样保留。
+ */
+describe('B 阶段：官方原语（Switch / StateDot / Tag）', () => {
+  const dotStates = (nodes: FlatElement[]): unknown[] =>
+    nodes.filter(node => node.props['data-state'] !== undefined).map(node => node.props['data-state'])
+  const tagTones = (nodes: FlatElement[]): unknown[] =>
+    nodes.filter(node => ['success', 'warning', 'neutral'].includes(String(node.props['data-tone'])))
+      .map(node => node.props['data-tone'])
+
+  it('maps the business status onto StateDot states without touching the text', () => {
+    expect(dotStates(render())).toEqual(['done', 'done', 'done'])
+    expect(dotStates(render({ enabled: { ...ALL_ON, no_progress: false } }))).toEqual(['done', 'done', 'idle'])
+    expect(dotStates(render({ enabled: undefined }))).toEqual(['warning', 'warning', 'warning'])
+  })
+
+  it('keeps the business data-tone on the dot shell', () => {
+    const tones = render().filter(node => node.props.className === 'v3-dot').map(node => node.props['data-tone'])
+    expect(tones).toEqual(['ok', 'ok', 'ok'])
+  })
+
+  it('maps the status Tag tones ok→success and off→neutral', () => {
+    expect(tagTones(render())).toEqual(['success', 'success', 'success'])
+    expect(tagTones(render({ enabled: { ...ALL_ON, no_progress: false } }))).toEqual(['success', 'success', 'neutral'])
+  })
+
+  it('keeps data-guard-status and its text exactly as before inside the Tag', () => {
+    const statuses = byData(render(), 'data-guard-status').map(node => [node.props['data-guard-status'], statusTextOf(node)])
+    expect(statuses).toEqual([['on', '已启用'], ['on', '已启用'], ['on', '已启用']])
+  })
+
+  it('shows a visible reason referenced by aria-describedby when the switch is disabled', () => {
+    const nodes = render({ enabled: undefined })
+    const reasons = byData(nodes, 'data-guard-switch-reason')
+    expect(reasons.length).toBe(3)
+    expect(reasons.every(node => node.type === 'p')).toBe(true)
+    expect(reasons.every(node => node.props.children === zh.guardSwitchReasonUnknown)).toBe(true)
+    const groups = nodes.filter(node => node.props.role === 'group')
+    expect(groups.length).toBe(3)
+    const ids = new Set(reasons.map(node => node.props.id))
+    expect(groups.every(group => ids.has(group.props['aria-describedby']))).toBe(true)
+    // 原因行必须有可见文案，而不是只靠 data-* 属性。
+    expect(zh.guardSwitchReasonUnknown.length).toBeGreaterThan(0)
+    expect(guardDictionaries().en.guardSwitchReasonUnknown).not.toBe(zh.guardSwitchReasonUnknown)
+  })
+
+  it('shows a readonly reason when the surface has no write handler', () => {
+    const nodes = render({ onToggle: undefined })
+    const reasons = byData(nodes, 'data-guard-switch-reason')
+    expect(reasons.length).toBe(3)
+    expect(reasons.every(node => node.props.children === zh.guardSwitchReasonReadonly)).toBe(true)
+  })
+
+  it('omits the reason line and aria-describedby when the switches are interactive', () => {
+    const nodes = render()
+    expect(byData(nodes, 'data-guard-switch-reason').length).toBe(0)
+    expect(nodes.filter(node => node.props.role === 'group' && node.props['aria-describedby'] !== undefined).length).toBe(0)
   })
 })

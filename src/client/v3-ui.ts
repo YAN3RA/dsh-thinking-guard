@@ -49,12 +49,8 @@ const CSS = [
     + 'padding:5px 10px;border-radius:999px;background:var(--v3-panel);border:1px solid var(--v3-line);min-width:0}',
   '.v3-statusline b{color:var(--v3-t1);font-weight:600}',
   '.v3-statusline[data-tone=\'bad\']{background:var(--v3-bad-dim);border-color:color-mix(in srgb,var(--v3-bad) 30%,transparent)}',
-  '.v3-dot{display:inline-block;width:7px;height:7px;border-radius:50%;flex:none;background:var(--v3-t4)}',
-  '.v3-dot[data-tone=\'ok\']{background:var(--v3-ok);box-shadow:0 0 0 3px var(--v3-ok-dim)}',
-  '.v3-dot[data-tone=\'bad\']{background:var(--v3-bad);box-shadow:0 0 0 3px var(--v3-bad-dim)}',
-  '.v3-dot[data-tone=\'warn\']{background:var(--v3-warn);box-shadow:0 0 0 3px var(--v3-warn-dim)}',
-  '.v3-dot[data-tone=\'run\']{width:8px;height:8px;background:transparent;border:1.5px solid var(--v3-t3);border-top-color:transparent;animation:v3-spin .9s linear infinite;box-shadow:none}',
-  '@keyframes v3-spin{to{transform:rotate(360deg)}}',
+  // `.v3-dot` 现在只做布局外壳：视觉圆点交给官方 StateDot（B-2），data-tone 保留在外壳上。
+  '.v3-dot{display:inline-flex;align-items:center;justify-content:center;flex:none}',
 
   /* ---------- panel ---------- */
   '.v3-panel{background:var(--v3-panel);border:1px solid var(--v3-line);border-radius:var(--v3-r-lg);padding:13px 15px;min-width:0}',
@@ -91,13 +87,7 @@ const CSS = [
   '.v3-notebox{margin:0;padding:11px 13px;border-radius:var(--v3-r-md);background:var(--v3-panel);border:1px solid var(--v3-line);color:var(--v3-t3);font-size:11.5px;line-height:18px}',
   '.v3-notebox b{color:var(--v3-t2);font-weight:600}',
 
-  /* ---------- switch (guard + catalog) ---------- */
-  '.v3-sw{position:relative;width:34px;height:19px;border:0;border-radius:999px;padding:0;cursor:pointer;flex:none;background:color-mix(in srgb,var(--dsw-alias-label-primary,CanvasText) 16%,transparent);transition:background .16s}',
-  '.v3-sw::after{content:\'\';position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;background:var(--dsw-alias-switch-thumb,var(--v3-bg));transition:transform .16s}',
-  '.v3-sw[aria-checked=\'true\']{background:var(--v3-ok)}',
-  '.v3-sw[aria-checked=\'true\']::after{transform:translateX(15px)}',
-  '.v3-sw:disabled{opacity:.55;cursor:default}',
-  '.v3-sw:focus-visible{outline:2px solid var(--v3-info);outline-offset:2px}',
+  /* ---------- switch：改用官方 Switch（B-1），旧的 .v3-sw 规则已删除 ---------- */
 
   /* ---------- catalog ---------- */
   '.v3-catgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}',
@@ -137,7 +127,7 @@ const CSS = [
   '@container v3 (max-width:900px){.v3-gpanel,.v3-catgrid{grid-template-columns:minmax(0,1fr)}}',
   '@container v3 (max-width:720px){.v3-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.v3-catstat{flex-wrap:wrap}.v3-catstat>div{flex:1 1 45%}.v3-catstat>div+div{border-left:0}}',
   '@container v3 (max-width:620px){.v3-rank-row .v3-nm{width:104px}}',
-  '@media (prefers-reduced-motion:reduce){.v3-dot[data-tone=\'run\'],.v3-scan[data-running=\'true\'] .v3-fill{animation:none}}',
+  '@media (prefers-reduced-motion:reduce){.v3-scan[data-running=\'true\'] .v3-fill{animation:none}}',
   /* 裸 `[hidden]` 会全局覆盖宿主的 display，收窄到 `.v3-root` 后代（A-4）。 */
   '.v3-root [hidden]{display:none !important}',
 ].join('')

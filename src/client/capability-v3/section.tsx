@@ -37,7 +37,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import type { KeyboardEvent, ReactElement, ReactNode } from 'react'
 import { MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
 import * as ClientUiPrimitives from '@deepseek-ai/dsh-client-ui-primitives'
-import { Button, Input, Modal, SegmentedTabs, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Input, Modal, SegmentedTabs, StateDot, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
 import type {
   CapabilityPolicyRemote,
   CapabilitySnapshot,
@@ -406,7 +406,8 @@ body[data-ds-dark-theme] .mc-count--disabled{color:#b8abad}
 .mc-guard-threshold-edit{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .mc-guard-threshold-edit-label{font-size:11.5px;color:var(--dsw-alias-label-tertiary)}
 /* ---- v3 工具与技能（V3-c）：仅新增，不改动上面任何 .mc-* / .mc-guard-* ---- */
-.v3-dot[data-tone='info']{background:var(--v3-info)}
+/* 常驻=中性 idle 圆点 + 蓝色 class 适配（官方 StateDot 无 info 状态） */
+.v3-dot--info[data-state='idle']{color:var(--v3-info)}
 .v3-trow{cursor:pointer}
 .v3-trow:focus-visible{outline:2px solid var(--v3-info);outline-offset:-2px}
 .v3-racts{display:flex;align-items:center;gap:4px;margin-left:auto;flex:none}
@@ -592,6 +593,16 @@ const CLASS_DOT_TONE: Record<CapabilityClass, string> = {
   disabled: '',
 }
 
+/**
+ * 官方 StateDot 无 info 状态（B-2）：常驻=中性 idle + 蓝色 class 适配，按需=warning，
+ * 禁用=idle（中性灰），不把常驻擅自改成绿色。业务 data-tone 仍由 CLASS_DOT_TONE 保留在外壳。
+ */
+const CLASS_DOT_STATE: Record<CapabilityClass, 'idle' | 'warning'> = {
+  resident: 'idle',
+  'on-demand': 'warning',
+  disabled: 'idle',
+}
+
 export interface CatalogStatCell {
   readonly label: ReactNode
   readonly value: ReactNode
@@ -729,7 +740,7 @@ export function ToolGroupsView(props: ToolGroupsViewProps): ReactElement {
                         }
                       }}
                     >
-                      <span className="v3-dot" data-tone={CLASS_DOT_TONE[tool.class]} aria-hidden="true" />
+                      <span className="v3-dot" data-tone={CLASS_DOT_TONE[tool.class]} aria-hidden="true"><StateDot state={CLASS_DOT_STATE[tool.class]} size={9} {...(tool.class === 'resident' ? { className: 'v3-dot--info' } : {})} /></span>
                       <span className="v3-nm" title={tool.name}>{displayToolName(server, tool.name)}</span>
                       <span className="v3-racts">
                         {tool.mandatory && <span className="v3-tag">{t('mandatory')}</span>}

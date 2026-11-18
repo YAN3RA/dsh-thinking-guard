@@ -112,11 +112,11 @@ dsh plugin --profile desktop add dsh-thinking-guard
 
 ### 安装指定版本
 
-例如安装 `0.3.6`：
+例如安装 `0.4.0`：
 
 ```bash
 dsh plugin --profile desktop remove dsh-thinking-guard
-dsh plugin --profile desktop add dsh-thinking-guard@0.3.6
+dsh plugin --profile desktop add dsh-thinking-guard@0.4.0
 ```
 
 ### 更新插件

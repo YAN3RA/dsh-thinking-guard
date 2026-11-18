@@ -1,12 +1,25 @@
 {
   "name": "dsh-thinking-guard",
-  "version": "0.4.1",
-  "description": "为 DeepSeek Harness 提供「思考节流」设置页：一个入口三个子页（总览 / 思考限制 / 能力菜单），统一管理工具与技能、查看运行数据、执行重复与空转保护。",
+  "version": "0.4.2",
+  "description": "DeepSeek Harness（DSH）社区插件：统一管理工具与技能的常驻、按需和禁用策略，提供重复调用提醒、交替循环识别、无进展局部保护及本次启动统计。",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/YAN3RA/dsh-thinking-guard.git"
   },
+  "homepage": "https://github.com/YAN3RA/dsh-thinking-guard",
+  "bugs": {
+    "url": "https://github.com/YAN3RA/dsh-thinking-guard/issues"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "capability-menu",
+    "agent-guard",
+    "mcp"
+  ],
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"

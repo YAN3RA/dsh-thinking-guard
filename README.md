@@ -1,5 +1,12 @@
 # 🛡️ 思考节流（DSH Thinking Guard）
 
+[![npm 版本](https://img.shields.io/npm/v/dsh-thinking-guard)](https://www.npmjs.com/package/dsh-thinking-guard) [![DSH 插件 · Cordis](https://img.shields.io/badge/DSH_plugin-Cordis-4D6BFE)](https://github.com/topics/dsh-plugin) [![许可证 Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/YAN3RA/dsh-thinking-guard/blob/main/LICENSE)
+
+**当前版本：0.4.2（文档与元数据补丁）；运行功能与 0.4.1 一致。** [npm 安装包](https://www.npmjs.com/package/dsh-thinking-guard) · [GitHub Releases](https://github.com/YAN3RA/dsh-thinking-guard/releases) · [问题反馈](https://github.com/YAN3RA/dsh-thinking-guard/issues)
+
+> **DSH 插件声明：** 本项目是为 **DeepSeek Harness（DSH）** 开发的社区维护、非官方 **Cordis 型插件**，不是独立应用，也不是用来冒充插件的 Skill 说明文件。安装与运行需要 DSH 宿主。
+
+
 **让 AI 执行更有边界，让工具调用更清晰，让重复思考少一些。**
 
 一个为 **DeepSeek Harness（DSH）** 设计的执行管理插件。
@@ -48,7 +55,7 @@
 | 交替循环识别 | 识别多个工具之间反复交替的调用模式 |
 | 无进展保护 | 识别缺少有效推进的重复执行 |
 
-你可以分别启用或关闭保护机制，并根据实际使用情况调整对应阈值。
+你可以分别启用或关闭三种保护机制，并调整重复调用提醒阈值（默认第 3 / 5 / 8 次）。三个开关按智能体 / 回合隔离，不跨会话继承；开关与阈值配置本身会保存在本机。
 
 **设计原则：提醒优先，保护适度。**
 
@@ -96,6 +103,44 @@
 - 将低频能力调整为按需使用。
 - 不确定某项能力是否需要时，先保留现状，观察实际使用情况后再调整。
 
+## 📝 版本变更
+
+### 0.4.2 · 文档与元数据补丁
+
+- 完善简体中文说明、安装升级步骤、兼容范围、隐私与插件声明，补充 DSH 插件标记及项目来源。
+- GitHub 与 npm 使用同一份 README；补齐包的主页、问题反馈地址与关键词。
+- **不增加功能，不修改 0.4.1 的运行代码或配置格式。**
+
+### 0.4.1 · 总览简化与统计重启清零
+
+- 删除总览页的刷新按钮。进入总览读取一次；切换到其他页再返回会重新读取，不添加轮询。
+- 已观察调用、重复提醒、循环提醒、本地拒绝以及结果分类计数，仅在**本次 DSH 宿主进程内累计**；完整重启 DSH 后全部清零，统计起点更新，最近提醒 / 拒绝时间重新开始。
+- 同一进程内刷新页面、切换页签或重新挂载状态服务**不会清零**。
+- 不再恢复旧统计，也不再周期落盘或在卸载时落盘；已有的 `guard-stats.json` 不读取、不写入、不删除。
+- **保护开关和阈值配置仍保留**；Guard 检测逻辑和 RPC 数据字段未变。
+
+## 🧩 DSH 插件标记与生态收录
+
+仓库根目录已包含真实可安装的插件标记：
+
+| 标记 | 作用 |
+| --- | --- |
+| [`package.json` 中的 `dsh.bundle.patch`](https://github.com/YAN3RA/dsh-thinking-guard/blob/main/package.json) | 声明插件清单为 `./cordis.patch.yml`，供 `dsh plugin add` 加载 |
+| [`cordis.patch.yml`](https://github.com/YAN3RA/dsh-thinking-guard/blob/main/cordis.patch.yml) | 挂载本插件的能力目录、策略、Guard 及公开网关 |
+| `package.json` 中的 `dsh.client` | 声明设置页客户端及其宿主依赖；不是仅靠客户端声明冒充完整插件 |
+| `@deepseek-ai/cordis` 与 `@deepseek-ai/dsh-*` peerDependencies | 声明真实 DSH / Cordis 宿主依赖 |
+
+> 💡 **收录说明：** DSH Market / Awesome DSH Plugin 面向 DeepSeek Harness 生态插件。本仓库使用 **`dsh-plugin` topic + 已存在的 Cordis 清单标记**供平台发现；topic 不能替代插件清单。Skill 型项目应提供真实的 `SKILL.md`，但本项目是 Cordis 型，**不为收录伪造 Skill 文件**。
+>
+> `dsh-plugin` topic 可供自动发现进入候选流程；另一种方式是按平台规范提交插件条目 PR。具体扫描、审核及收录以[平台贡献指南](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/blob/main/contributing.md)为准。**添加 topic 不等于已收录，收录也不等于官方认证或安全审计。**
+
+## 🔧 宿主与兼容范围
+
+- 先安装并启动 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)，确保终端可执行 `dsh`。
+- 当前 DSH peer 声明范围为 `^0.2.1-rc.3 || ^0.2.2-rc.1`，其他 Cordis / React 依赖以包清单为准。
+- 0.4.1 的自动测试为 **33 个测试文件 / 431 个用例**；已用独立 DSH Web CLI **0.2.2-rc.3** 验证实际包、公开 RPC、跨进程统计清零与设置页。
+- 这不代表对所有 peer 版本、生产 Electron 热重载、物理触屏或屏幕阅读器组合的完整兼容保证。升级后请完整重启宿主。
+
 ## 📦 安装
 
 ### 安装插件
@@ -112,16 +157,32 @@ dsh plugin --profile desktop add dsh-thinking-guard
 
 ### 安装指定版本
 
-例如安装 `0.4.1`：
+首次安装指定版本：
 
 ```bash
-dsh plugin --profile desktop remove dsh-thinking-guard
-dsh plugin --profile desktop add dsh-thinking-guard@0.4.1
+dsh plugin --profile desktop add dsh-thinking-guard@0.4.2
 ```
+
+`desktop` 是桌面客户端常用 profile；使用其他 profile 时，请将其替换为实际名称。
 
 ### 更新插件
 
-建议根据项目发布的最新版本进行更新。更新后重启 DeepSeek Harness，使插件重新加载。
+已安装旧版时，可在 DSH 插件管理页更新；终端方式如下（由你手动执行）：
+
+```bash
+dsh plugin --profile desktop remove dsh-thinking-guard
+dsh plugin --profile desktop add dsh-thinking-guard@0.4.2
+```
+
+随后**完整退出并重新打开 DeepSeek Harness**，而不是只刷新页面。正常升级保留开关与阈值；运行统计按 0.4.1 起的规则在宿主重启后清零。不要为了升级主动删除本机配置或旧统计文件。
+
+npm 是首选渠道，包内已含构建后的 `lib/`，无需为正常安装手动构建源码。无法访问 npm 时，可从对应 [GitHub Release](https://github.com/YAN3RA/dsh-thinking-guard/releases) 下载预构建 `.tgz`，再执行：
+
+```bash
+dsh plugin --profile desktop add "<本地下载的插件包.tgz>" --ignore-scripts
+```
+
+备用包请使用**固定版本的 Release 附件**，不要把带版本文件名拼到 `releases/latest/download/`，以免下一版发布后失效。
 
 项目版本与发布记录：
 
@@ -141,6 +202,13 @@ dsh plugin --profile desktop add dsh-thinking-guard@0.4.1
 
 **你的任务内容不应该成为执行统计的必要条件。**
 
+### 安全与权限声明
+
+- 本插件**不是纯只读插件**：修改开关、阈值、能力分档或注册 MCP / 技能目录会改变对应本机配置；请仅在理解影响后操作。
+- 不增加额外模型请求来生成统计，也不以简单次数直接终止整个任务；提醒 / 局部拒绝仅在实际检测条件满足时触发。
+- 注册外部 MCP 服务及调用工具的网络、权限和数据去向，仍由宿主、所配置服务和用户授权决定；本文不作“绝不联网”或“所有服务均可信”的保证。
+- 本项目由社区独立维护，与 DeepSeek 官方不存在官方插件或安全认证关系；徽章仅标识适用生态或制作归属，不表示官方背书。
+
 ---
 
 ## ❓ 常见问题
@@ -155,7 +223,7 @@ dsh plugin --profile desktop add dsh-thinking-guard@0.4.1
 <details>
 <summary><strong>总览中的计数为什么是 0？</strong></summary>
 
-这通常表示当前统计范围内还没有相关执行保护事件。可以结合实际工具调用情况和诊断信息判断插件是否正常工作。
+0.4.1 起统计仅覆盖本次 DSH 启动期间，完整重启后为 0 是预期行为。只有检测器实际观察到的调用才会计入；不是聊天消息数或历史会话总量。没有提醒或拒绝也不代表挂载失败，请结合“插件挂载”和诊断状态判断。
 
 </details>
 
@@ -210,6 +278,12 @@ dsh plugin --profile desktop add dsh-thinking-guard@0.3.5
   
 感谢所有开源项目作者与社区贡献者的分享和支持！
 
+## 📄 许可证与声明
+
+本项目按 [Apache License 2.0](https://github.com/YAN3RA/dsh-thinking-guard/blob/main/LICENSE) 分发。保留上游许可证、版权及来源声明；原许可证中的 `Copyright 2026 Dawei Fu` 保持不变。新增维护与扩展不表示原作者或 DeepSeek 官方为本分支的修改提供背书。
+
+反馈问题时请说明插件版本、DSH 版本与复现步骤，勿在公开 Issue 上传凭据、完整聊天记录或未经脱敏的配置。
+
 ---
 
 <p align="center">
@@ -217,3 +291,5 @@ dsh plugin --profile desktop add dsh-thinking-guard@0.3.5
   <br />
   <sub>DSH Thinking Guard · 为更清晰、更可控的 Agent 执行体验而设计</sub>
 </p>
+
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)

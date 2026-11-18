@@ -58,7 +58,6 @@ const chevronIcons = ClientUiPrimitives as unknown as {
 }
 const IconTriangleRightFill: ChevronIcon = (chevronIcons.IconTriangleRightFillMedium ?? chevronIcons.IconTriangleRightFill14)!
 import { LocationModal } from '../LocationModal.tsx'
-import { V3Styles } from './styles.ts'
 import { ADOPTABLE_SKILL_SOURCES, BUILT_IN_SERVER, PROJECT_SKILL_SOURCES } from '../../constants.ts'
 import {
   compileNameFilter,
@@ -222,8 +221,10 @@ const CLASS_SHORT_KEYS: Record<CapabilityClass, CapabilityKey> = {
   disabled: 'disabledShort',
 }
 
-/** Scoped stylesheet: injected once at module scope, like every official bundle. */
-const CSS_ID = 'capability-menu-section-css'
+/** Scoped stylesheet: injected once at module scope, like every official bundle.
+ *  A-6：id 必须独立 —— 与上游冻结的 CapabilitySection.tsx 同 id 时，先注入的那个
+ *  会让对方在幂等检查处被跳过，两套 mc-* 规则互相吃掉。 */
+const CSS_ID = 'capability-menu-v3-css'
 const CSS = `
 .mc-section{display:flex;flex-direction:column;gap:12px;color:var(--dsw-alias-label-primary)}
 /* One settings page with category tabs on top (PluginSection). The reused
@@ -399,60 +400,10 @@ body[data-ds-dark-theme] .mc-count--disabled{color:#b8abad}
 .mc-frontmatter td{color:var(--dsw-alias-label-primary);overflow-wrap:anywhere;white-space:pre-wrap}
 .mc-preview-hint{padding:16px;text-align:center;font-size:13px;color:var(--dsw-alias-label-tertiary)}
 /* ---- 总览（OverviewPanel） ---- */
-.mc-metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
-.mc-metric{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:10px 12px;min-width:0}
-.mc-metric-label{font-size:11.5px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
-.mc-metric-value{font-size:20px;line-height:28px;font-weight:600;font-variant-numeric:tabular-nums}
-.mc-metric-hint{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary);margin-top:2px}
-.mc-attention{margin-top:4px}
-.mc-attention-title{margin:0 0 6px;font-size:13px;font-weight:600}
-.mc-attention-list{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px}
-.mc-attention-item{font-size:12.5px;line-height:20px;color:var(--dsw-alias-label-secondary)}
-.mc-attention-item--failures{color:var(--dsw-alias-state-warn-primary)}
-.mc-attention-item--coverage{color:var(--dsw-alias-state-warn-primary)}
 /* ---- 思考限制（GuardPanel） ---- */
-.mc-guard-boundary{margin:0;padding:8px 12px;border-radius:8px;font-size:12px;line-height:18px;
-  border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);
-  color:var(--dsw-alias-label-secondary)}
 /* v3 数据看板：真实计数板 + 可编辑阈值 */
-.mc-guard-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1px;
-  background:var(--dsw-alias-border-l2);border:1px solid var(--dsw-alias-border-l2);
-  border-radius:8px;overflow:hidden;margin:10px 0}
-.mc-guard-stat{background:var(--dsw-alias-bg-l1);padding:10px 12px}
-.mc-guard-stat-label{font-size:11px;color:var(--dsw-alias-label-tertiary);margin-bottom:4px}
-.mc-guard-stat-value{font-size:19px;font-weight:600;line-height:1.15;
-  font-variant-numeric:tabular-nums;font-family:var(--dsw-font-code)}
-.mc-guard-stat-hint{font-size:10.5px;color:var(--dsw-alias-label-tertiary);margin-top:3px;line-height:1.35}
-.mc-guard-stats-since{grid-column:1/-1;margin:0;padding:7px 12px;font-size:10.5px;
-  color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-l2)}
 .mc-guard-threshold-edit{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .mc-guard-threshold-edit-label{font-size:11.5px;color:var(--dsw-alias-label-tertiary)}
-.mc-guard-threshold-edit-input{width:150px;padding:3px 7px;border-radius:6px;font-size:12px;
-  font-family:var(--dsw-font-code);color:inherit;background:transparent;
-  border:1px solid var(--dsw-alias-border-l2)}
-.mc-guard-threshold-edit-input:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
-.mc-guard-threshold-edit-input:disabled{opacity:.6}
-.mc-guard-threshold-edit-hint{font-size:10.5px;color:var(--dsw-alias-label-tertiary)}
-.mc-guard-card{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;overflow:hidden}
-.mc-guard-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 12px;
-  background:var(--dsw-alias-bg-layer-2)}
-.mc-guard-title{font-size:13px;font-weight:600}
-.mc-guard-model{font-family:var(--dsw-font-code);font-size:11px;line-height:18px;
-  color:var(--dsw-alias-label-tertiary);margin-left:auto}
-.mc-guard-body{padding:10px 12px;border-top:1px solid var(--dsw-alias-border-l1);display:flex;flex-direction:column;gap:8px}
-.mc-guard-points{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:3px}
-.mc-guard-point{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
-.mc-guard-thresholds{font-size:11.5px;line-height:18px;color:var(--dsw-alias-label-tertiary);
-  display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
-.mc-guard-thresholds-label{font-family:inherit}
-.mc-guard-thresholds-value{font-family:var(--dsw-font-code);color:var(--dsw-alias-label-secondary)}
-.mc-guard-switch{position:relative;flex:none;width:34px;height:20px;border-radius:999px;border:none;
-  padding:0;cursor:pointer;background:var(--dsw-alias-state-idle-primary);transition:background .16s ease}
-.mc-guard-switch::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;
-  border-radius:50%;background:#fff;transition:transform .16s ease}
-.mc-guard-switch--on{background:var(--dsw-alias-state-business-primary)}
-.mc-guard-switch--on::after{transform:translateX(14px)}
-.mc-guard-switch:disabled{opacity:.5;cursor:not-allowed}
 /* ---- v3 工具与技能（V3-c）：仅新增，不改动上面任何 .mc-* / .mc-guard-* ---- */
 .v3-dot[data-tone='info']{background:var(--v3-info)}
 .v3-trow{cursor:pointer}
@@ -488,6 +439,15 @@ button.v3-tag:disabled{opacity:.55;cursor:default}
 .v3-root .v3-group>summary{padding:11px 15px;min-height:38px}
 .v3-root .v3-tag{font-size:11px;height:19px;line-height:19px;padding:0 7px}
 .v3-root .v3-trow{min-height:34px;font-size:12.5px}
+/* 窄窗口（容器 <=520px）工具栏折行：页签+搜索一行、操作按钮换到下一行并允许
+   自身折行。宽屏不触发，保持原来的单行 nowrap 布局。断点沿用 v3 容器语义
+   （.v3-root 上的 container: v3 / inline-size），按内容宽度而非视口判断。 */
+@container v3 (max-width:520px){
+  .mc-cat-bar{flex-wrap:wrap}
+  .mc-cat-bar>.mc-cat-tabs{flex:0 1 auto}
+  .mc-cat-search{flex:1 1 120px;min-width:0;max-width:220px}
+  .mc-cat-bar>.mc-cat-actions{flex:1 1 100%;flex-wrap:wrap;justify-content:flex-start;margin-left:0}
+}
 `
 if (typeof document !== 'undefined' && document.querySelector(`style[data-css-id="${CSS_ID}"]`) === null) {
   const tag = document.createElement('style')
@@ -1110,11 +1070,10 @@ export function CapabilitySection(props: CapabilitySectionProps): JSX.Element {
   }, [remote, busy, state, t, reload, showFeedback])
 
   // v3 容器：`v3-root` 让 `v3-ui.ts` 的 @container 断点生效，深浅色 token 与
-  // 执行保护页同一套。`V3Styles` 挂在这里而不是 ReadyBody 里，加载/错误态也走
-  // 同一套 token。
+  // 执行保护页同一套。v3 样式表由外壳 thinking-throttle.tsx 单实例渲染（A-3），
+  // 本页只提供容器类，加载/错误态因此也走同一套 token。
   return (
     <section className="v3-root mc-section">
-      <V3Styles />
       {toast !== null && (
         <Toast
           key={toast.seq}

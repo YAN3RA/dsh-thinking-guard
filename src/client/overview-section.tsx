@@ -19,7 +19,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
 import type { GuardDiagnostics, GuardRemote, GuardStatsSnapshot, GuardSwitches } from './guard-remote.ts'
 import type { CapabilityDiagnostics, CapabilityPolicyRemote, CapabilityRow } from './store.ts'
-import { V3Styles, V3_ROOT_CLASS } from './v3-ui.ts'
+import { V3_ROOT_CLASS } from './v3-ui.ts'
 
 /** 本页文案键。zh / en 两份字典的键必须与此完全一致。 */
 export type OverviewKey =
@@ -658,7 +658,6 @@ export function OverviewView(props: OverviewViewProps): ReactElement {
 
   return (
     <section className={V3_ROOT_CLASS + ' mc-overview-section'} data-overview-busy={busy ? 'true' : 'false'}>
-      <V3Styles />
       <style data-overview-style="true">{OVERVIEW_CSS}</style>
       <div className="mc-overview-bar">
         <button

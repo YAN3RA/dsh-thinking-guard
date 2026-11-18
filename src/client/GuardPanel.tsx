@@ -21,7 +21,6 @@
  * 本文件不读会话历史，也不改任何检测逻辑：它只把配置读出来、把改动交回去。
  */
 import { useCallback, useEffect, useRef, useState, type ReactElement, type ReactNode } from 'react'
-import { V3Styles } from './v3-ui.ts'
 
 /** The three Guard capabilities, in display order. */
 export type GuardSectionId = 'duplicate_call' | 'alternating_cycle' | 'no_progress'
@@ -46,6 +45,7 @@ export type GuardPanelKey =
   | 'guardThresholds'
   | 'guardThresholdSave'
   | 'guardThresholdDraftHint'
+  | 'guardThresholdConflictHint'
   | 'guardThresholdHint'
   | 'guardStageAt'
   | 'guardStageOnly'
@@ -180,6 +180,8 @@ const GUARD_CSS = [
   '.mc-guard-threshold-num:focus-visible{outline:2px solid var(--v3-info);outline-offset:1px}',
   '.mc-guard-threshold-num:disabled{opacity:.6}',
   '.mc-guard-threshold-hint{margin:0}',
+  // 常驻但空时隐藏（不用 hidden / display:none，否则读屏会丢掉整个区域）。
+  '.mc-guard-threshold-hints:empty{position:absolute;width:1px;height:1px;overflow:hidden}',
   '.mc-guard-threshold-save{padding:3px 10px;border-radius:var(--v3-r-sm);font-size:11.5px;color:var(--v3-t1);'
     + 'background:var(--v3-panel-2);border:1px solid var(--v3-line);cursor:pointer}',
   '.mc-guard-threshold-save:disabled{opacity:.5;cursor:default}',
@@ -402,6 +404,9 @@ export function useGuardThresholdDraft(props: {
  * rejects writes gets disabled boxes. 保存 is disabled while the draft is invalid as
  * well as while it is clean: an invalid list can never be sent, so offering a click
  * that silently does nothing would only mislead.
+ *
+ * 冲突（草稿脏而宿主列表变了）用一行可见文案说明；aria-live 容器常驻、空时不可见，
+ * 非法草稿只显示格式错误。
  */
 export function GuardThresholdEditor(props: {
   readonly t: (key: GuardPanelKey) => string
@@ -412,6 +417,8 @@ export function GuardThresholdEditor(props: {
   const draft = useGuardThresholdDraft(props)
   if (thresholds === undefined) return null
   const { editable, rows, invalid } = draft
+  // 草稿脏、宿主基线动过、且草稿合法时才出提示；非法态由格式错误独占用。
+  const conflictNotice = draft.conflict && draft.dirty && !invalid
   // Inner content only: the WRAPPER (data-guard-thresholds) belongs to the hook-free
   // view above, so element-tree walkers can still assert it without calling this
   // hook-owned component.
@@ -462,6 +469,24 @@ export function GuardThresholdEditor(props: {
           page above prints the error. */}
       {editable && invalid
         ? <p className="mc-guard-threshold-hint" role="alert" data-guard-threshold-invalid="true">{t('guardThresholdDraftHint')}</p>
+        : null}
+      {/* 宿主列表在草稿脏时变了：草稿保留，但要让这条变化看得见。 */}
+      {editable
+        ? (
+          <div
+            className="mc-guard-threshold-hints"
+            aria-live="polite"
+            data-guard-threshold-notice={invalid ? 'invalid' : conflictNotice ? 'conflict' : 'none'}
+          >
+            {conflictNotice
+              ? (
+                <p className="mc-guard-threshold-hint" data-guard-threshold-conflict="true">
+                  {t('guardThresholdConflictHint')}
+                </p>
+              )
+              : null}
+          </div>
+        )
         : null}
     </div>
   )
@@ -593,7 +618,6 @@ export function GuardPanel(props: GuardPanelProps): ReactElement {
 
   return (
     <section className="mc-section v3-root">
-      <V3Styles />
       <style data-guard-style="true">{GUARD_CSS}</style>
       <div className="gd-list">
         {SECTIONS.map(section)}

@@ -23,7 +23,7 @@ import { useCallback, useEffect, useRef, useState, type ReactElement } from 'rea
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type { GuardRemote, GuardSwitches } from './guard-remote.ts'
 import { GuardPanel, isGuardThresholdListValid, type GuardPanelKey, type GuardSectionId } from './GuardPanel.tsx'
-import { V3Styles, V3_ROOT_CLASS } from './v3-ui.ts'
+import { V3_ROOT_CLASS } from './v3-ui.ts'
 
 /**
  * 本页文案键：页面级（nav / title / desc 与状态行）+ 面板自己的键。
@@ -402,7 +402,6 @@ export function GuardSection(props: GuardSectionProps): ReactElement {
 
   return (
     <section className={V3_ROOT_CLASS + ' mc-guard-section'} data-guard-busy={busy ? 'true' : 'false'}>
-      <V3Styles />
       <style data-guard-section-style="true">{SECTION_CSS}</style>
       {/* 顶部状态栏已按需求移除；保存反馈仍保留，只在读回确认后出现。 */}
       {saved === null ? null : (
@@ -477,6 +476,7 @@ export function guardDictionaries(): {
     guardThresholds: '重复提醒阈值',
     guardThresholdSave: '保存',
     guardThresholdDraftHint: '需为 2–50 的递增整数、最多 5 个；未合法前不会提交。',
+    guardThresholdConflictHint: '宿主值已变化，当前草稿保留。',
     guardThresholdHint: '每个值都在「连续重复第 N 次」时提醒一次；最高值同时是 C 的无进展候选门槛，是否局部拒绝由 C 与证据决定。',
     guardStageAt: '第 {n} 次',
     guardStageOnly: '唯一阈值 · 提醒与门槛',
@@ -538,6 +538,7 @@ export function guardDictionaries(): {
     guardThresholds: 'Repeat reminder thresholds',
     guardThresholdSave: 'Save',
     guardThresholdDraftHint: 'Needs 2–50 ascending integers, at most 5; nothing is submitted until it is valid.',
+    guardThresholdConflictHint: 'The host value changed; your draft is kept.',
     guardThresholdHint: 'Each value reminds once, on the Nth consecutive repeat; the highest value also gates the no-progress candidate, and C decides with the evidence whether to deny locally.',
     guardStageAt: '#{n}',
     guardStageOnly: 'only threshold · reminder and gate',

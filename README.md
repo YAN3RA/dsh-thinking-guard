@@ -112,11 +112,11 @@ dsh plugin --profile desktop add dsh-thinking-guard
 
 ### 安装指定版本
 
-例如安装 `0.4.0`：
+例如安装 `0.4.1`：
 
 ```bash
 dsh plugin --profile desktop remove dsh-thinking-guard
-dsh plugin --profile desktop add dsh-thinking-guard@0.4.0
+dsh plugin --profile desktop add dsh-thinking-guard@0.4.1
 ```
 
 ### 更新插件
@@ -137,7 +137,7 @@ dsh plugin --profile desktop add dsh-thinking-guard@0.4.0
 - 仅记录执行保护相关的次数与时间信息。
 - 不记录工具调用参数、工具返回结果或聊天内容。
 - 不读取会话历史。
-- 运行计数保存在本机，不依赖外部统计服务。
+- 运行计数仅在本次 DSH 启动的内存中累计，重启后清零，不再恢复或写入旧统计文件；保护开关与阈值配置仍保存在本机。
 
 **你的任务内容不应该成为执行统计的必要条件。**
 

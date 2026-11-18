@@ -105,13 +105,14 @@ const CSS = [
   '.v3-group[open]>summary{border-bottom:1px solid var(--v3-line)}',
   '.v3-group>summary .v3-chev{width:10px;height:10px;color:var(--v3-t4);flex:none;transition:transform .14s}',
   '.v3-group[open]>summary .v3-chev{transform:rotate(90deg)}',
-  '.v3-group>summary .v3-gnm{font-size:12.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}',
+  // C-2：工具/技能长名优先用布局完整换行，保证键盘 focus 与触屏都能读到全名（不再省略号截断）。
+  '.v3-group>summary .v3-gnm{font-size:12.5px;font-weight:600;min-width:0;overflow-wrap:anywhere;white-space:normal}',
   '.v3-group>summary .v3-cnt{font-size:10.5px;color:var(--v3-t4);flex:none}',
   '.v3-group>summary .v3-right{margin-left:auto;display:flex;gap:4px;align-items:center;flex:none}',
   '.v3-trow{display:flex;align-items:center;gap:8px;padding:0 12px 0 29px;min-height:30px;border-top:1px solid var(--v3-line);font-size:12px;min-width:0}',
   '.v3-trow:first-of-type{border-top:0}',
   '.v3-trow:hover{background:var(--v3-panel-2)}',
-  '.v3-trow .v3-nm{font-family:var(--v3-font-code);font-size:11.5px;flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+  '.v3-trow .v3-nm{font-family:var(--v3-font-code);font-size:11.5px;flex:1 1 auto;min-width:0;overflow-wrap:anywhere;white-space:normal}',
   '.v3-trow .v3-uses{flex:none;font-size:11px;color:var(--v3-t4);font-variant-numeric:tabular-nums;white-space:nowrap}',
   '.v3-tag{display:inline-flex;align-items:center;gap:4px;height:17px;padding:0 6px;border-radius:4px;font-size:10px;line-height:17px;white-space:nowrap;color:var(--v3-t3);background:var(--v3-panel-2)}',
   '.v3-tag[data-tone=\'info\']{color:var(--v3-info);background:var(--v3-info-dim)}',
@@ -122,6 +123,17 @@ const CSS = [
   /* ---------- scope hint + scan progress ---------- */
   '@keyframes v3-indet{0%{left:-34%}100%{left:100%}}',
 
+  /* ---------- forced-colors（C-4）：高对比度下保底可见 ---------- */
+  // 卡片 / 状态格 / 机制卡 / 比例条 / 表格滚动区用系统色边框，文字走系统色；
+  // 状态不靠颜色：StateDot 在该模式下统一为 CanvasText，区分依赖每个状态旁的文案。
+  '@media (forced-colors: active){'
+    + '.v3-root .v3-panel,.v3-root .v3-statusline,.v3-root .v3-notebox,.v3-root .v3-group,'
+    + '.v3-root .v3-catstat,.v3-root .v3-cat-diag,.v3-root .ov-scell,.v3-root .gd-card,'
+    + '.v3-root .mc-overview-card,.v3-root .mc-frontmatter-region,.v3-root .ov-bar,'
+    + '.v3-root .gd-stage,.v3-root .v3-tag{border:1px solid CanvasText}'
+    + '.v3-root .ov-bar>span{background:CanvasText}'
+    + '.v3-root :focus-visible{outline:2px solid Highlight;outline-offset:2px}'
+    + '}',
   /* ---------- container breakpoints (v3 own numbers, container-keyed) ---------- */
   '@container v3 (max-width:980px){.v3-board{grid-template-columns:minmax(0,1fr)}}',
   '@container v3 (max-width:900px){.v3-gpanel,.v3-catgrid{grid-template-columns:minmax(0,1fr)}}',
@@ -147,4 +159,3 @@ export function V3Styles(): ReactElement {
 
 /** Whether an element must be treated as the v3 container (add to the page root). */
 export const V3_ROOT_CLASS = 'v3-root'
-

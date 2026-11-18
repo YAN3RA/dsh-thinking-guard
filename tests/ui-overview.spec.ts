@@ -16,6 +16,7 @@ import type { CapabilityRow } from '../src/client/store.ts'
 vi.mock('@deepseek-ai/dsh-client-ui-primitives', async () => {
   const { createElement } = await import('react')
   return {
+    Button: 'button',
     StateDot: (props: Record<string, unknown>): unknown => createElement('span', {
       'data-state': props.state,
       'aria-hidden': 'true',
@@ -355,5 +356,16 @@ describe('OverviewView', () => {
       guard: { switches: ALL_ON, diagnostics: { ...HEALTHY_DIAGNOSTICS, available: false, reasons: ['not-mounted'] } },
       catalog: {},
     })))).toEqual(['done', 'error', 'done'])
+  })
+
+  it('renders the refresh action as an official Button (host button) with data attr + compact class', () => {
+    const nodes = view()
+    const refresh = nodes.filter(node => node.props['data-overview-refresh'] !== undefined)
+    // 非空断言：forwardRef 对象若没被正确替身，会在这里被抓住（不是空集 every 假绿）。
+    expect(refresh.length).toBeGreaterThan(0)
+    expect(refresh[0]!.type).toBe('button')
+    const cls = String(refresh[0]!.props.className)
+    expect(cls).toContain('mc-overview-refresh')
+    expect(cls).toContain('mc-btn-sm')
   })
 })

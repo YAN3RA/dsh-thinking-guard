@@ -20,7 +20,7 @@ import { useCallback, useEffect, useRef, useState, type ReactElement } from 'rea
 import type { GuardDiagnostics, GuardRemote, GuardStatsSnapshot, GuardSwitches } from './guard-remote.ts'
 import type { CapabilityDiagnostics, CapabilityPolicyRemote, CapabilityRow } from './store.ts'
 import { V3_ROOT_CLASS } from './v3-ui.ts'
-import { StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 
 /** 本页文案键。zh / en 两份字典的键必须与此完全一致。 */
 export type OverviewKey =
@@ -116,10 +116,10 @@ const OVERVIEW_CSS = [
   '.mc-overview-section.v3-root{display:flex;flex-direction:column;gap:12px}',
   '.mc-overview-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}',
   '.mc-overview-bar .v3-hint{flex:1 1 240px;min-width:0}',
-  '.mc-overview-refresh{margin-left:auto;flex:none;padding:4px 12px;border-radius:var(--v3-r-sm);font-size:11.5px;'
-    + 'color:var(--v3-t1);background:var(--v3-panel-2);border:1px solid var(--v3-line);cursor:pointer}',
-  '.mc-overview-refresh:disabled{opacity:.5;cursor:default}',
-  '.mc-overview-refresh:focus-visible{outline:2px solid var(--v3-info);outline-offset:1px}',
+  // C-6A：外观交给官方 Button(outline/sm)，这里只留布局；用 .mc-btn-sm 提高 specificity
+  // 把默认 28px 压到贴近原自建按钮（refresh 基线 25.333px → 26px，差 ≤2px）。
+  '.mc-overview-refresh{margin-left:auto;flex:none}',
+  '.mc-overview-refresh.mc-btn-sm{height:26px;min-height:26px;font-size:11.5px;line-height:16px;padding:0 12px}',
   '.mc-overview-card{display:flex;flex-direction:column;gap:10px}',
   '.mc-overview-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;min-width:0}',
   '.mc-overview-title{margin:0;font-size:13px;font-weight:600;color:var(--v3-t1)}',
@@ -673,13 +673,15 @@ export function OverviewView(props: OverviewViewProps): ReactElement {
     <section className={V3_ROOT_CLASS + ' mc-overview-section'} data-overview-busy={busy ? 'true' : 'false'}>
       <style data-overview-style="true">{OVERVIEW_CSS}</style>
       <div className="mc-overview-bar">
-        <button
+        <Button
           type="button"
-          className="mc-overview-refresh"
+          variant="outline"
+          size="sm"
+          className="mc-overview-refresh mc-btn-sm"
           data-overview-refresh="true"
           disabled={busy || onRefresh === undefined}
           onClick={() => { if (onRefresh !== undefined) onRefresh() }}
-        >{busy ? t('overviewRefreshing') : t('overviewRefresh')}</button>
+        >{busy ? t('overviewRefreshing') : t('overviewRefresh')}</Button>
       </div>
 
       <div className="v3-panel mc-overview-card" data-overview-card="status">

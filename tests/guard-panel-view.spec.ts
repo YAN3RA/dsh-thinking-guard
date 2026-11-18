@@ -271,4 +271,10 @@ describe('B 阶段：官方原语（Switch / StateDot / Tag）', () => {
     expect(byData(nodes, 'data-guard-switch-reason').length).toBe(0)
     expect(nodes.filter(node => node.props.role === 'group' && node.props['aria-describedby'] !== undefined).length).toBe(0)
   })
+
+  it('exposes the threshold format hint id that the C-5 inputs reference', () => {
+    const hint = render().find(node => node.props.id === 'guard-thr-duplicate_call-format')
+    expect(hint).toBeDefined()
+    expect(String(hint!.props.className)).toContain('mc-guard-threshold-hint')
+  })
 })

@@ -21,7 +21,7 @@
  * 本文件不读会话历史，也不改任何检测逻辑：它只把配置读出来、把改动交回去。
  */
 import { useCallback, useEffect, useRef, useState, type ReactElement, type ReactNode } from 'react'
-import { StateDot, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, StateDot, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 
 /** The three Guard capabilities, in display order. */
 export type GuardSectionId = 'duplicate_call' | 'alternating_cycle' | 'no_progress'
@@ -189,10 +189,9 @@ const GUARD_CSS = [
   '.mc-guard-threshold-hint{margin:0}',
   // 常驻但空时隐藏（不用 hidden / display:none，否则读屏会丢掉整个区域）。
   '.mc-guard-threshold-hints:empty{position:absolute;width:1px;height:1px;overflow:hidden}',
-  '.mc-guard-threshold-save{padding:3px 10px;border-radius:var(--v3-r-sm);font-size:11.5px;color:var(--v3-t1);'
-    + 'background:var(--v3-panel-2);border:1px solid var(--v3-line);cursor:pointer}',
-  '.mc-guard-threshold-save:disabled{opacity:.5;cursor:default}',
-  '.mc-guard-threshold-save:focus-visible{outline:2px solid var(--v3-info);outline-offset:1px}',
+  // C-6A：外观交给官方 Button(outline/sm)，用 .mc-btn-sm 提高 specificity 把 28px 压到
+  // 贴近原按钮（save 基线 23.333px → 24px，差 ≤2px）；data-guard-threshold-save 保留。
+  '.mc-guard-threshold-save.mc-btn-sm{height:24px;min-height:24px;font-size:11.5px;line-height:16px;padding:0 10px}',
   '.mc-guard-threshold-hint[data-guard-threshold-invalid=\'true\']{color:var(--v3-bad)}',
 ].join('')
 
@@ -437,6 +436,8 @@ export function GuardThresholdEditor(props: {
   readonly t: (key: GuardPanelKey) => string
   readonly thresholds?: readonly number[]
   readonly onChange?: (next: readonly number[]) => void
+  /** 说明元素 id（正常 / 非法 / 冲突）；缺省时不加 aria-describedby（独立渲染场景）。 */
+  readonly hintIds?: { readonly format: string; readonly invalid: string; readonly conflict: string }
 }): ReactElement | null {
   const { t, thresholds } = props
   const draft = useGuardThresholdDraft(props)
@@ -444,6 +445,17 @@ export function GuardThresholdEditor(props: {
   const { editable, rows, invalid } = draft
   // 草稿脏、宿主基线动过、且草稿合法时才出提示；非法态由格式错误独占用。
   const conflictNotice = draft.conflict && draft.dirty && !invalid
+  // C-5：按当前状态只关联「有效」的那个说明元素：非法→格式错误、冲突→冲突提示、
+  // 正常→格式提示；不始终挂全部（避免播报已过期的错误）。
+  // busy 时页面会缺省 onChange → !editable，此时 invalid/conflict 的 <p> 不渲染；
+  // 若仍引用它们会让 aria-describedby 悬空。!editable 一律不关联（readonly 输入无须播报）。
+  const describedBy = props.hintIds === undefined || !editable
+    ? undefined
+    : invalid
+      ? props.hintIds.invalid
+      : conflictNotice
+        ? props.hintIds.conflict
+        : props.hintIds.format
   // Inner content only: the WRAPPER (data-guard-thresholds) belongs to the hook-free
   // view above, so element-tree walkers can still assert it without calling this
   // hook-owned component.
@@ -465,6 +477,7 @@ export function GuardThresholdEditor(props: {
           disabled={!editable}
           aria-label={t('guardThresholds') + ' ' + String(index + 1)}
           aria-invalid={invalid ? 'true' : 'false'}
+          aria-describedby={describedBy}
           data-guard-threshold-dirty={draft.dirty ? 'true' : 'false'}
           onChange={event => { draft.setRow(index, event.target.value) }}
           onKeyDown={event => {
@@ -479,21 +492,23 @@ export function GuardThresholdEditor(props: {
       ))}
       {editable
         ? (
-          <button
+          <Button
             type="button"
-            className="mc-guard-threshold-save"
+            variant="outline"
+            size="sm"
+            className="mc-guard-threshold-save mc-btn-sm"
             data-guard-threshold-save="true"
             // 非法草稿不发请求，按钮也就没有可点的理由：把「保存」置灰比让它静默失败更好懂。
             disabled={!draft.dirty || invalid}
             onClick={() => { draft.commit() }}
-          >{t('guardThresholdSave')}</button>
+          >{t('guardThresholdSave')}</Button>
         )
         : null}
       {/* Invalid draft: say WHY it cannot be sent, and keep it. A Host that REFUSES the
           write needs no extra line of its own: the boxes still show the draft and the
           page above prints the error. */}
       {editable && invalid
-        ? <p className="mc-guard-threshold-hint" role="alert" data-guard-threshold-invalid="true">{t('guardThresholdDraftHint')}</p>
+        ? <p className="mc-guard-threshold-hint" id={props.hintIds?.invalid} role="alert" data-guard-threshold-invalid="true">{t('guardThresholdDraftHint')}</p>
         : null}
       {/* 宿主列表在草稿脏时变了：草稿保留，但要让这条变化看得见。 */}
       {editable
@@ -505,7 +520,7 @@ export function GuardThresholdEditor(props: {
           >
             {conflictNotice
               ? (
-                <p className="mc-guard-threshold-hint" data-guard-threshold-conflict="true">
+                <p className="mc-guard-threshold-hint" id={props.hintIds?.conflict} data-guard-threshold-conflict="true">
                   {t('guardThresholdConflictHint')}
                 </p>
               )
@@ -578,6 +593,12 @@ export function GuardPanel(props: GuardPanelProps): ReactElement {
           ? 'guardSwitchReasonReadonly'
           : undefined
     const switchReasonId = 'guard-switch-reason-' + entry.id
+    // C-5：阈值输入按状态关联说明元素；id 由 entry.id 确定性派生（无需 useId）。
+    const thresholdHintIds = {
+      format: 'guard-thr-' + entry.id + '-format',
+      invalid: 'guard-thr-' + entry.id + '-invalid',
+      conflict: 'guard-thr-' + entry.id + '-conflict',
+    }
     const params = entry.id === 'duplicate_call'
       ? (
         <div className="gd-params">
@@ -590,6 +611,7 @@ export function GuardPanel(props: GuardPanelProps): ReactElement {
           >
             <GuardThresholdEditor
               t={t}
+              hintIds={thresholdHintIds}
               {...(duplicateThresholds === undefined ? {} : { thresholds: duplicateThresholds })}
               {...(commitThresholds === undefined ? {} : { onChange: commitThresholds })}
             />
@@ -603,7 +625,7 @@ export function GuardPanel(props: GuardPanelProps): ReactElement {
               ))}
             </div>
           )}
-          <p className="v3-hint mc-guard-threshold-hint">{t('guardThresholdHint')}</p>
+          <p className="v3-hint mc-guard-threshold-hint" id={thresholdHintIds.format}>{t('guardThresholdHint')}</p>
         </div>
       )
       : null

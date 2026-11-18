@@ -15,6 +15,7 @@
  * 语义；占位文案必须短到不会在 220px 输入框里被裁切。
  */
 import { describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
 import type { ReactElement, ReactNode } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
 
@@ -74,7 +75,7 @@ vi.mock('../src/client/settings-nav-icon.ts', () => ({
 }))
 
 import { apply } from '../src/client/index.ts'
-import { CapabilitySection, ToolGroupsView } from '../src/client/capability-v3/section.tsx'
+import { CapabilitySection, MarkdownFilePreview, ToolGroupsView } from '../src/client/capability-v3/section.tsx'
 import { rememberSnapshot } from '../src/client/store.ts'
 import type { CapabilityRow } from '../src/client/store.ts'
 
@@ -313,5 +314,75 @@ describe('B-2: resident row dot uses the blue adapter (StateDot has no info stat
     const dot = nodes.find(node => node.type === 'span' && node.props.state === 'idle' && node.props.className === 'v3-dot--info')
     expect(dot).toBeDefined()
     expect(nodes.some(node => node.props['data-state'] === 'done')).toBe(false)
+  })
+})
+
+describe('C-2: long tool / skill names stay fully readable (layout-first wrap)', () => {
+  const longTool = 'mcp__built-in__a_really_long_tool_name_that_used_to_be_truncated_before_c2'
+  const longSkill = 'A very long skill display name that must remain fully readable on keyboard and touch'
+
+  it('renders the full tool name and its title, on a focusable row', () => {
+    const fixture = row({ id: longTool, kind: 'tool', name: longTool, server: 'built-in', mandatory: false, class: 'resident' })
+    const nodes = render(() => ToolGroupsView({
+      groups: [{ server: 'built-in', tools: [fixture] }], openServers: new Set(['built-in']), busy: false,
+      t: ((key: string) => en[key]!) as never, onToggle: () => {}, onCycle: () => {},
+      onOpenDetail: () => {}, onEditServer: () => {}, onEditSearch: () => {},
+    }))
+    const name = nodes.find(node => node.props.className === 'v3-nm')
+    expect(name).toBeDefined()
+    // 文本节点是完整名字（不是被截断的片段），title 也提供同样全名给指针设备。
+    expect(name!.props.children).toBe(longTool)
+    expect(name!.props.title).toBe(longTool)
+    // 行本身可聚焦（键盘可达），长名换行后键盘与触屏都能读到全文。
+    const rowNode = nodes.find(node => node.props.className === 'v3-trow')!
+    expect(rowNode.props.role).toBe('button')
+    expect(rowNode.props.tabIndex).toBe(0)
+  })
+
+  it('renders the full skill name and its title in the skill list', () => {
+    H.slots = []
+    rememberSnapshot({ rows: [row({ id: 'long-skill-c2', kind: 'skill', name: longSkill, source: 'user-agents' }) ] })
+    const nodes = render(() => CapabilitySection({ remote: {} as never, t: ((key: string) => en[key]!) as never, subscribeSignals: () => () => {} }))
+    const name = nodes.find(node => node.props.className === 'v3-gnm' && node.props.children === longSkill)
+    expect(name).toBeDefined()
+    expect(name!.props.title).toBe(longSkill)
+  })
+})
+
+describe('C-3: frontmatter table scroll region', () => {
+  const md = ['---','name: demo-skill','description: A long description that makes the frontmatter table wide','allowed-tools: read, write, bash','---','','Body text'].join('\n')
+
+  it('wraps the table in a named, focusable region and keeps row header scope', () => {
+    const nodes = render(() => MarkdownFilePreview({ text: md, t: ((key: string) => en[key]!) as never, label: 'skills/demo/SKILL.md' }))
+    const region = nodes.find(node => node.props.role === 'region')
+    expect(region).toBeDefined()
+    expect(region!.props.tabIndex).toBe(0)
+    expect(region!.props['aria-label']).toBe('skills/demo/SKILL.md')
+    expect(region!.props.className).toBe('mc-frontmatter-region')
+    // 表格原生语义与 th scope 行头保留。
+    const table = nodes.find(node => node.props.className === 'mc-frontmatter')
+    expect(table).toBeDefined()
+    const ths = nodes.filter(node => node.type === 'th')
+    expect(ths.length).toBeGreaterThan(0)
+    expect(ths.every(node => node.props.scope === 'row')).toBe(true)
+  })
+
+  it('falls back to the localized title when no filename label is given', () => {
+    const nodes = render(() => MarkdownFilePreview({ text: md, t: ((key: string) => en[key]!) as never }))
+    const region = nodes.find(node => node.props.role === 'region')!
+    expect(region.props['aria-label']).toBe(en.title)
+  })
+
+  it('guards that the fixed-width frontmatter header wraps long unbreakable words (not only wrapper width)', () => {
+    const src = readFileSync(new URL('../src/client/capability-v3/section.tsx', import.meta.url), 'utf8')
+    const thRule = /\.mc-frontmatter th\{([^}]*)\}/.exec(src)?.[1] ?? ''
+    // 表头有 width:130px 且 table-layout:fixed；必须自己允许断行，否则长词压进 td。
+    expect(thRule).toContain('width:130px')
+    expect(thRule).toContain('overflow-wrap:anywhere')
+    expect(thRule).toContain('white-space:normal')
+    expect(thRule).toContain('min-width:0')
+    // 原生表格滚动能力保持不变（table 最小宽 + wrapper overflow:auto）。
+    expect(src).toContain('.mc-frontmatter{width:100%;min-inline-size:320px')
+    expect(src).toMatch(/\.mc-frontmatter-region\{overflow:auto/)
   })
 })

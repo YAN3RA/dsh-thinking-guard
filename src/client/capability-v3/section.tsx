@@ -395,9 +395,15 @@ body[data-ds-dark-theme] .mc-count--disabled{color:#b8abad}
 .mc-preview-body{overflow:auto;flex:1 1 auto;min-height:0;padding:14px 16px;color:var(--dsw-alias-label-primary)}
 .mc-preview-body>pre,.mc-preview-plain{margin:0;font-family:var(--dsw-font-markdown-code-block-font-family);font-size:12px;line-height:20px;white-space:pre-wrap;overflow-wrap:anywhere}
 .mc-tool-description{padding-bottom:12px;margin-bottom:12px;border-bottom:1px solid var(--dsw-alias-border-l1)}
-.mc-frontmatter{width:100%;margin:0 0 20px;border-collapse:collapse;table-layout:fixed;font-size:13px;line-height:20px}
+/* C-3：表格外层滚动容器具名 region，键盘可进入并横向滚动；table 保最小宽度，
+   窄容器里才会真的 scrollWidth > clientWidth，而外层 overflow:auto 保证页面根不横溢。 */
+.mc-frontmatter-region{overflow:auto;max-inline-size:100%;container-type:inline-size}
+.mc-frontmatter-region:focus-visible{outline:2px solid var(--v3-info);outline-offset:1px}
+.mc-frontmatter{width:100%;min-inline-size:320px;margin:0 0 20px;border-collapse:collapse;table-layout:fixed;font-size:13px;line-height:20px}
 .mc-frontmatter th,.mc-frontmatter td{padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);vertical-align:top;text-align:left}
-.mc-frontmatter th{width:130px;font-weight:500;color:var(--dsw-alias-label-secondary)}
+/* C-3：表头定宽 130px + table-layout:fixed 时，超长不可断词会压进 td；
+   允许表头任意换行并把最小宽度归零，长词在 130px 列内断行而不越界。 */
+.mc-frontmatter th{width:130px;min-width:0;font-weight:500;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere;white-space:normal}
 .mc-frontmatter td{color:var(--dsw-alias-label-primary);overflow-wrap:anywhere;white-space:pre-wrap}
 .mc-preview-hint{padding:16px;text-align:center;font-size:13px;color:var(--dsw-alias-label-tertiary)}
 /* ---- 总览（OverviewPanel） ---- */
@@ -407,7 +413,7 @@ body[data-ds-dark-theme] .mc-count--disabled{color:#b8abad}
 .mc-guard-threshold-edit-label{font-size:11.5px;color:var(--dsw-alias-label-tertiary)}
 /* ---- v3 工具与技能（V3-c）：仅新增，不改动上面任何 .mc-* / .mc-guard-* ---- */
 /* 常驻=中性 idle 圆点 + 蓝色 class 适配（官方 StateDot 无 info 状态） */
-.v3-dot--info[data-state='idle']{color:var(--v3-info)}
+.v3-root .v3-dot--info[data-state='idle']{color:var(--v3-info)}
 .v3-trow{cursor:pointer}
 .v3-trow:focus-visible{outline:2px solid var(--v3-info);outline-offset:-2px}
 .v3-racts{display:flex;align-items:center;gap:4px;margin-left:auto;flex:none}
@@ -516,24 +522,33 @@ function splitMarkdownFrontmatter(text: string): { frontmatter?: FrontmatterProp
   }
 }
 
-function MarkdownFilePreview(props: {
+export function MarkdownFilePreview(props: {
   text: string
   t(key: CapabilityKey, params?: Record<string, unknown>): string
+  /** 已有本地化标题/文件名（如预览文件的 relPath），用作表格滚动 region 的可访问名。 */
+  label?: string
 }): ReactElement {
   const { frontmatter, body } = splitMarkdownFrontmatter(props.text)
   return (
     <>
       {frontmatter !== undefined && frontmatter.length > 0 && (
-        <table className="mc-frontmatter">
-          <tbody>
-            {frontmatter.map(property => (
-              <tr key={property.name}>
-                <th scope="row">{property.name}</th>
-                <td>{property.value}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <div
+          className="mc-frontmatter-region"
+          role="region"
+          tabIndex={0}
+          aria-label={props.label ?? props.t('title')}
+        >
+          <table className="mc-frontmatter">
+            <tbody>
+              {frontmatter.map(property => (
+                <tr key={property.name}>
+                  <th scope="row">{property.name}</th>
+                  <td>{property.value}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
       <MarkdownPreview text={body} t={props.t} />
     </>
@@ -2001,7 +2016,7 @@ function SkillList(props: {
                 <svg className="v3-chev" viewBox="0 0 12 12" fill="none" aria-hidden="true">
                   <path d="M4.5 2.5 8 6l-3.5 3.5" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
-                <span className="v3-gnm">{skill.name}</span>
+                <span className="v3-gnm" title={skill.name}>{skill.name}</span>
                 {PROJECT_SKILL_SOURCES.has(skill.source ?? '') && skill.path !== undefined && (
                   <span className="v3-cnt" title={skill.path}>{t('projectRootLabel', { path: projectRootForSkill(skill.path) })}</span>
                 )}
@@ -2094,7 +2109,7 @@ function SkillList(props: {
             {preview.content !== undefined ? (
               <div className="mc-preview-body">
                 {/\.md$/i.test(preview.relPath) ? (
-                  <MarkdownFilePreview text={preview.content} t={t} />
+                  <MarkdownFilePreview text={preview.content} t={t} label={preview.relPath} />
                 ) : (
                   <pre className="mc-preview-plain">{preview.content}</pre>
                 )}

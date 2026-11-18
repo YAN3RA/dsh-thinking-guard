@@ -70,7 +70,7 @@ vi.mock('react', async importOriginal => {
 
 /** GuardPanel 现在从宿主原语包导入 Switch/StateDot/Tag；本包无 clsx，需替身以加载模块。
  *  本文件只渲染 GuardThresholdEditor，不触及这三个原语，替身仅用于解析导入。 */
-vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({ Switch: 'button', StateDot: 'span', Tag: 'span' }))
+vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({ Switch: 'button', StateDot: 'span', Tag: 'span', Button: 'button' }))
 
 const { zh, en } = guardDictionaries()
 
@@ -121,7 +121,9 @@ function flatten(node: ReactNode, out: FlatElement[] = []): FlatElement[] {
 
 interface EditorProps {
   readonly thresholds: readonly number[]
-  readonly onChange: (next: readonly number[]) => void
+  /** 可缺省：模拟页面 busy 时不再传 onChange（→ 只读），但保留已输入草稿。 */
+  readonly onChange?: (next: readonly number[]) => void
+  readonly hintIds?: { readonly format: string; readonly invalid: string; readonly conflict: string }
 }
 
 /**
@@ -145,7 +147,7 @@ function mountEditor(initial: EditorProps) {
     do {
       H.rerender = false
       H.cursor = 0
-      result = GuardThresholdEditor({ t, thresholds: props.thresholds, onChange: props.onChange })
+      result = GuardThresholdEditor({ t, thresholds: props.thresholds, ...(props.onChange === undefined ? {} : { onChange: props.onChange }), ...(props.hintIds === undefined ? {} : { hintIds: props.hintIds }) })
       flushEffects()
       rounds += 1
       if (rounds > 25) throw new Error('render loop did not settle')
@@ -276,5 +278,72 @@ describe('threshold draft vs host list', () => {
     expect(en.guardThresholdConflictHint.length).toBeGreaterThan(0)
     expect(en.guardThresholdConflictHint).not.toBe(zh.guardThresholdConflictHint)
     expect(en.guardThresholdConflictHint).toContain('draft')
+  })
+})
+
+describe('C-5: inputs associate only the current state hint', () => {
+  const IDS = { format: 'thr-fmt', invalid: 'thr-inv', conflict: 'thr-cnf' }
+  const describedByOf = (view: ReactElement): unknown[] =>
+    nodesOf(view).filter(node => node.type === 'input').map(node => node.props['aria-describedby'])
+
+  it('normal draft: every input references the format hint id', () => {
+    const editor = mountEditor({ thresholds: [3, 5, 8], onChange: vi.fn(), hintIds: IDS })
+    expect(describedByOf(editor.view)).toEqual(['thr-fmt', 'thr-fmt', 'thr-fmt'])
+  })
+
+  it('invalid draft references only the invalid hint id, and that element exists', () => {
+    const editor = mountEditor({ thresholds: [3, 5, 8], onChange: vi.fn(), hintIds: IDS })
+    editor.type(1, '3')
+    expect(describedByOf(editor.view)).toEqual(['thr-inv', 'thr-inv', 'thr-inv'])
+    const hint = nodesOf(editor.view).find(node => node.props.id === 'thr-inv')
+    expect(hint).toBeDefined()
+    expect(hint!.props['data-guard-threshold-invalid']).toBe('true')
+  })
+
+  it('conflict references only the conflict hint id, and that element exists', () => {
+    const onChange = vi.fn()
+    const editor = mountEditor({ thresholds: [3, 5, 8], onChange, hintIds: IDS })
+    editor.type(2, '9')
+    editor.update({ thresholds: [2, 5, 8], onChange, hintIds: IDS })
+    expect(describedByOf(editor.view)).toEqual(['thr-cnf', 'thr-cnf', 'thr-cnf'])
+    const hint = nodesOf(editor.view).find(node => node.props.id === 'thr-cnf')
+    expect(hint).toBeDefined()
+  })
+
+  it('renders the save action as an official Button (host button) with data attr + compact class', () => {
+    const editor = mountEditor({ thresholds: [3, 5, 8], onChange: vi.fn() })
+    const saves = nodesOf(editor.view).filter(node => node.props['data-guard-threshold-save'] !== undefined)
+    expect(saves.length).toBeGreaterThan(0)
+    expect(saves[0]!.type).toBe('button')
+    const cls = String(saves[0]!.props.className)
+    expect(cls).toContain('mc-guard-threshold-save')
+    expect(cls).toContain('mc-btn-sm')
+  })
+
+  it('invalid draft + readonly (busy) leaves no dangling invalid reference, and restoring editable re-associates', () => {
+    const editor = mountEditor({ thresholds: [3, 5, 8], onChange: vi.fn(), hintIds: IDS })
+    editor.type(1, '3') // 非法但仍是脏草稿
+    editor.update({ thresholds: [3, 5, 8], onChange: undefined, hintIds: IDS }) // busy：不再传 onChange
+    expect(valuesOf(editor.view)).toEqual(['3', '3', '8'])
+    // 三个输入都不引用不存在的 invalid hint。
+    expect(describedByOf(editor.view)).toEqual([undefined, undefined, undefined])
+    expect(nodesOf(editor.view).some(node => node.props.id === IDS.invalid)).toBe(false)
+    // 恢复 editable：重新关联 invalid，且该元素存在。
+    editor.update({ thresholds: [3, 5, 8], onChange: vi.fn(), hintIds: IDS })
+    expect(describedByOf(editor.view)).toEqual([IDS.invalid, IDS.invalid, IDS.invalid])
+    expect(nodesOf(editor.view).some(node => node.props.id === IDS.invalid)).toBe(true)
+  })
+
+  it('conflict draft + readonly (busy) leaves no dangling conflict reference, and restoring editable re-associates', () => {
+    const onChange = vi.fn()
+    const editor = mountEditor({ thresholds: [3, 5, 8], onChange, hintIds: IDS })
+    editor.type(2, '9') // 合法脏草稿
+    editor.update({ thresholds: [2, 5, 8], onChange: undefined, hintIds: IDS }) // 宿主变了 + busy
+    expect(valuesOf(editor.view)).toEqual(['3', '5', '9'])
+    expect(describedByOf(editor.view)).toEqual([undefined, undefined, undefined])
+    expect(nodesOf(editor.view).some(node => node.props.id === IDS.conflict)).toBe(false)
+    editor.update({ thresholds: [2, 5, 8], onChange, hintIds: IDS })
+    expect(describedByOf(editor.view)).toEqual([IDS.conflict, IDS.conflict, IDS.conflict])
+    expect(nodesOf(editor.view).some(node => node.props.id === IDS.conflict)).toBe(true)
   })
 })

@@ -120,6 +120,7 @@ export type CapabilityKey =
   | 'emptyPresetSkills'
   | 'toolCount'
   | 'filterByName'
+  | 'filterPlaceholder'
   | 'filterHint'
   | 'filterNoMatch'
   | 'residentShort'
@@ -711,7 +712,7 @@ export function ToolGroupsView(props: ToolGroupsViewProps): ReactElement {
                     <div
                       key={tool.id}
                       className="v3-trow"
-                      title={tool.classLabel}
+                      title={t(CLASS_SHORT_KEYS[tool.class])}
                       role="button"
                       tabIndex={0}
                       aria-label={tool.name}
@@ -747,8 +748,8 @@ export function ToolGroupsView(props: ToolGroupsViewProps): ReactElement {
                           className="v3-tag"
                           data-tone={CLASS_TONE[tool.class]}
                           disabled={busy || tool.mandatory}
-                          title={tool.classLabel}
-                          aria-label={tool.classLabel}
+                          title={t('cycleHint')}
+                          aria-label={t(CLASS_SHORT_KEYS[tool.class])}
                           onClick={(e: { stopPropagation(): void }) => { e.stopPropagation(); props.onCycle([tool.id], 'tool') }}
                         >
                           {t(CLASS_SHORT_KEYS[tool.class])}
@@ -1472,7 +1473,7 @@ function ReadyBody(props: {
             <Input
               type="search"
               value={filter}
-              placeholder={t('filterByName')}
+              placeholder={t('filterPlaceholder')}
               aria-label={t('filterByName')}
               title={t('filterHint')}
               onChange={e => setFilter(e.target.value)}
@@ -1725,7 +1726,7 @@ function ReadyBody(props: {
       )}
 
       {(registerOpen || editMcp !== undefined || editSkill !== undefined) && (
-        /* LocationModal 是上游文件（一字不改直接复用），它的 `t` 收上游那份键全集；
+        /* LocationModal 保留上游表单行为，弹窗壳独立复用宿主 Modal；它的 `t` 收上游那份键全集；
            本页的 `t` 只声明自己用到的键，所以这里显式放宽一次：运行期是同一个宿主
            函数，上游组件只会取它自己那份字典里确实存在的键。 */
         <LocationModal
@@ -2003,7 +2004,7 @@ function SkillList(props: {
                     className="v3-tag"
                     data-tone={CLASS_TONE[skill.class as CapabilityClass]}
                     disabled={busy || skill.mandatory}
-                    title={skill.classLabel}
+                    title={t('cycleHint')}
                     onClick={(e: { stopPropagation(): void }) => { e.stopPropagation(); onCycle([skill.id], 'skill') }}
                   >
                     {t(CLASS_SHORT_KEYS[skill.class as CapabilityClass])}

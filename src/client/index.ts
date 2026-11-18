@@ -103,6 +103,7 @@ export function apply(ctx: ClientContext): void {
     emptyProjectSkills: '暂无项目技能',
     emptyPresetSkills: '暂无预设技能',
     filterByName: '按名字、分组或正则过滤…',
+    filterPlaceholder: '搜索名称或分组…',
     filterHint: '忽略大小写。可匹配工具名、技能名、MCP 服务器、技能来源与预设编号，也支持正则，例如 cordis|ptc。',
     filterNoMatch: '没有匹配的能力（清空过滤框可恢复完整列表）',
     emptyTools: '暂无工具',
@@ -245,7 +246,7 @@ export function apply(ctx: ClientContext): void {
     diagnosticUndocumented: '描述待补：{name}；摘要回退为「{summary}」',
     projectRootLabel: '项目根：{path}',
     skillBrowseUnavailable: '该技能没有可浏览的目录根，可能是非目录型技能来源。',
-  } satisfies Record<CapabilityKey | 'cycleSaved', string>
+  } satisfies Record<CapabilityKey | 'cycleSaved' | 'filterPlaceholder', string>
   const en = {
     nav: 'Capability Menu',
     title: 'Capability Menu',
@@ -274,7 +275,7 @@ export function apply(ctx: ClientContext): void {
     disabled: 'Disabled',
     tool: '工具',
     skill: '技能',
-    mandatory: '控制面',
+    mandatory: 'Control plane',
     toolsGroup: 'Tools',
     skillsGroup: 'Skills',
     builtInGroup: 'System built-in',
@@ -285,6 +286,7 @@ export function apply(ctx: ClientContext): void {
     emptyProjectSkills: 'No project skills',
     emptyPresetSkills: 'No preset skills',
     filterByName: 'Filter by name, group, or regex…',
+    filterPlaceholder: 'Search name or group…',
     filterHint: 'Case-insensitive. Matches tool/skill names, MCP servers, skill source labels and preset ids; a regular expression works too, e.g. cordis|ptc or /^mcp__dbx/.',
     filterNoMatch: 'No capability matches (clear the filter to see the full list)',
     emptyTools: 'No tools',
@@ -384,7 +386,7 @@ export function apply(ctx: ClientContext): void {
     adoptSkillHint: "Only user-agents and custom sources can be adopted. This links it into dsh's skill root (default ~/.dsh/skills); the content is untouched.",
     adoptSkillTitle: 'Adopt "{name}"?',
     skillDirHint: 'Enter a local directory or a public GitHub HTTPS skill URL. Imports validate SKILL.md and keep only the selected skill directory. Git must be installed on the machine running dsh. The skill name comes from SKILL.md.',
-    serverName: '服务器名称',
+    serverName: 'Server name',
     serverNameImmutable: 'The name is locked after registration because tool IDs and permission rules use it.',
     transport: 'Transport',
     transportStdio: 'stdio (local subprocess)',
@@ -395,7 +397,7 @@ export function apply(ctx: ClientContext): void {
     args: 'Args (space separated)',
     cwd: 'Working directory',
     env: 'Environment',
-    url: '地址',
+    url: 'URL',
     headers: 'Headers',
     headersHint: 'One header per line as Key: Value; credentials such as a Bearer token go here.',
     timeout: 'Timeout (seconds)',
@@ -427,7 +429,7 @@ export function apply(ctx: ClientContext): void {
     diagnosticUndocumented: 'Description needed: {name}; search summary falls back to “{summary}”.',
     projectRootLabel: 'Project root: {path}',
     skillBrowseUnavailable: 'This Skill has no browsable directory root; its provider may be non-filesystem based.',
-  } satisfies Record<CapabilityKey | 'cycleSaved', string>
+  } satisfies Record<CapabilityKey | 'cycleSaved' | 'filterPlaceholder', string>
 
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'capability-menu: dictionaries')
   ctx.effect(() => ctx.locale.register(GUARD_NS, guardDictionaries()), 'thinking-guard: dictionaries')
@@ -501,10 +503,10 @@ export function apply(ctx: ClientContext): void {
 
   const capabilityRemote = lazyRemote(remoteMount, 'capabilityPolicy')
   const guardRemote = lazyRemote(guardMount, 'thinkingGuard')
-  // 字典键集比上游节面的键多出我们自己的键（`cycleSaved`），所以 t 的类型锚在这里，
+  // 字典键集比上游节面的键多出我们自己的键（`cycleSaved` / `filterPlaceholder`），所以 t 的类型锚在这里，
   // 而不是上游的 CapabilitySectionInjected['t']。参数方向是逆变：更宽的键集可以直接
   // 赋给 v3 视图那个更窄的 t。
-  const t = ctx.locale.bind(NS) as (key: CapabilityKey | 'cycleSaved', params?: Record<string, unknown>) => string
+  const t = ctx.locale.bind(NS) as (key: CapabilityKey | 'cycleSaved' | 'filterPlaceholder', params?: Record<string, unknown>) => string
   installSettingsNavIcon(ctx, () => t('nav'))
   /**
    * The two signals that say "the host catalog may have moved, and this page did

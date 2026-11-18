@@ -15,6 +15,7 @@
  * second enable switch here.
  */
 import { useCallback, useMemo, useState } from 'react'
+import { Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { CapabilityKey } from './CapabilitySection.tsx'
 import {
   unwrapMessage,
@@ -42,6 +43,20 @@ export interface LocationModalProps {
 
 const CSS_ID = 'capability-menu-location-css'
 const CSS = `
+/* Shell: the official Modal owns mask / card / Escape / focus. We only cap the card
+   the way its own stylesheet asks (max-height:100%, never a viewport calc) and lay
+   our header + scrolling body out inside it. */
+.lm-modal{width:min(640px,100%);max-height:100%}
+.lm-shell{display:flex;flex-direction:column;flex:1 1 auto;min-height:0;min-width:0}
+/* Header and tabs never shrink: on a short/narrow window the close button must
+   stay reachable and the body is the only part that scrolls. The title wraps
+   instead of being clipped — a dialog heading is the one string the user needs
+   in full. */
+.lm-head{display:flex;align-items:center;gap:8px;flex-shrink:0;padding:22px 14px 12px 24px}
+.lm-head-title{flex:1;min-width:0;margin:0;font-size:16px;line-height:24px;font-weight:500;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
+.lm-close{flex:none}
+.lm-shell .lm-tabs{margin:0 24px;padding:0;flex-shrink:0}
+.lm-body{padding:0 24px;flex:1 1 auto;min-height:0;overflow:auto}
 .lm-block{display:flex;flex-direction:column;gap:8px}
 .lm-btn{border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:20px;padding:0 10px;cursor:pointer;white-space:nowrap}
 .lm-btn:hover{border-color:var(--dsw-alias-border-l3);background:var(--dsw-alias-interactive-bg-hover)}
@@ -56,7 +71,7 @@ const CSS = `
    can only ever affect its own field, and a fixed label track (rather than
    min-width, which sizes per row) keeps every label column identical. */
 .lm-form{display:flex;flex-direction:column;gap:6px}
-.lm-field{--lm-label-w:104px;display:grid;grid-template-columns:var(--lm-label-w) 1fr;gap:2px 8px;align-items:start}
+.lm-field{--lm-label-w:104px;display:grid;grid-template-columns:var(--lm-label-w) minmax(0,1fr);gap:2px 8px;align-items:start}
 .lm-label{grid-column:1;min-width:0;overflow-wrap:anywhere;font-size:12px;line-height:20px;color:var(--dsw-alias-label-tertiary)}
 /* width:100% must come with border-box: the field carries a 1px border plus 8px of
    padding, which would otherwise overflow the column and clip. */
@@ -71,17 +86,14 @@ textarea.lm-input{resize:vertical;font-family:var(--dsw-font-markdown-code-block
 .lm-spinner{width:12px;height:12px;flex:none;border:2px solid var(--dsw-alias-border-l2);border-top-color:var(--dsw-alias-state-business-primary);border-radius:50%;animation:lm-spin .8s linear infinite}
 @keyframes lm-spin{to{transform:rotate(360deg)}}
 @media(prefers-reduced-motion:reduce){.lm-spinner{animation-duration:2s}}
-.mc-tab:disabled,.mc-preview-close:disabled{cursor:default;opacity:.6}
-.lm-actions{display:flex;gap:8px;justify-content:flex-end;padding:4px 0 0}
+.mc-tab:disabled{cursor:default;opacity:.6}
+.lm-actions{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;padding:4px 0 0}
 .lm-actions .lm-btn--remove{margin-right:auto}
 /* Removal is irreversible, so it takes over the action row for one confirmation
    step: the message states the consequence, then the buttons act. */
 .lm-confirm{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;border:1px solid #b3261e;border-radius:6px}
 .lm-confirm-msg{flex:1 1 auto;margin:0;font-size:12px;line-height:18px;word-break:break-word}
 .lm-confirm-actions{display:flex;gap:8px;flex-shrink:0}
-/* The modal shell itself carries no padding (it is shared with the read-only
-   catalog viewer, whose body supplies its own); the form supplies it here. */
-.lm-body{padding:14px 16px;overflow:auto;flex:1 1 auto;min-height:0}
 `
 if (typeof document !== 'undefined' && document.querySelector(`style[data-css-id="${CSS_ID}"]`) === null) {
   const tag = document.createElement('style')
@@ -322,18 +334,36 @@ export function LocationModal(props: LocationModalProps): JSX.Element {
       </div>
     )
 
+  /**
+   * One close path for mask click and Escape.
+   *
+   * The mutations this dialog starts are the only irreversible thing on this page
+   * (移除 unlinks a directory), so while one is in flight nothing may dismiss the
+   * dialog: the official Modal routes mask clicks and Escape here, and the visible
+   * close button is disabled too.
+   */
+  const requestClose = useCallback(() => {
+    if (!busy) onClose()
+  }, [busy, onClose])
+
   return (
-    <div className="mc-preview-mask" onClick={busy ? undefined : onClose}>
-      <div className="mc-preview" onClick={e => e.stopPropagation()}>
-        <div className="mc-preview-head">
-          <span className="mc-preview-title">{title}</span>
-          <button type="button" className="mc-preview-close" disabled={busy} onClick={onClose}>
+    <Modal open headless onClose={requestClose} title={title} className="lm-modal">
+      <div className="lm-shell">
+        <div className="lm-head">
+          <h2 className="lm-head-title">{title}</h2>
+          <button
+            type="button"
+            className="lm-btn lm-close"
+            aria-label={t('previewClose')}
+            disabled={busy}
+            onClick={onClose}
+          >
             {t('previewClose')}
           </button>
         </div>
 
         {!editing && (
-          <div className="mc-subtabs mc-catalog-tabs">
+          <div className="lm-tabs mc-subtabs mc-catalog-tabs">
             <div className="mc-tab-group" role="tablist" aria-label={t('registerCapability')}>
               <button
                 type="button"
@@ -495,7 +525,7 @@ export function LocationModal(props: LocationModalProps): JSX.Element {
             )}
         </div>
       </div>
-    </div>
+    </Modal>
   )
 }
 

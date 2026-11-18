@@ -103,37 +103,6 @@
 - 将低频能力调整为按需使用。
 - 不确定某项能力是否需要时，先保留现状，观察实际使用情况后再调整。
 
-## 📝 版本变更
-
-### 0.4.2 · 文档与元数据补丁
-
-- 完善简体中文说明、安装升级步骤、兼容范围、隐私与插件声明，补充 DSH 插件标记及项目来源。
-- GitHub 与 npm 使用同一份 README；补齐包的主页、问题反馈地址与关键词。
-- **不增加功能，不修改 0.4.1 的运行代码或配置格式。**
-
-### 0.4.1 · 总览简化与统计重启清零
-
-- 删除总览页的刷新按钮。进入总览读取一次；切换到其他页再返回会重新读取，不添加轮询。
-- 已观察调用、重复提醒、循环提醒、本地拒绝以及结果分类计数，仅在**本次 DSH 宿主进程内累计**；完整重启 DSH 后全部清零，统计起点更新，最近提醒 / 拒绝时间重新开始。
-- 同一进程内刷新页面、切换页签或重新挂载状态服务**不会清零**。
-- 不再恢复旧统计，也不再周期落盘或在卸载时落盘；已有的 `guard-stats.json` 不读取、不写入、不删除。
-- **保护开关和阈值配置仍保留**；Guard 检测逻辑和 RPC 数据字段未变。
-
-## 🧩 DSH 插件标记与生态收录
-
-仓库根目录已包含真实可安装的插件标记：
-
-| 标记 | 作用 |
-| --- | --- |
-| [`package.json` 中的 `dsh.bundle.patch`](https://github.com/YAN3RA/dsh-thinking-guard/blob/main/package.json) | 声明插件清单为 `./cordis.patch.yml`，供 `dsh plugin add` 加载 |
-| [`cordis.patch.yml`](https://github.com/YAN3RA/dsh-thinking-guard/blob/main/cordis.patch.yml) | 挂载本插件的能力目录、策略、Guard 及公开网关 |
-| `package.json` 中的 `dsh.client` | 声明设置页客户端及其宿主依赖；不是仅靠客户端声明冒充完整插件 |
-| `@deepseek-ai/cordis` 与 `@deepseek-ai/dsh-*` peerDependencies | 声明真实 DSH / Cordis 宿主依赖 |
-
-> 💡 **收录说明：** DSH Market / Awesome DSH Plugin 面向 DeepSeek Harness 生态插件。本仓库使用 **`dsh-plugin` topic + 已存在的 Cordis 清单标记**供平台发现；topic 不能替代插件清单。Skill 型项目应提供真实的 `SKILL.md`，但本项目是 Cordis 型，**不为收录伪造 Skill 文件**。
->
-> `dsh-plugin` topic 可供自动发现进入候选流程；另一种方式是按平台规范提交插件条目 PR。具体扫描、审核及收录以[平台贡献指南](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/blob/main/contributing.md)为准。**添加 topic 不等于已收录，收录也不等于官方认证或安全审计。**
-
 ## 🔧 宿主与兼容范围
 
 - 先安装并启动 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)，确保终端可执行 `dsh`。

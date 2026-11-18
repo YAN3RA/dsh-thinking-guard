@@ -200,22 +200,15 @@ dsh plugin --profile desktop add dsh-thinking-guard@0.3.5
 
 ---
 
-## 🧩 项目信息
-
-| 项目 | 信息 |
-| --- | --- |
-| 插件名称 | 思考节流 |
-| 英文名称 | DSH Thinking Guard |
-| npm 包名 | `dsh-thinking-guard` |
-| 当前版本 | `0.3.5` |
-| 运行环境 | DeepSeek Harness |
-| 开源协议 | Apache-2.0 |
-
-### 🔗 相关链接
-
-- [GitHub 项目主页](https://github.com/YAN3RA/dsh-thinking-guard)
-- [npm 软件包](https://www.npmjs.com/package/dsh-thinking-guard)
-- [问题反馈与功能建议](https://github.com/YAN3RA/dsh-thinking-guard/issues)
+## 🙏 致谢与项目来源  
+  
+本项目基于 [PKUfudawei/dsh-capability-menu](https://github.com/PKUfudawei/dsh-capability-menu) 进行扩展与开发。  
+  
+感谢原作者 **PKUfudawei** 的开源贡献，为本项目提供了能力菜单相关的基础实现与设计思路。  
+  
+本项目在此基础上持续迭代，围绕 DeepSeek Harness 的执行保护、能力管理与使用体验进行扩展和优化。  
+  
+感谢所有开源项目作者与社区贡献者的分享和支持！
 
 ---
 

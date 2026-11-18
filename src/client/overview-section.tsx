@@ -3,7 +3,7 @@
  *
  * 数据来源只有三个，都不含会话内容：
  *   1. Guard 开关与诊断（getGuard / getGuardDiagnostics）；
- *   2. Guard 计数（getGuardStats，落盘在本机，重启后继续累加）；
+ *   2. Guard 计数（getGuardStats，本次 DSH 启动期间的进程内计数，重启清零）；
  *   3. 能力目录快照（classifyAll / catalogVersion / getDiagnostics）。
  *
  * 刻意不读会话历史：没有任何会话事件流、持久化会话索引或调用统计的代码。
@@ -13,21 +13,20 @@
  *   - 数字读不到显示「—」，绝不伪造成 0；
  *   - 比例条与占比只在有真实条目时计算，总数为零时整条轨道为空，不产生 NaN。
  *
- * 行为：挂载时读一次 + 一个「刷新」按钮，不轮询。三个区域各自独立，一块读失败
- * 只影响它自己的错误行。
+ * 行为：进入本页时读一次；切到别的页签会卸载本页、切回时重新挂载再读一次。没有
+ * 刷新按钮，也不轮询、不加定时请求。三个区域各自独立，一块读失败只影响它自己的
+ * 错误行。
  */
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
 import type { GuardDiagnostics, GuardRemote, GuardStatsSnapshot, GuardSwitches } from './guard-remote.ts'
 import type { CapabilityDiagnostics, CapabilityPolicyRemote, CapabilityRow } from './store.ts'
 import { V3_ROOT_CLASS } from './v3-ui.ts'
-import { Button, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
+import { StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 
 /** 本页文案键。zh / en 两份字典的键必须与此完全一致。 */
 export type OverviewKey =
   | 'nav'
   | 'title'
-  | 'overviewRefresh'
-  | 'overviewRefreshing'
   | 'overviewLoading'
   | 'overviewUnknown'
   // 第一层：执行保护状态
@@ -114,12 +113,6 @@ const INITIAL_STATE: OverviewState = { busy: true }
 /** Page-level rules; every colour comes from the v3 token layer. */
 const OVERVIEW_CSS = [
   '.mc-overview-section.v3-root{display:flex;flex-direction:column;gap:12px}',
-  '.mc-overview-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}',
-  '.mc-overview-bar .v3-hint{flex:1 1 240px;min-width:0}',
-  // C-6A：外观交给官方 Button(outline/sm)，这里只留布局；用 .mc-btn-sm 提高 specificity
-  // 把默认 28px 压到贴近原自建按钮（refresh 基线 25.333px → 26px，差 ≤2px）。
-  '.mc-overview-refresh{margin-left:auto;flex:none}',
-  '.mc-overview-refresh.mc-btn-sm{height:26px;min-height:26px;font-size:11.5px;line-height:16px;padding:0 12px}',
   '.mc-overview-card{display:flex;flex-direction:column;gap:10px}',
   '.mc-overview-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;min-width:0}',
   '.mc-overview-title{margin:0;font-size:13px;font-weight:600;color:var(--v3-t1)}',
@@ -511,7 +504,8 @@ function StatusCard(props: {
 /**
  * The 总览 page: 执行保护状态 + 执行保护统计 + 能力目录分布.
  *
- * Reads once on mount and again on 刷新; each area owns its own error line, so a
+ * Reads once on mount; leaving the tab unmounts this page, so coming back re-reads.
+ * There is no refresh button and no polling. Each area owns its own error line, so a
  * broken capability remote cannot blank the Guard areas (or the reverse).
  */
 export function OverviewSection(props: OverviewSectionInjected): ReactElement {
@@ -534,8 +528,8 @@ export function OverviewSection(props: OverviewSectionInjected): ReactElement {
    * One full read of all three areas.
    *
    * The two remote families overlap, and a failure on one side is stored on its own
-   * side — the payload keeps whatever the other side did return, so 刷新 after a
-   * transient failure cannot silently clear a good area.
+   * side — the payload keeps whatever the other side did return, so a later re-read
+   * after a transient failure cannot silently clear a good area.
    */
   const load = useCallback(async (): Promise<void> => {
     gen.current += 1
@@ -587,7 +581,6 @@ export function OverviewSection(props: OverviewSectionInjected): ReactElement {
         ...(state.catalogError === undefined ? {} : { error: state.catalogError }),
         ...(state.observedAt === undefined ? {} : { observedAt: state.observedAt }),
       }}
-      onRefresh={() => { void load() }}
       {...(onOpenCapability === undefined ? {} : { onOpenCapability })}
     />
   )
@@ -615,8 +608,6 @@ export interface OverviewViewProps {
   readonly guard: OverviewGuardRecord
   readonly catalog: OverviewCatalogRecord
   readonly busy: boolean
-  /** Omitted = the 刷新 button renders disabled (read-only surface). */
-  readonly onRefresh?: () => void
   /** Omitted = 分类行是纯文本，不渲染跳转按钮。 */
   readonly onOpenCapability?: () => void
 }
@@ -626,7 +617,7 @@ export interface OverviewViewProps {
  * returned element tree (the same pattern PluginSectionView uses).
  */
 export function OverviewView(props: OverviewViewProps): ReactElement {
-  const { t, guard, catalog, busy, onRefresh, onOpenCapability } = props
+  const { t, guard, catalog, busy, onOpenCapability } = props
   const { stats: guardStats, error: guardError, diagnostics } = guard
   const { rows: catalogRows, error: catalogError, version, observedAt } = catalog
   const counts = countRows(catalogRows)
@@ -672,18 +663,6 @@ export function OverviewView(props: OverviewViewProps): ReactElement {
   return (
     <section className={V3_ROOT_CLASS + ' mc-overview-section'} data-overview-busy={busy ? 'true' : 'false'}>
       <style data-overview-style="true">{OVERVIEW_CSS}</style>
-      <div className="mc-overview-bar">
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="mc-overview-refresh mc-btn-sm"
-          data-overview-refresh="true"
-          disabled={busy || onRefresh === undefined}
-          onClick={() => { if (onRefresh !== undefined) onRefresh() }}
-        >{busy ? t('overviewRefreshing') : t('overviewRefresh')}</Button>
-      </div>
-
       <div className="v3-panel mc-overview-card" data-overview-card="status">
         <div className="mc-overview-head">
           <h3 className="mc-overview-title">{t('overviewStatusTitle')}</h3>
@@ -716,7 +695,7 @@ export function OverviewView(props: OverviewViewProps): ReactElement {
           <StatCell stat="cycle" label={t('overviewGuardCycle')} value={dash(guardStats?.reminders.cycle)} hint={t('overviewHintCycle')} />
           <StatCell stat="denials" label={t('overviewGuardDenials')} value={dash(guardStats?.denials)} hint={t('overviewHintDenials')} />
         </div>
-        <p className="v3-hint ov-note" data-overview-note="cumulative">{t('overviewStatsNote')}</p>
+        <p className="v3-hint ov-note" data-overview-note="session">{t('overviewStatsNote')}</p>
         <div className="ov-metarow" data-overview-meta="guard">
           <span><span className="ov-k">{t('overviewStatsSince')}</span> <b data-overview-since="true">{timeText(guardStats?.since, unknown)}</b></span>
           <span><span className="ov-k">{t('overviewStatsLastReminder')}</span> <b data-overview-last-reminder="true">{timeText(guardStats?.lastReminderAt, t('overviewStatsEmpty'))}</b></span>
@@ -775,9 +754,9 @@ export function OverviewView(props: OverviewViewProps): ReactElement {
  * 两行「来源」小字是本页的核心交付：它们说明每个数字来自哪一层、什么时候归零，
  * 这样「观察数 0」不会被读成「历史上从没调用过」，也不会被读成任何会话历史。
  *
- * 「本机累计统计 · 重启后继续累加」这句文案的授权来自 guard-state.ts：挂载时
- * readGuardStatsFile + processGuardStats.restore() 恢复计数并保留原 since，运行中
- * 每 5 秒落盘一次、卸载时再落一次（tests/guard-stats-persist.spec.ts 覆盖）。
+ * 统计口径：四个计数与「统计起始时间 / 最近提醒 / 最近拒绝」都是本次 DSH 启动期间的
+ * 进程内值，DSH 重启即清零 —— 页面不得把它们写成跨重启累计或永久历史。开关与诊断
+ * 仍来自本机状态文件（那一行文案与其它状态内容不变）。
  */
 export function overviewDictionaries(): {
   zh: Record<OverviewKey, string>
@@ -786,8 +765,6 @@ export function overviewDictionaries(): {
   const zh: Record<OverviewKey, string> = {
     nav: '总览',
     title: '总览',
-    overviewRefresh: '刷新',
-    overviewRefreshing: '正在读取…',
     overviewLoading: '正在读取…',
     overviewUnknown: '未知',
     overviewStatusTitle: '执行保护状态',
@@ -807,7 +784,7 @@ export function overviewDictionaries(): {
     overviewStatusSourceMount: '来源 getGuardDiagnostics',
     overviewStatusSourcePersist: '来源 getGuardDiagnostics',
     overviewStatsTitle: '执行保护统计',
-    overviewStatsNote: '本机累计统计 · 重启后继续累加',
+    overviewStatsNote: '本次 DSH 启动期间统计 · 重启后清零',
     overviewGuardObservations: '已观察调用',
     overviewGuardRepeat: '重复提醒',
     overviewGuardCycle: '循环提醒',
@@ -820,7 +797,7 @@ export function overviewDictionaries(): {
     overviewStatsLastReminder: '最近提醒',
     overviewStatsLastDenial: '最近拒绝',
     overviewStatsEmpty: '暂无记录',
-    overviewGuardSource: '来源：四个数字是执行保护在本机的累计计数（getGuardStats），每 5 秒落盘、重启后继续累加；开关与诊断来自本机状态文件。',
+    overviewGuardSource: '来源：四个数字是执行保护在本次 DSH 启动期间的进程内计数（getGuardStats），DSH 重启后清零，不是永久历史；开关与诊断来自本机状态文件。',
     overviewGuardError: '执行保护设置读取失败',
     overviewCatalogTitle: '能力目录分布',
     overviewCatalogTotal: '总计',
@@ -839,8 +816,6 @@ export function overviewDictionaries(): {
   const en: Record<OverviewKey, string> = {
     nav: 'Overview',
     title: 'Overview',
-    overviewRefresh: 'Refresh',
-    overviewRefreshing: 'Reading…',
     overviewLoading: 'Reading…',
     overviewUnknown: 'Unknown',
     overviewStatusTitle: 'Execution protection status',
@@ -860,7 +835,7 @@ export function overviewDictionaries(): {
     overviewStatusSourceMount: 'source getGuardDiagnostics',
     overviewStatusSourcePersist: 'source getGuardDiagnostics',
     overviewStatsTitle: 'Execution protection counters',
-    overviewStatsNote: 'Cumulative on this machine · keeps counting after a restart',
+    overviewStatsNote: 'Counted during this DSH launch · resets on restart',
     overviewGuardObservations: 'Calls observed',
     overviewGuardRepeat: 'Repeat reminders',
     overviewGuardCycle: 'Cycle reminders',
@@ -873,7 +848,7 @@ export function overviewDictionaries(): {
     overviewStatsLastReminder: 'Last reminder',
     overviewStatsLastDenial: 'Last denial',
     overviewStatsEmpty: 'None yet',
-    overviewGuardSource: 'Source: the four numbers are the cumulative Guard counters of this machine (getGuardStats), flushed every 5 seconds and continued after a restart; switches and diagnostics come from the local state file.',
+    overviewGuardSource: 'Source: the four numbers are in-process Guard counters for this DSH launch (getGuardStats); they reset when DSH restarts and are not a permanent history. Switches and diagnostics come from the local state file.',
     overviewGuardError: 'Failed to read the guard settings',
     overviewCatalogTitle: 'Capability catalog distribution',
     overviewCatalogTotal: 'Total',

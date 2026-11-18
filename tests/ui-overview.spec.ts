@@ -12,11 +12,13 @@ import {
 import type { GuardDiagnostics, GuardSwitches } from '../src/client/guard-remote.ts'
 import type { CapabilityRow } from '../src/client/store.ts'
 
-/** OverviewSection 从宿主原语包导入 StateDot；本包无 clsx，故替身为 span[data-state]。 */
+/**
+ * OverviewSection 只从宿主原语包导入 StateDot（刷新按钮已移除，模块不再导入 Button）；
+ * 本包无 clsx，故替身为 span[data-state]。
+ */
 vi.mock('@deepseek-ai/dsh-client-ui-primitives', async () => {
   const { createElement } = await import('react')
   return {
-    Button: 'button',
     StateDot: (props: Record<string, unknown>): unknown => createElement('span', {
       'data-state': props.state,
       'aria-hidden': 'true',
@@ -282,7 +284,7 @@ describe('OverviewView', () => {
     expect(stats.length).toBe(4)
   })
 
-  it('renders the four counters in a 2×2 grid with the cumulative caption', () => {
+  it('renders the four counters in a 2×2 grid with the this-launch caption', () => {
     const nodes = view()
     const grid = byData(nodes, 'data-overview-stats')[0]!
     expect(grid.props['data-overview-stats']).toBe('guard')
@@ -290,7 +292,9 @@ describe('OverviewView', () => {
     const cells = byData(nodes, 'data-overview-stat').map(node => node.props['data-overview-stat'])
     expect(cells).toEqual(['observations', 'repeat', 'cycle', 'denials'])
     const note = byData(nodes, 'data-overview-note')[0]!
-    expect(note.props.children).toBe('本机累计统计 · 重启后继续累加')
+    // 口径：本次 DSH 启动期间统计、重启清零（不再跨重启累计）。
+    expect(note.props.children).toBe('本次 DSH 启动期间统计 · 重启后清零')
+    expect(note.props['data-overview-note']).toBe('session')
   })
 
   it('prints a real counting-since time and 暂无记录 for timestamps that do not exist', () => {
@@ -358,14 +362,61 @@ describe('OverviewView', () => {
     })))).toEqual(['done', 'error', 'done'])
   })
 
-  it('renders the refresh action as an official Button (host button) with data attr + compact class', () => {
-    const nodes = view()
-    const refresh = nodes.filter(node => node.props['data-overview-refresh'] !== undefined)
-    // 非空断言：forwardRef 对象若没被正确替身，会在这里被抓住（不是空集 every 假绿）。
-    expect(refresh.length).toBeGreaterThan(0)
-    expect(refresh[0]!.type).toBe('button')
-    const cls = String(refresh[0]!.props.className)
-    expect(cls).toContain('mc-overview-refresh')
-    expect(cls).toContain('mc-btn-sm')
+  it('no longer renders a refresh control, while the first read and the status display still work', () => {
+    // 需求：总览删除刷新按钮 —— 不出现按钮、不留刷新 data 属性、样式里也不再带刷新规则。
+    for (const nodes of [view(), flatten(OverviewView({ t, busy: true, guard: {}, catalog: {} }))]) {
+      expect(byData(nodes, 'data-overview-refresh')).toEqual([])
+      expect(nodes.filter(node => node.type === 'button')).toEqual([])
+      const css = String(nodes.find(node => node.props['data-overview-style'] === true)?.props.children ?? '')
+      expect(css).not.toContain('mc-overview-refresh')
+      expect(css).not.toContain('mc-overview-bar')
+    }
+    // 首次读取仍在：busy 标记 + 两处读取占位 + 三格状态区都在，删除按钮没带走首次读取。
+    const first = flatten(OverviewView({ t, busy: true, guard: {}, catalog: {} }))
+    expect(first.find(node => node.props['data-overview-busy'] !== undefined)?.props['data-overview-busy']).toBe('true')
+    expect(byData(first, 'data-overview-loading').map(node => node.props['data-overview-loading']))
+      .toEqual(['guard', 'catalog'])
+    expect(byData(first, 'data-overview-status-cell').map(node => node.props['data-overview-status-cell']))
+      .toEqual(['guards', 'mount', 'persist'])
+    // 加载完成后状态照旧显示（删除的是按钮，不是状态）。
+    expect(byData(view(), 'data-overview-status-cell').map(node => node.props['data-tone']))
+      .toEqual(['ok', 'ok', 'ok'])
+  })
+})
+
+/**
+ * 统计口径文案（中英）：只描述「本次 DSH 启动期间」的计数，重启清零；
+ * 不得残留跨重启累计 / 每 5 秒落盘 / 永久历史这类旧文案。
+ */
+describe('stats copy: this launch only, reset on restart', () => {
+  const dict = overviewDictionaries()
+
+  it('says the counters cover this DSH launch and reset on restart (zh + en)', () => {
+    expect(dict.zh.overviewStatsNote).toContain('本次 DSH 启动')
+    expect(dict.zh.overviewStatsNote).toContain('重启后清零')
+    expect(dict.en.overviewStatsNote).toMatch(/this DSH launch/i)
+    expect(dict.en.overviewStatsNote).toMatch(/resets on restart/i)
+    for (const source of [dict.zh.overviewGuardSource, dict.en.overviewGuardSource]) {
+      expect(source).toMatch(/本次 DSH 启动|this DSH launch/)
+      expect(source).toMatch(/重启|restart/)
+      expect(source).toMatch(/清零|reset/)
+      expect(source).toMatch(/不是永久历史|not a permanent history/)
+    }
+  })
+
+  it('drops every old cross-restart / persisted wording in both languages', () => {
+    const legacy = [/继续累加/, /累计/, /每 5 秒/, /keeps counting/i, /Cumulative/i, /after a restart/i, /every 5 seconds/i]
+    for (const copy of [dict.zh, dict.en]) {
+      for (const text of [copy.overviewStatsNote, copy.overviewGuardSource]) {
+        for (const pattern of legacy) expect(text).not.toMatch(pattern)
+      }
+    }
+  })
+
+  it('no longer ships the removed refresh label keys', () => {
+    expect(Object.keys(dict.zh)).not.toContain('overviewRefresh')
+    expect(Object.keys(dict.zh)).not.toContain('overviewRefreshing')
+    expect(Object.keys(dict.en)).not.toContain('overviewRefresh')
+    expect(Object.keys(dict.en)).not.toContain('overviewRefreshing')
   })
 })

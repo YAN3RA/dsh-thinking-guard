@@ -1,15 +1,33 @@
-import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { processGuardStats, type GuardStatsSnapshot } from '../src/guard-core.ts'
-import { apply as applyGuardState, readGuardStatsFile, writeGuardStatsFile } from '../src/guard-state.ts'
+import { apply as applyGuardState } from '../src/guard-state.ts'
+
+/**
+ * The Guard counters are process-scoped now: a running host accumulates them in
+ * memory and a restart starts from zero. This spec pins the *removal* of the old
+ * persistence path — a legacy `guard-stats.json` must never be read, written or
+ * deleted — and that mounting the state service does not register any flush timer
+ * or unload handler. Cross-process behaviour (a genuinely new Node process, and
+ * the still-persisted switch/threshold config) lives in guard-stats-process.spec.ts.
+ *
+ * Every path is built from `tmpdir()` + `node:path`; nothing is hard-coded.
+ */
 
 const dirs: string[] = []
 afterEach(async () => { await Promise.all(dirs.splice(0).map(d => rm(d, { recursive: true, force: true }))) })
 
-function snapshot(observations: number): GuardStatsSnapshot {
-  return {
+async function tempDir(): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-guard-stats-'))
+  dirs.push(dir)
+  return dir
+}
+
+/** The exact envelope the old writer produced: { version: 1, stats: GuardStatsSnapshot }. */
+function legacyStatsFile(observations: number): string {
+  const stats: GuardStatsSnapshot = {
     observations,
     reminders: { repeat: 2, cycle: 1 },
     denials: 1,
@@ -17,6 +35,7 @@ function snapshot(observations: number): GuardStatsSnapshot {
     lastReminderAt: 1_700_000_000_000,
     since: 1_600_000_000_000,
   }
+  return JSON.stringify({ version: 1, stats }, null, 2) + '\n'
 }
 
 function fakeCtx() {
@@ -24,43 +43,90 @@ function fakeCtx() {
   const ctx: any = {
     logger: { info() {}, warn() {}, error() {} },
     provide(name: string, service: unknown) { ctx[name] = service },
-    effect(cb: () => unknown) { const d = cb(); if (typeof d === 'function') effects.push(d as () => unknown) },
+    effect(cb: () => unknown) {
+      const dispose = cb()
+      if (typeof dispose === 'function') effects.push(dispose as () => unknown)
+    },
   }
-  return { ctx, runEffects: async () => { for (const d of effects.splice(0)) await d() } }
+  return { ctx, effects, runEffects: async () => { for (const d of effects.splice(0)) await d() } }
 }
 
-describe('Guard stats persistence', () => {
-  it('round-trips a snapshot through the stats file', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'dsh-guard-stats-')); dirs.push(dir)
-    const file = join(dir, 'guard-stats.json')
-    expect(await readGuardStatsFile(file)).toBeUndefined()
-    const snap = snapshot(7)
-    await writeGuardStatsFile(file, snap)
-    expect(await readGuardStatsFile(file)).toEqual(snap)
-    expect(JSON.parse(await readFile(file, 'utf8')).version).toBe(1)
-  })
-
-  it('restores counters at mount so a restart does not zero the numbers', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'dsh-guard-stats-')); dirs.push(dir)
+describe('legacy guard-stats.json is ignored', () => {
+  it('does not restore counters from a valid stats file and leaves the file byte-for-byte intact', async () => {
+    const dir = await tempDir()
     const statsFile = join(dir, 'guard-stats.json')
-    await writeGuardStatsFile(statsFile, snapshot(9))
+    await writeFile(statsFile, legacyStatsFile(999))
+
+    const beforeBytes = await readFile(statsFile, 'utf8')
+    const beforeStat = await stat(statsFile)
+    const before = processGuardStats.snapshot()
+
     const { ctx } = fakeCtx()
     await applyGuardState(ctx, { stateFile: join(dir, 'guard.json'), legacyStateFile: '', statsFile })
-    const live = processGuardStats.snapshot()
-    expect(live.observations).toBe(9)
-    expect(live.reminders).toEqual({ repeat: 2, cycle: 1 })
-    expect(live.since).toBe(1_600_000_000_000)
+
+    const after = processGuardStats.snapshot()
+    // No restore: the counters are exactly what this process already had.
+    expect(after.observations).toBe(before.observations)
+    expect(after.reminders).toEqual(before.reminders)
+    expect(after.denials).toBe(before.denials)
+    expect(after.outcomes).toEqual(before.outcomes)
+    expect(after.since).toBe(before.since)
+
+    // Not deleted, not rewritten: identical bytes and untouched metadata.
+    expect(await readFile(statsFile, 'utf8')).toBe(beforeBytes)
+    const afterStat = await stat(statsFile)
+    expect(afterStat.size).toBe(beforeStat.size)
+    expect(afterStat.mtimeMs).toBe(beforeStat.mtimeMs)
   })
 
-  it('flushes new observations on unload', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'dsh-guard-stats-')); dirs.push(dir)
+  it('ignores a corrupt stats file without throwing and without touching it', async () => {
+    const dir = await tempDir()
     const statsFile = join(dir, 'guard-stats.json')
-    await writeGuardStatsFile(statsFile, snapshot(4))
-    const { ctx, runEffects } = fakeCtx()
-    await applyGuardState(ctx, { stateFile: join(dir, 'guard.json'), legacyStateFile: '', statsFile })
+    const corrupt = '{ this is not valid json'
+    await writeFile(statsFile, corrupt)
+
+    const before = processGuardStats.snapshot()
+    const { ctx } = fakeCtx()
+    await expect(
+      applyGuardState(ctx, { stateFile: join(dir, 'guard.json'), legacyStateFile: '', statsFile }),
+    ).resolves.toBeUndefined()
+
+    expect(processGuardStats.snapshot().observations).toBe(before.observations)
+    expect(await readFile(statsFile, 'utf8')).toBe(corrupt)
+  })
+
+  it('mounts without a flush timer or unload handler and never creates a stats file', async () => {
+    const dir = await tempDir()
+    const statsFile = join(dir, 'guard-stats.json')
+    const { ctx, effects, runEffects } = fakeCtx()
+
+    vi.useFakeTimers()
+    try {
+      await applyGuardState(ctx, { stateFile: join(dir, 'guard.json'), legacyStateFile: '', statsFile })
+      // The old 5s sweep would have scheduled a timer; there must be none.
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+
+    // No unload effect was registered either, so "observe then unmount" cannot flush.
+    expect(effects).toHaveLength(0)
     processGuardStats.observe('success')
     await runEffects()
-    const stored = await readGuardStatsFile(statsFile)
-    expect(stored?.observations).toBe(5)
+    await expect(stat(statsFile)).rejects.toBeDefined()
+  })
+
+  it('keeps the deprecated statsFile config inert even when it points at an existing file', async () => {
+    const dir = await tempDir()
+    const statsFile = join(dir, 'guard-stats.json')
+    await writeFile(statsFile, legacyStatsFile(42))
+    const beforeBytes = await readFile(statsFile, 'utf8')
+    const before = processGuardStats.snapshot()
+
+    const { ctx } = fakeCtx()
+    await applyGuardState(ctx, { stateFile: join(dir, 'guard.json'), legacyStateFile: '', statsFile })
+
+    expect(processGuardStats.snapshot().observations).toBe(before.observations)
+    expect(await readFile(statsFile, 'utf8')).toBe(beforeBytes)
   })
 })

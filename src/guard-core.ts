@@ -220,10 +220,11 @@ export class GuardStatsRecorder {
   }
 
   /**
-   * Seed the counters from a persisted snapshot.
-   *
-   * Used once at mount so a process restart or a plugin update continues the same
-   * totals instead of zeroing them. `since` keeps the original first-start time.
+   * @deprecated No longer called by the plugin — counters are process-scoped and
+   * start from zero on every restart. Kept only as a compatibility helper for a
+   * caller that wants to seed a recorder by hand; the plugin never invokes it and
+   * never reads a persisted snapshot into the shared counters. `since` is taken
+   * from the supplied snapshot.
    */
   restore(snapshot: GuardStatsSnapshot): void {
     this.observations = snapshot.observations

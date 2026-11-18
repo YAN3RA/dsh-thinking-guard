@@ -1,5 +1,5 @@
 /**
- * 执行保护（Guard）自有状态：开关、阈值、诊断与落盘。
+ * 执行保护（Guard）自有状态：开关、阈值与诊断。累计计数只在本进程内统计。
  *
  * WHY THIS FILE EXISTS — the Guard used to read and write its switches through
  * the capability-policy service (the 1,877-line `policy.ts` we patched in the
@@ -118,12 +118,23 @@ export function defaultGuardStateFile(): string {
   return join(dirname(defaultPatchFile()), 'dsh-thinking-guard', 'guard.json')
 }
 
-/** Where the Guard's cumulative counters live (survives restarts / plugin updates). */
+/**
+ * @deprecated The Guard no longer persists its counters.
+ *
+ * Counters are process-scoped: they accumulate only for the lifetime of the
+ * running host process and start from zero after a restart. This path helper —
+ * and the two file helpers below — are kept exported only so an out-of-tree
+ * caller importing them does not break; the plugin itself neither reads nor
+ * writes (and never deletes) a `guard-stats.json`.
+ */
 export function defaultGuardStatsFile(): string {
   return join(dirname(defaultPatchFile()), 'dsh-thinking-guard', 'guard-stats.json')
 }
 
-/** Read the persisted counter snapshot; a missing file means "no history yet". */
+/**
+ * @deprecated Not called by the plugin. Kept for API compatibility only; the
+ * Guard never reads a persisted counter file anymore.
+ */
 export async function readGuardStatsFile(file: string): Promise<GuardStatsSnapshot | undefined> {
   let source: string
   try {
@@ -141,7 +152,10 @@ export async function readGuardStatsFile(file: string): Promise<GuardStatsSnapsh
   return stats as GuardStatsSnapshot
 }
 
-/** Atomically replace the persisted counter snapshot. */
+/**
+ * @deprecated Not called by the plugin. Kept for API compatibility only; the
+ * Guard never writes a persisted counter file anymore.
+ */
 export async function writeGuardStatsFile(file: string, stats: GuardStatsSnapshot): Promise<void> {
   await mkdir(dirname(file), { recursive: true })
   const content = JSON.stringify({ version: 1, stats }, null, 2) + '\n'
@@ -338,7 +352,11 @@ export interface GuardStateService {
   /** Report that a Guard instance failed to construct; returns its withdrawal. */
   noteGuardUnavailable(): () => void
   getGuardDiagnostics(): GuardDiagnostics
-  /** Content-free counters; process-scoped, so they do not reset per turn. */
+  /**
+   * Content-free counters, scoped to this host process: they accumulate for the
+   * life of the running process (a service remount keeps them) and reset to zero
+   * on a restart.
+   */
   getGuardStats(): GuardStatsSnapshot
   /** Where the persisted overrides live (empty string when persistence is disabled). */
   stateFilePath(): string
@@ -355,7 +373,12 @@ export interface Config {
   readonly stateFile?: string
   /** Override the 0.1.x migration source; empty disables migration. */
   readonly legacyStateFile?: string
-  /** Override the counters file; empty disables counter persistence (tests). */
+  /**
+   * @deprecated Accepted for backward compatibility only and ignored.
+   *
+   * The Guard's counters are process-scoped now; nothing is read from or written
+   * to a stats file. Supplying this field no longer has any effect.
+   */
   readonly statsFile?: string
 }
 
@@ -371,9 +394,6 @@ export const name = 'thinking-guard-state'
  */
 export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   const stateFile = (config.stateFile ?? defaultGuardStateFile()).trim()
-  // Keep it next to the switch file (same directory), and disabled exactly when
-  // the switch file is disabled — that keeps tests using a temp dir self-contained.
-  const statsFile = (config.statsFile ?? (stateFile.length > 0 ? join(dirname(stateFile), 'guard-stats.json') : '')).trim()
   const legacyFile = (config.legacyStateFile ?? legacyPolicyStateFile()).trim()
   let saved: GuardStateRecord = {}
   if (stateFile.length > 0) {
@@ -392,22 +412,12 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     }
   }
 
-  /**
-   * Restore the cumulative counters before any hook can observe a call, so the
-   * 总览 page does not drop to zero on every restart / plugin update.
-   */
-  let lastStatsJson = ''
-  if (statsFile.length > 0) {
-    try {
-      const stored = await readGuardStatsFile(statsFile)
-      if (stored !== undefined) {
-        processGuardStats.restore(stored)
-        lastStatsJson = JSON.stringify(stored)
-      }
-    } catch (error) {
-      ctx.logger.warn(`thinking-guard: cannot read Guard stats ${statsFile}: ${String(error)}`)
-    }
-  }
+  // Counters are process-scoped on purpose. The shared `processGuardStats`
+  // singleton keeps accumulating for as long as this host process lives, so a
+  // state-service remount (settings page reload, plugin re-apply) must neither
+  // reset nor re-seed them — this function never touches them. A legacy
+  // `guard-stats.json` is deliberately ignored and left untouched (not read,
+  // written or deleted); a fresh process restart simply starts from zero.
 
   /** Patch-file values, registered by the Guard itself (keyed so withdrawal is exact). */
   const bases = new Map<number, Partial<GuardSwitches>>()
@@ -516,35 +526,6 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
 
   ctx.provide('thinkingGuardState', service)
 
-  // Persist the counters periodically and once on unload. A mutation hook would
-  // sit in the tool hot path; a 5s sweep is enough for a settings readout and
-  // bounds what a hard kill can lose.
-  if (statsFile.length > 0) {
-    let writing = false
-    const flush = async (): Promise<void> => {
-      if (writing) return
-      const snapshot = processGuardStats.snapshot()
-      const json = JSON.stringify(snapshot)
-      if (json === lastStatsJson) return
-      writing = true
-      try {
-        await writeGuardStatsFile(statsFile, snapshot)
-        lastStatsJson = json
-      } catch (error) {
-        ctx.logger.warn(`thinking-guard: cannot persist Guard stats to ${statsFile}: ${String(error)}`)
-      } finally {
-        writing = false
-      }
-    }
-    const timer = setInterval(() => { void flush() }, 5_000)
-    ;(timer as unknown as { unref?: () => void }).unref?.()
-    // `effect` is the real cordis lifecycle. A minimal test host may omit it;
-    // then the timer still flushes on its own and cleanup is simply skipped.
-    if (typeof (ctx as unknown as { effect?: unknown }).effect === 'function') {
-      ctx.effect(() => async () => {
-        clearInterval(timer)
-        await flush()
-      }, 'thinking-guard: persist Guard stats')
-    }
-  }
+  // No stats timer and no unload flush: the counters live only in process memory
+  // (see the comment above the service), so there is nothing to persist.
 }

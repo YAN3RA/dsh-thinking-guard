@@ -25,6 +25,48 @@ import {
   type PendingLoopObservation,
   type TurnState,
 } from './guard-core.ts'
+
+/**
+ * Bounded per-turn buffer of recent COMPLETED tool results, used as an
+ * additional pre-dispatch evidence source for the local deny.
+ *
+ * PTC / Code Mode nested calls run on the shared guarded pipeline, but the
+ * stored block candidate from the result stage is not always consumable at the
+ * next call's pre-dispatch check inside one run_code burst. Recomputing the
+ * repeat + unchanged-result evidence here at dispatch time makes the 9th
+ * identical nested call deny exactly like standard mode. Only signature /
+ * outcome / hash are kept - never arguments or payloads.
+ */
+type RecentResult = {
+  readonly signature: string
+  readonly outcome: GuardToolOutcome
+  readonly fingerprint: string
+}
+
+function recentRepeatEvidence(
+  recentByState: WeakMap<object, RecentResult[]>,
+  state: object,
+  signature: string,
+  thresholds: readonly number[],
+): boolean {
+  const recent = recentByState.get(state)
+  if (recent === undefined || recent.length === 0) return false
+  const sorted = [...thresholds].sort((a, b) => a - b)
+  const max = sorted[sorted.length - 1]
+  if (max === undefined || max < 2) return false
+  let run = 0
+  for (let index = recent.length - 1; index >= 0; index -= 1) {
+    if (recent[index].signature === signature) run += 1
+    else break
+  }
+  if (run < max) return false
+  const tail = recent.slice(-max)
+  const first = tail[0]
+  return tail.every((entry) => entry.signature === signature
+    && entry.outcome === first.outcome
+    && entry.fingerprint === first.fingerprint)
+}
+
 export const name = 'thinking-guard'
 // The Guard owns its state now: `thinkingGuardState` is a service of this same
 // package (`src/guard-state.ts`), mounted by `src/index.ts` before this plugin.
@@ -521,6 +563,8 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
   }
 
+  const recentByState = new WeakMap<object, RecentResult[]>()
+
   const toolGuard = ctx.tools.guard((execution) => {
     try {
       const agent = execution.agent
@@ -545,8 +589,11 @@ export function apply(ctx: Context, config: Config = {}): void {
       const signature = guardToolSignature(execution.name, execution.arguments)
       if (signature === undefined) return undefined
       if (state.localLoopDenials >= MAX_LOCAL_LOOP_DENIALS
-        || !takeBlockCandidate(state, signature, allowed)
         || state.blockedLoopSignatures.has(signature)) return undefined
+      const hasCandidate = takeBlockCandidate(state, signature, allowed)
+        || (allowed.has('repeat')
+          && recentRepeatEvidence(recentByState, state, signature, sw.repeatThresholds))
+      if (!hasCandidate) return undefined
       rememberBlockedSignature(state, signature)
       rememberDeniedCall(state, String(execution.callId))
       state.localLoopDenials += 1
@@ -569,7 +616,11 @@ export function apply(ctx: Context, config: Config = {}): void {
       // from an older turn and must be discarded now, not when (or if) the switch
       // is turned back on. Otherwise turn-2's first identical call would consume
       // turn-1's pending candidate / repeat history.
-      if (previousTurn !== undefined && previousTurn !== payload.turn) activeGuard.states.clear(agent)
+      if (previousTurn !== undefined && previousTurn !== payload.turn) {
+        const stale = activeGuard.states.get(agent)
+        if (stale !== undefined) recentByState.delete(stale)
+        activeGuard.states.clear(agent)
+      }
     }
     activeGuard.admitStep(payload.agent, payload.turn)
     return next()
@@ -580,6 +631,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (state === undefined || message.source.kind !== 'user') return
     if (!rememberUserMessage(state, String(message.id))) return
     activeGuard.resetLoopState(agent)
+    recentByState.delete(state)
   }))
 
   disposers.push(ctx.on('tools/execute', async (execution, next) => {
@@ -669,6 +721,15 @@ export function apply(ctx: Context, config: Config = {}): void {
         signature: dispatch.signature,
         outcome,
         ...(resultFingerprint !== undefined ? { resultFingerprint } : {}),
+      }
+      if (resultFingerprint !== undefined) {
+        let recent = recentByState.get(state)
+        if (recent === undefined) {
+          recent = []
+          recentByState.set(state, recent)
+        }
+        recent.push({ signature: dispatch.signature, outcome, fingerprint: resultFingerprint })
+        if (recent.length > 64) recent.splice(0, recent.length - 64)
       }
       if (state.pendingLoopObservations.size >= MAX_PENDING_DISPATCHES) {
         failOpenLoopDetection(state)

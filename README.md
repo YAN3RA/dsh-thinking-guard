@@ -2,7 +2,7 @@
 
 [![npm 版本](https://img.shields.io/npm/v/dsh-thinking-guard)](https://www.npmjs.com/package/dsh-thinking-guard) [![DSH 插件 · Cordis](https://img.shields.io/badge/DSH_plugin-Cordis-4D6BFE)](https://github.com/topics/dsh-plugin) [![许可证 Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/YAN3RA/dsh-thinking-guard/blob/main/LICENSE)
 
-**当前版本：0.4.2（文档与元数据补丁）；运行功能与 0.4.1 一致。** [npm 安装包](https://www.npmjs.com/package/dsh-thinking-guard) · [GitHub Releases](https://github.com/YAN3RA/dsh-thinking-guard/releases) · [问题反馈](https://github.com/YAN3RA/dsh-thinking-guard/issues)
+**当前版本：0.4.3；修复 PTC / Code Mode 下重复调用未被“局部拒绝”的问题，并纳入上游 #33（禁用 MCP 服务时裁剪其说明段）。** [npm 安装包](https://www.npmjs.com/package/dsh-thinking-guard) · [GitHub Releases](https://github.com/YAN3RA/dsh-thinking-guard/releases) · [问题反馈](https://github.com/YAN3RA/dsh-thinking-guard/issues)
 
 > **DSH 插件声明：** 本项目是为 **DeepSeek Harness（DSH）** 开发的社区维护、非官方 **Cordis 型插件**，不是独立应用，也不是用来冒充插件的 Skill 说明文件。安装与运行需要 DSH 宿主。
 
@@ -129,7 +129,7 @@ dsh plugin --profile desktop add dsh-thinking-guard
 首次安装指定版本：
 
 ```bash
-dsh plugin --profile desktop add dsh-thinking-guard@0.4.2
+dsh plugin --profile desktop add dsh-thinking-guard@0.4.3
 ```
 
 `desktop` 是桌面客户端常用 profile；使用其他 profile 时，请将其替换为实际名称。
@@ -140,7 +140,7 @@ dsh plugin --profile desktop add dsh-thinking-guard@0.4.2
 
 ```bash
 dsh plugin --profile desktop remove dsh-thinking-guard
-dsh plugin --profile desktop add dsh-thinking-guard@0.4.2
+dsh plugin --profile desktop add dsh-thinking-guard@0.4.3
 ```
 
 随后**完整退出并重新打开 DeepSeek Harness**，而不是只刷新页面。正常升级保留开关与阈值；运行统计按 0.4.1 起的规则在宿主重启后清零。不要为了升级主动删除本机配置或旧统计文件。

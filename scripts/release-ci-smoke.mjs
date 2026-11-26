@@ -289,7 +289,9 @@ async function main() {
   const add = runLogged(
     'plugin-add',
     { cmd: process.execPath, args: [binJs], shell: false },
-    ['plugin', '--profile', profile, 'add', tarball, '--ignore-scripts'],
+    // The selected profile is a fresh, disposable pnpm workspace root, not
+    // the source repository. Explicitly acknowledge that root for pnpm 9+.
+    ['plugin', '--profile', profile, 'add', tarball, '--workspace-root', '--ignore-scripts'],
     { cwd: workDir, env, logDir, timeoutMs: 600000 },
   )
   summary.steps.push({ step: 'plugin-add', status: add.status, ms: add.ms, log: path.relative(workDir, add.logPath) })

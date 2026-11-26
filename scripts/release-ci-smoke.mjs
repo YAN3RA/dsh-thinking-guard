@@ -236,6 +236,13 @@ async function main() {
     summary.ok = false
     summary.errors.push(message + (step ? ' (exit ' + step.status + ')' : ''))
     printSummary(summary)
+    // Surface only package-manager error identifiers, never raw host logs.
+    if (step?.logPath) {
+      const text = fs.readFileSync(step.logPath, 'utf8')
+      const codes = [...new Set(text.match(/\b(?:ERR_PNPM_[A-Z0-9_]+|ENOENT|EACCES|EAI_AGAIN|ETIMEDOUT|ECONNREFUSED|ECONNRESET|E404|E403|E401|ENOTFOUND)\b/g) ?? [])]
+      const hints = ['pnpm was not found', 'requires Node.js', 'registry returned', 'Issue with peer dependencies', 'no matching version'].filter(hint => text.toLowerCase().includes(hint.toLowerCase()))
+      console.log('[release-ci-smoke] package-manager diagnostic: ' + JSON.stringify({ codes, hints }))
+    }
     return 1
   };
 

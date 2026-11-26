@@ -2,9 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     tags: ['v*']
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -16,7 +20,7 @@ jobs:
           version: 9
       - uses: actions/setup-node@v4
         with:
-          node-version: 24.9.0
+          node-version: '24.22.3'
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
@@ -24,7 +28,7 @@ jobs:
       - run: pnpm build
       - run: npm pack --dry-run
 
-  windows-self-update:
+  windows-test:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,15 +37,86 @@ jobs:
           version: 9
       - uses: actions/setup-node@v4
         with:
-          node-version: 24.9.0
+          node-version: '24.22.3'
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
-      - run: pnpm exec vitest run tests/self-update.spec.ts
+      # The full suite passes on Windows when run serially; parallel workers make
+      # timing-sensitive assertions flaky. Keep the whole suite, one worker.
+      - run: pnpm exec vitest run --maxWorkers=1
+
+  package:
+    needs: [test, windows-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.3'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Pack the tarball used by the CI smoke
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-smoke-tarball"
+          # CI-only artifact: it is consumed by release-smoke below. It is NOT
+          # the official release attachment -- that is the Windows-built tarball
+          # the release owner uploads manually, and the two may differ in bytes.
+          # Build already produced lib/; --ignore-scripts keeps this artifact
+          # identical to what the gates just validated.
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/ci-smoke-tarball"
+          cd "$RUNNER_TEMP/ci-smoke-tarball"
+          sha256sum ./*.tgz > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-smoke-tarball
+          path: ${{ runner.temp }}/ci-smoke-tarball
+          if-no-files-found: error
+          retention-days: 7
+
+  release-smoke:
+    needs: [package]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Exact host versions the release must load on. rc.5 stays as the
+        # regression baseline; Alpha.2 is the newly supported release.
+        host-version: ['0.2.2-rc.5', '0.2.3-alpha.2']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          # The dsh plugin manager shells out to pnpm to install the tarball.
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.3'
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-smoke-tarball
+          path: ${{ runner.temp }}/ci-smoke-tarball
+      - name: Verify the tarball checksum recorded by the package job
+        run: |
+          cd "$RUNNER_TEMP/ci-smoke-tarball"
+          sha256sum -c SHA256SUMS
+      - name: Install and load the release tarball on an isolated host
+        env:
+          HOST_VERSION: ${{ matrix.host-version }}
+        run: |
+          TARBALL=$(ls "$RUNNER_TEMP"/ci-smoke-tarball/*.tgz)
+          node scripts/release-ci-smoke.mjs \
+            --host-version "$HOST_VERSION" \
+            --tarball "$TARBALL" \
+            --work-dir "$RUNNER_TEMP/smoke-$HOST_VERSION"
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test, windows-self-update]
+    needs: [test, windows-test, package, release-smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -53,7 +128,7 @@ jobs:
         run: git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
       - uses: actions/setup-node@v4
         with:
-          node-version: 24.9.0
+          node-version: '24.22.3'
       - name: Create GitHub Release from annotated tag notes
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

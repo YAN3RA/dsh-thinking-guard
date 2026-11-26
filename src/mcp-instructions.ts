@@ -7,7 +7,8 @@ const RESOURCE_TOOLS = new Set([
 
 /**
  * DSH's MCP client publishes literal instructions as `mcp:<server>` sections,
- * independently of tool schemas (verified against dsh-mcp-client 0.2.2-rc.1).
+ * independently of tool schemas. Alpha.2 also publishes an independent
+ * `mcp:<server>:tools` catalog for its native `load_tools` entry.
  * Use the caller's registered tool view BEFORE Resident-only admission: an
  * On-demand tool still needs its server's instructions. Empty/unknown servers
  * are not evidence of an explicit Disabled decision.
@@ -23,16 +24,32 @@ export function projectMcpInstructions<T extends PromptPresentation>(
   // Its public resource API does not identify which server needs instructions.
   // Preserve them conservatively while resource access is still enabled in
   // this scope; never parse or rewrite server-provided prose to infer ownership.
-  if (assembly.sections.some(section => section.name === 'mcp-resource-servers' && section.text.length > 0)
-    && tools.some(tool => RESOURCE_TOOLS.has(tool.name) && !isDisabled(tool.name))) return assembly
+  const preserveInstructions = assembly.sections.some(section => section.name === 'mcp-resource-servers' && section.text.length > 0)
+    && tools.some(tool => RESOURCE_TOOLS.has(tool.name) && !isDisabled(tool.name))
 
   const disabledServers = new Map<string, boolean>()
+  const disabledMcpTools = new Set<string>()
   for (const tool of tools) {
     if (!tool.name.startsWith('mcp__')) continue
     const server = serverNameOf(tool.name)
-    disabledServers.set(server, (disabledServers.get(server) ?? true) && isDisabled(tool.name))
+    const disabled = isDisabled(tool.name)
+    disabledServers.set(server, (disabledServers.get(server) ?? true) && disabled)
+    if (disabled) disabledMcpTools.add(tool.name)
   }
-  const sections = assembly.sections.filter(section =>
-    !section.name.startsWith('mcp:') || disabledServers.get(section.name.slice(4)) !== true)
-  return sections.length === assembly.sections.length ? assembly : { ...assembly, sections }
+  // Incremental hosts leave an omitted source active; a same-name empty
+  // contribution withdraws it. Older hosts omit empty text when rendering.
+  const sections = assembly.sections.map(section => {
+    if (!section.name.startsWith('mcp:') || section.text === '') return section
+    // Match Alpha.2's exact loader name from the section, without splitting
+    // the server name on '__'. The resource exception applies to instructions
+    // only, and a disabled member alone does not make the loader unusable.
+    const source = section.name.slice('mcp:'.length)
+    const suffix = ':tools'
+    const withdraw = source.endsWith(suffix)
+      ? disabledMcpTools.has(`mcp__${source.slice(0, -suffix.length)}__load_tools`)
+      : !preserveInstructions && disabledServers.get(source) === true
+    return withdraw ? { ...section, text: '', interpolate: false } : section
+  })
+  return sections.every((section, index) => section === assembly.sections[index])
+    ? assembly : { ...assembly, sections }
 }

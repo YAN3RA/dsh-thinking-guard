@@ -4,7 +4,7 @@ import { join as joinPath } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
+import ToolRuntime, { defineTool, ToolNotFoundError } from '@deepseek-ai/dsh-tools'
 import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { executeOne } from './execute-one.ts'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
@@ -562,5 +562,158 @@ describe('capability-menu-invoke', () => {
     expect(content(b1)).toContain('Full design instructions')
     // Re-loading in session A returns the short reminder.
     expect(content(a2)).toContain('already loaded')
+  })
+
+  /**
+   * A program-only executor (PTC / Code Mode) rejects every direct root call
+   * except `run_code` with "only `run_code` is callable directly". This stands
+   * one up with the public pipeline API: a pipeline whose `reject` source
+   * refuses direct root calls, wrapped as the selected executor. `meta_invoke`
+   * itself stays callable at the root so these tests can reach it the way a
+   * program subcall would (a real program calls it nested, which is also
+   * permitted here).
+   */
+  async function programOnlySetup(
+    home: string,
+    policyConfig: Record<string, unknown> = {},
+    mode: 'program-only' | 'unknown' = 'program-only',
+  ): Promise<Context> {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(SkillRegistry)
+    await ctx.plugin(SkillFileSystem, {
+      dshHome: `${home}/.dsh`,
+      agentsHome: `${home}/.agents`,
+      watch: false,
+    })
+    await ctx.plugin(registry, { stateFile: '' })
+    await ctx.plugin(policy, { stateFile: '', ...policyConfig })
+    await ctx.plugin(toolMetaInvoke, {})
+    const { ToolExecutionPipeline, executeToolBatch } = await import('@deepseek-ai/dsh-tools/pipeline')
+    const pipeline = new ToolExecutionPipeline(ctx, {
+      reject: (name, nested) => {
+        if (nested || name === 'run_code' || name === 'meta_invoke') return undefined
+        return new ToolNotFoundError(name, mode === 'program-only'
+          ? `only \`run_code\` is callable directly — call \`${name}\` from inside a \`run_code\` program instead`
+          : undefined)
+      },
+    })
+    ctx.tools.setExecutor({
+      describe: () => ({ schemas: [] }),
+      execute: input => executeToolBatch(input, pipeline, () => 10),
+    })
+    return ctx
+  }
+
+  it('executes a tool the program-only executor refuses to call directly', async () => {
+    // The rejection is a transport restriction, not a capability one: retrying
+    // through the public native pipeline must reach the On-demand tool.
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
+    const ctx = await programOnlySetup(home, { tools: { 'on-demand': ['working_directory'] } })
+    let calls = 0
+    const tool = registerNativeTool(ctx, 'working_directory', 'Report the current directory', args => {
+      calls += 1
+      return { ok: true, received: args }
+    })
+    await ctx.capability.refresh()
+
+    // The executor really does refuse this tool when called directly — the
+    // retry below is what makes it reachable.
+    const direct = await executeOne(ctx, {
+      callId: ToolCallId('direct-refused'), name: tool, arguments: { command: 'pwd' },
+      agent: agentStub('ptc-direct') as never, signal: testSignal,
+    })
+    expect(direct.isError).toBe(true)
+    expect(direct.content.map(block => block.type === 'text' ? block.text : '').join('\n')).toContain('is callable directly')
+
+    const result = await runTool(ctx, 'meta_invoke', { id: tool, kind: 'tool', args: { command: 'pwd' } })
+    expect(result.isError, JSON.stringify(result.content)).toBe(false)
+    expect(result.value).toMatchObject({ ok: true, kind: 'mcp', detail: { forwarded: true, target: tool } })
+    // Exactly one execution: the refused attempt never ran the body.
+    expect(calls).toBe(1)
+  })
+
+  it('forwards with the enclosing execution as parent and keeps the root call', async () => {
+    // A transport sub-dispatch must carry the enclosing execution's opaque
+    // token and root call, so the host can tell it apart from a model-direct
+    // call and commit-style observers can wait for the outer program.
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
+    const ctx = await programOnlySetup(home)
+    const tool = registerNativeTool(ctx, 'working_directory', 'Report the current directory', args => ({ ok: true, received: args }))
+    await ctx.capability.refresh()
+
+    const seen: { name: string; token: unknown; parent: unknown; rootCallId: unknown }[] = []
+    const dispose = ctx.on('tools/pre-execute', async (exec: { name: string; token: unknown; parent?: unknown; rootCallId: unknown }, next: () => Promise<unknown>) => {
+      seen.push({ name: exec.name, token: exec.token, parent: exec.parent, rootCallId: exec.rootCallId })
+      return next()
+    })
+
+    try {
+      const result = await runTool(ctx, 'meta_invoke', { id: tool, kind: 'tool', args: { command: 'pwd' } })
+      expect(result.isError, JSON.stringify(result.content)).toBe(false)
+    } finally {
+      dispose()
+    }
+
+    const meta = seen.find(entry => entry.name === 'meta_invoke')
+    const target = seen.find(entry => entry.name === tool)
+    expect(meta).toBeDefined()
+    expect(target).toBeDefined()
+    // The forward is a sub-dispatch of the meta_invoke execution…
+    expect(target?.parent).toBe(meta?.token)
+    // …and preserves its root call.
+    expect(target?.rootCallId).toBe(meta?.rootCallId)
+  })
+
+  it('surfaces a target failure once through the retry path', async () => {
+    // The retry must not turn a real tool failure into a success, and must not
+    // run the body twice.
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
+    const ctx = await programOnlySetup(home)
+    let calls = 0
+    const failing = registerNativeTool(ctx, 'working_directory', 'Always fails', () => {
+      calls += 1
+      throw new Error('target exploded')
+    })
+    await ctx.capability.refresh()
+
+    const result = await runTool(ctx, 'meta_invoke', { id: failing, kind: 'tool', args: { command: 'pwd' } })
+    expect(result.isError).toBe(true)
+    expect(calls).toBe(1)
+  })
+
+  it('keeps a disabled capability refused under a program-only executor', async () => {
+    // Disabled stays a hard deny at the invocation surface: the retry is never
+    // reached, so it cannot widen the policy.
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
+    const ctx = await programOnlySetup(home, { tools: { disabled: ['working_directory'] } })
+    let calls = 0
+    const tool = registerNativeTool(ctx, 'working_directory', 'Report the current directory', args => {
+      calls += 1
+      return { ok: true, received: args }
+    })
+    await ctx.capability.refresh()
+
+    const result = await runTool(ctx, 'meta_invoke', { id: tool, kind: 'tool', args: { command: 'pwd' } })
+    expect(result.isError).toBe(true)
+    expect(calls).toBe(0)
+  })
+
+  it('does not retry a plain unknown-tool rejection', async () => {
+    // Only the program-only message earns a retry. A genuine "unknown tool"
+    // stays a failure, so a missing registration is never masked.
+    const home = await import('node:fs/promises').then(fs => fs.mkdtemp(joinPath(tmpdir(), 'dsh-meta-invoke-')))
+    const ctx = await programOnlySetup(home, {}, 'unknown')
+    let calls = 0
+    const tool = registerNativeTool(ctx, 'working_directory', 'Report the current directory', args => {
+      calls += 1
+      return { ok: true, received: args }
+    })
+    await ctx.capability.refresh()
+
+    const result = await runTool(ctx, 'meta_invoke', { id: tool, kind: 'tool', args: { command: 'pwd' } })
+    expect(result.isError).toBe(true)
+    expect(calls).toBe(0)
   })
 })

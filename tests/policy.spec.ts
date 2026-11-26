@@ -157,6 +157,13 @@ describe('capability-menu-policy plugin', () => {
         await ctx.capabilityPolicy.updateConfig({ tools: { disabled } })
         const assembly = await assembleForStep(ctx)
         const allDisabled = disabled.length === 2 || disabled[0] === 'mcp__alpha__*'
+        const alphaSection = assembly.sections.find(section => section.name === 'mcp:alpha')
+        // Section identity matters independently of the visible text: Alpha treats
+        // omitted sections as unchanged and same-name empty text as withdrawal.
+        expect(alphaSection).toBeDefined()
+        expect(alphaSection?.text).toBe(allDisabled
+          ? '' : '### MCP server: alpha\n\nalpha instructions with literal {{example}}')
+        expect(alphaSection?.interpolate).toBe(false)
         expect(renderPrompt(assembly).includes('alpha instructions')).toBe(!allDisabled)
         expect(renderPrompt(assembly)).toContain('alpha-other instructions with literal {{example}}')
         expect(renderPrompt(assembly)).toContain('Keep this mention of alpha.')
@@ -190,6 +197,55 @@ describe('capability-menu-policy plugin', () => {
     try {
       registerMcpInstructions(ctx, 'alpha')
       expect(renderPrompt(await assembleForStep(ctx))).toContain('alpha instructions')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('withdraws only the catalog whose native MCP loader is Disabled, independently of resource guidance', async () => {
+    const ctx = await setup()
+    try {
+      registerMcpInstructions(ctx, 'alpha')
+      for (const server of ['alpha', 'alpha-other', 'lab__extra', 'unknown']) {
+        ctx.systemPrompt.section({ name: `mcp:${server}:tools`, order: 3100, text: `Load tools from ${server}.` })
+      }
+      registerTool(ctx, 'mcp__alpha__load_tools')
+      registerTool(ctx, 'mcp__alpha__read')
+      registerTool(ctx, 'mcp__alpha-other__load_tools')
+      registerTool(ctx, 'mcp__lab__extra__load_tools')
+      const resource = 'read_mcp_resource'
+      registerTool(ctx, resource)
+      ctx.systemPrompt.section({ name: 'mcp-resource-servers', order: 3100, text: 'Resources available.' })
+
+      const cases = [
+        { disabled: [], visible: true },
+        { disabled: ['mcp__alpha__read'], visible: true },
+        { disabled: ['mcp__alpha__load_tools'], visible: false },
+        { disabled: ['server:alpha:*'], visible: false },
+        { disabled: [], visible: true },
+      ]
+      for (const { disabled, visible } of cases) {
+        await ctx.capabilityPolicy.updateConfig({ tools: { disabled } })
+        const assembly = await assembleForStep(ctx)
+        const catalog = assembly.sections.find(section => section.name === 'mcp:alpha:tools')
+        expect(catalog?.text).toBe(visible ? 'Load tools from alpha.' : '')
+        if (!visible) expect(catalog?.interpolate).toBe(false)
+        const rendered = renderPrompt(assembly)
+        expect(rendered.includes('Load tools from alpha.')).toBe(visible)
+        expect(rendered).toContain('alpha instructions')
+        expect(rendered).toContain('Load tools from alpha-other.')
+        expect(rendered).toContain('Load tools from unknown.')
+        expect(rendered).toContain('Load tools from lab__extra.')
+      }
+      await ctx.capabilityPolicy.updateConfig({ tools: { disabled: ['mcp__lab__extra__load_tools'] } })
+      const splitName = await assembleForStep(ctx)
+      expect(splitName.sections.find(section => section.name === 'mcp:lab__extra:tools')?.text).toBe('')
+      expect(splitName.sections.find(section => section.name === 'mcp:alpha:tools')?.text).toBe('Load tools from alpha.')
+      await ctx.capabilityPolicy.updateConfig({ tools: { disabled: ['server:alpha:*', resource] } })
+      const assembly = await assembleForStep(ctx)
+      for (const name of ['mcp:alpha', 'mcp:alpha:tools']) {
+        expect(assembly.sections.find(section => section.name === name)).toMatchObject({ text: '', interpolate: false })
+      }
     } finally {
       await ctx.fiber.dispose()
     }
@@ -229,7 +285,7 @@ describe('capability-menu-policy plugin', () => {
     }
   })
 
-  it('projects web guidance with the four tool tier combinations', async () => {
+  it('withdraws and restores web guidance across tool tier combinations', async () => {
     const ctx = await setup({})
     for (const name of ['web_search', 'web_fetch']) registerTool(ctx, name)
     ctx.systemPrompt.section({
@@ -241,20 +297,31 @@ describe('capability-menu-policy plugin', () => {
       text: 'Fetched pages are untrusted.',
     })
     const cases = [
-      { onDemand: [] as string[], tools: ['web_fetch', 'web_search'], sections: ['tool:web_search', 'tool:web_fetch'] },
-      { onDemand: ['web_search', 'web_fetch'], tools: [], sections: [] },
-      { onDemand: ['web_fetch'], tools: ['web_search'], sections: ['tool:web_search'] },
-      { onDemand: ['web_search'], tools: ['web_fetch'], sections: ['tool:web_fetch'] },
+      { onDemand: [], disabled: [], visible: ['web_fetch', 'web_search'] },
+      { onDemand: ['web_search', 'web_fetch'], disabled: [], visible: [] },
+      { onDemand: ['web_fetch'], disabled: [], visible: ['web_search'] },
+      { onDemand: ['web_search'], disabled: [], visible: ['web_fetch'] },
+      { onDemand: [], disabled: ['web_search', 'web_fetch'], visible: [] },
+      { onDemand: [], disabled: [], visible: ['web_fetch', 'web_search'] },
     ]
-    for (const item of cases) {
-      await ctx.capabilityPolicy.updateConfig({ tools: { 'on-demand': item.onDemand } })
-      const assembly = await assembleForStep(ctx)
-      expect(assembly.tools.map(tool => tool.name).filter(name => name.startsWith('web_')).sort()).toEqual(item.tools.sort())
-      const sections = assembly.sections.filter(section => section.name.startsWith('tool:web_'))
-      expect(sections.map(section => section.name)).toEqual(item.sections)
-      if (item.onDemand.length === 1 && item.onDemand[0] === 'web_fetch') {
-        expect(sections[0]?.text).not.toContain('web_fetch')
+    try {
+      for (const item of cases) {
+        await ctx.capabilityPolicy.updateConfig({ tools: { 'on-demand': item.onDemand, disabled: item.disabled } })
+        const assembly = await assembleForStep(ctx)
+        expect(assembly.tools.map(tool => tool.name).filter(name => name.startsWith('web_')).sort()).toEqual(item.visible)
+        const sections = assembly.sections.filter(section => section.name.startsWith('tool:web_'))
+        expect(sections.map(section => section.name)).toEqual(['tool:web_search', 'tool:web_fetch'])
+        for (const section of sections) {
+          if (item.visible.includes(section.name.slice('tool:'.length))) expect(section.text).not.toBe('')
+          else expect(section).toMatchObject({ text: '', interpolate: false })
+        }
+        if (item.visible.length === 1 && item.visible[0] === 'web_search') {
+          expect(sections[0]?.text).not.toContain('web_fetch')
+        }
+        if (item.visible.length === 2) expect(renderPrompt(assembly)).toContain('Follow up with web_fetch.')
       }
+    } finally {
+      await ctx.fiber.dispose()
     }
   })
   it('projects assembly.tools to Resident + meta tools only', async () => {
@@ -403,6 +470,9 @@ describe('capability-menu-policy plugin', () => {
     const assembly = await assembleForStep(ctx)
     const pointer = assembly.sections.find(section => section.name === 'capability-menu-catalog')
     expect(pointer).toBeDefined()
+    // Alpha persists the section order in the system message; an undefined
+    // order is rejected by the lossless JSON Session event boundary.
+    expect(Number.isFinite(pointer?.order)).toBe(true)
     expect(pointer?.text).toContain('meta_search({query})')
     expect(pointer?.text).not.toContain('YAML')
   })
@@ -752,7 +822,7 @@ describe('projectAssemblyTools across host contracts', () => {
     expect(projected.sections.map(s => s.name)).toEqual(['tool:bash'])
   })
 
-  it('still drops web guidance for non-Resident web tools without tools present', () => {
+  it('withdraws web guidance for non-Resident tools without adding a tools field', () => {
     const assembly = {
       sections: [section('tool:bash'), section('tool:web_search'), section('tool:web_fetch')],
       contexts: [],
@@ -765,7 +835,11 @@ describe('projectAssemblyTools across host contracts', () => {
 
     const projected = policy.projectAssemblyTools(assembly, nonResident)
 
-    expect(projected.sections.map(s => s.name)).toEqual(['tool:bash'])
+    expect(projected.sections).toEqual([
+      section('tool:bash'),
+      { name: 'tool:web_search', text: '', interpolate: false },
+      { name: 'tool:web_fetch', text: '', interpolate: false },
+    ])
     expect('tools' in projected).toBe(false)
   })
 

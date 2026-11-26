@@ -8,7 +8,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
+import type { ToolExecutionInput, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { isModelInvocable, renderSkillContent, type SkillResourceBase } from '@deepseek-ai/dsh-skill'
@@ -238,24 +238,13 @@ export function apply(ctx: Context, config: Config = {}): void {
         // risks turning a legitimate call into a wrong one (see issue #10).
         const envelope = envelopeDiagnostic(forwarded, capability.name, definition.parameters)
         if (envelope !== undefined) throw new Error(envelope)
-        const result = typeof ctx.tools.resolve === 'function'
-          ? (await ctx.tools.execute({
-              calls: [{
-                type: 'tool-call', id: ToolCallId(`${exec.callId}:meta:${id}`),
-                name: capability.name, arguments: JSON.stringify(forwarded),
-              }],
-              signal: exec.signal,
-              agent: exec.agent,
-            })).results[0]?.result
-          : await (ctx.tools as unknown as {
-              execute(input: {
-                callId: ReturnType<typeof ToolCallId>; name: string; arguments: Record<string, unknown>;
-                signal: AbortSignal; parent: typeof exec.token; agent: typeof exec.agent;
-              }): Promise<{ isError: boolean; content: readonly { type: string; text?: string }[] }>
-            }).execute({
-              callId: ToolCallId(`${exec.callId}:meta:${id}`), name: capability.name,
-              arguments: forwarded, signal: exec.signal, parent: exec.token, agent: exec.agent,
-            })
+        const result = await forwardThroughHost(
+          ctx,
+          { callId: exec.callId, rootCallId: exec.rootCallId, agent: exec.agent, signal: exec.signal, token: exec.token },
+          capability.name,
+          forwarded,
+          id,
+        )
         if (result === undefined) throw new Error(`meta_invoke: ${capability.name} returned no result`)
         if (result.isError) {
           const message = result.content.map(block => block.type === 'text' ? block.text : `[${block.type} content]`).join('\n')
@@ -397,4 +386,150 @@ function envelopeDiagnostic(
     `meta_invoke: args looks like a nested { id, kind, args } envelope for "${targetName}" — ` +
     'pass the target tool\'s parameters directly (the parameter object from meta_search detail)'
   )
+}
+
+/** Minimal settled-result view shared by the two forwarding paths. */
+interface ForwardedResult {
+  readonly isError: boolean
+  readonly error?: { readonly message?: unknown } | undefined
+  readonly content: readonly { readonly type: string; readonly text?: string }[]
+}
+
+/** Caller context a forwarded call must keep: agent scope, cancellation, correlation. */
+interface ForwardScope {
+  readonly callId: ToolRunContext['callId']
+  readonly rootCallId: ToolRunContext['rootCallId']
+  readonly agent: ToolRunContext['agent']
+  readonly signal: AbortSignal
+  readonly token: ToolRunContext['token']
+}
+
+/**
+ * Forward one tool call through the host's selected executor.
+ *
+ * Normally that executor runs the target in place. A program-only executor
+ * (PTC / Code Mode) instead rejects every direct call with "only `run_code` is
+ * callable directly" — a transport restriction, not a capability one: the same
+ * registered tool stays executable through the public native tool pipeline.
+ * Only that exact rejection is retried there; every other failure (including a
+ * target's own error result) propagates unchanged, so a real tool error is
+ * never masked, retried, or turned into a silent success.
+ */
+async function forwardThroughHost(
+  ctx: Context,
+  scope: ForwardScope,
+  name: string,
+  forwarded: Record<string, unknown>,
+  id: string,
+): Promise<ForwardedResult | undefined> {
+  try {
+    const result: ForwardedResult | undefined = typeof ctx.tools.resolve === 'function'
+      ? (await ctx.tools.execute({
+          calls: [{
+            type: 'tool-call', id: ToolCallId(`${scope.callId}:meta:${id}`),
+            name, arguments: JSON.stringify(forwarded),
+          }],
+          signal: scope.signal,
+          agent: scope.agent,
+        })).results[0]?.result
+      : await (ctx.tools as unknown as {
+          execute(input: {
+            callId: ReturnType<typeof ToolCallId>; name: string; arguments: Record<string, unknown>;
+            signal: AbortSignal; parent: ToolRunContext['token']; agent: ToolRunContext['agent'];
+          }): Promise<ForwardedResult>
+        }).execute({
+          callId: ToolCallId(`${scope.callId}:meta:${id}`), name,
+          arguments: forwarded, signal: scope.signal, parent: scope.token, agent: scope.agent,
+        })
+    if (result !== undefined && result.isError && isProgramOnlyRestriction(settledFailureText(result))) {
+      return await executeOutsideProgramOnlyExecutor(ctx, scope, name, forwarded, id)
+    }
+    return result
+  } catch (error) {
+    if (!isProgramOnlyRestriction(thrownMessage(error))) throw error
+    return await executeOutsideProgramOnlyExecutor(ctx, scope, name, forwarded, id)
+  }
+}
+
+/**
+ * Execute the target through the public native tool pipeline
+ * (`@deepseek-ai/dsh-tools/pipeline`).
+ *
+ * This is the same protected path the standard executor uses — pre-execute
+ * waterfall, guards, approvals, dispatch, post-execute — it just does not route
+ * through the program-only executor, which is what frees non-`run_code` tools.
+ * The module is imported lazily so a host without that export keeps loading and
+ * keeps behaving exactly as before; the retry is only ever reached after an
+ * actual program-only rejection. The concurrency accessor must be a function
+ * (the batch scheduler reads it per call).
+ */
+async function executeOutsideProgramOnlyExecutor(
+  ctx: Context,
+  scope: ForwardScope,
+  name: string,
+  forwarded: Record<string, unknown>,
+  id: string,
+): Promise<ForwardedResult | undefined> {
+  let pipelineModule: typeof import('@deepseek-ai/dsh-tools/pipeline')
+  try {
+    pipelineModule = await import('@deepseek-ai/dsh-tools/pipeline')
+  } catch (cause) {
+    throw new Error(
+      `meta_invoke: "${name}" is only callable from inside a run_code program, and this host does not expose the native tool pipeline (@deepseek-ai/dsh-tools/pipeline) for plugin execution`,
+      { cause },
+    )
+  }
+  const pipeline = new pipelineModule.ToolExecutionPipeline(ctx)
+  // A transport sub-dispatch must carry the enclosing execution's opaque token
+  // and its root call: with a program-only executor selected, only a call that
+  // has a parent may execute a native tool name (a model-direct call is denied
+  // as UNKNOWN_TOOL), and commit-style observers need the root correlation.
+  const input: ToolExecutionInput = {
+    callId: ToolCallId(`${scope.callId}:outside:${id}`),
+    rootCallId: scope.rootCallId,
+    name,
+    arguments: forwarded,
+    signal: scope.signal,
+    parent: scope.token,
+    ...scope.agent === undefined ? {} : { agent: scope.agent },
+  }
+  const prepared = await pipeline.prepare(input)
+  const outcome = prepared.kind === 'dispatch' ? await pipeline.dispatch(prepared.exec) : prepared
+  const result = await pipeline.complete(prepared.exec, outcome)
+  if (result === undefined) return undefined
+  // A second rejection means the pipeline is program-only too; do not recurse.
+  if (result.isError && isProgramOnlyRestriction(settledFailureText(result))) {
+    throw new Error(`meta_invoke: "${name}" cannot be executed outside a run_code program on this host`)
+  }
+  return result
+}
+
+/** Readable text of a settled result: the structured error message plus text blocks. */
+function settledFailureText(result: ForwardedResult): string {
+  const message = typeof result.error?.message === 'string' ? result.error.message : ''
+  const content = result.content
+    .filter(block => block.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text ?? '')
+    .join('\n')
+  return `${message}\n${content}`
+}
+
+/** Readable message of a thrown value, including non-Error throws. */
+function thrownMessage(error: unknown): string {
+  if (error instanceof Error) return error.message
+  if (typeof error === 'string') return error
+  const message = (error as { message?: unknown } | null | undefined)?.message
+  return typeof message === 'string' ? message : ''
+}
+
+/**
+ * Detect a program-only executor's direct-call rejection.
+ *
+ * DSH's PTC executor rejects `ctx.tools.execute` with a `ToolNotFoundError`
+ * whose message is "unknown tool \"<x>\": only `run_code` is callable directly".
+ * Requiring both fragments keeps the retry scoped to that transport
+ * restriction: a genuinely missing tool ("unknown tool" alone) still fails.
+ */
+function isProgramOnlyRestriction(text: string): boolean {
+  return text.includes('run_code') && text.includes('callable directly')
 }

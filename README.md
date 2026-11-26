@@ -2,7 +2,7 @@
 
 [![npm 版本](https://img.shields.io/npm/v/dsh-thinking-guard)](https://www.npmjs.com/package/dsh-thinking-guard) [![DSH 插件 · Cordis](https://img.shields.io/badge/DSH_plugin-Cordis-4D6BFE)](https://github.com/topics/dsh-plugin) [![许可证 Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/YAN3RA/dsh-thinking-guard/blob/main/LICENSE)
 
-**当前版本：0.4.3；修复 PTC / Code Mode 下重复调用未被“局部拒绝”的问题，并纳入上游 #33（禁用 MCP 服务时裁剪其说明段）。** [npm 安装包](https://www.npmjs.com/package/dsh-thinking-guard) · [GitHub Releases](https://github.com/YAN3RA/dsh-thinking-guard/releases) · [问题反馈](https://github.com/YAN3RA/dsh-thinking-guard/issues)
+**当前版本：0.4.4；修复 PTC / Code Mode 的按需工具转发，正式支持 DSH 0.2.3-alpha.2，并保留 0.2.2-rc.5 回归。** [npm 安装包](https://www.npmjs.com/package/dsh-thinking-guard) · [GitHub Releases](https://github.com/YAN3RA/dsh-thinking-guard/releases) · [问题反馈](https://github.com/YAN3RA/dsh-thinking-guard/issues)
 
 > **DSH 插件声明：** 本项目是为 **DeepSeek Harness（DSH）** 开发的社区维护、非官方 **Cordis 型插件**，不是独立应用，也不是用来冒充插件的 Skill 说明文件。安装与运行需要 DSH 宿主。
 
@@ -106,9 +106,10 @@
 ## 🔧 宿主与兼容范围
 
 - 先安装并启动 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)，确保终端可执行 `dsh`。
-- 当前 DSH peer 声明范围为 `^0.2.1-rc.3 || ^0.2.2-rc.1`，其他 Cordis / React 依赖以包清单为准。
-- 0.4.1 的自动测试为 **33 个测试文件 / 431 个用例**；已用独立 DSH Web CLI **0.2.2-rc.3** 验证实际包、公开 RPC、跨进程统计清零与设置页。
-- 这不代表对所有 peer 版本、生产 Electron 热重载、物理触屏或屏幕阅读器组合的完整兼容保证。升级后请完整重启宿主。
+- 正式支持 **DSH 0.2.3-alpha.2**，并保留 **0.2.2-rc.5** 隔离回归。不声明支持 0.2.3-alpha.1 或其他未经验证的 Alpha；旧版 peer 范围保留用于安装兼容，不代表所有旧宿主都能使用 PTC 按需转发。该转发需要宿主公开的 `@deepseek-ai/dsh-tools/pipeline`。
+- **Alpha.2 运行要求**：若用外部 Node 启动 npm CLI 或源码，使用 Node 24.x 的 **24.22.3 及以上**，或 **26.13.1 及以上**；官方打包桌面端自带运行时。
+- PTC 中按需工具仍不进入常驻 SDK；由 `meta_search` 发现，再经 `meta_invoke` 和宿主管线执行。Disabled 仍在执行入口拒绝。Alpha.2 对已禁用的原生 MCP loader 目录发出明确撤回；仍适用的资源说明继续保留。
+- Alpha.2 的设置页和真人审批在隔离 Web 宿主验证；不代表生产 Electron 热重载或所有外部模型、第三方 MCP 组合已验收。升级后请完整重启宿主。
 
 ## 📦 安装
 
@@ -129,7 +130,7 @@ dsh plugin --profile desktop add dsh-thinking-guard
 首次安装指定版本：
 
 ```bash
-dsh plugin --profile desktop add dsh-thinking-guard@0.4.3
+dsh plugin --profile desktop add dsh-thinking-guard@0.4.4
 ```
 
 `desktop` 是桌面客户端常用 profile；使用其他 profile 时，请将其替换为实际名称。
@@ -140,7 +141,7 @@ dsh plugin --profile desktop add dsh-thinking-guard@0.4.3
 
 ```bash
 dsh plugin --profile desktop remove dsh-thinking-guard
-dsh plugin --profile desktop add dsh-thinking-guard@0.4.3
+dsh plugin --profile desktop add dsh-thinking-guard@0.4.4
 ```
 
 随后**完整退出并重新打开 DeepSeek Harness**，而不是只刷新页面。正常升级保留开关与阈值；运行统计按 0.4.1 起的规则在宿主重启后清零。不要为了升级主动删除本机配置或旧统计文件。
